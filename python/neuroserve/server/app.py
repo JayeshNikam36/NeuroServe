@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -16,12 +17,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import KvCacheExhausted, __version__
 from .config import ServerConfig
-from .engine_service import ContextLengthExceeded, EngineService
+from .engine_service import ContextLengthExceeded, EngineService, GenerationResult
 from .schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     Choice,
+    CompletionChoice,
+    CompletionRequest,
+    CompletionResponse,
     NeuroServeInfo,
+    NeuroServeOptions,
     ResponseMessage,
     Usage,
 )
@@ -50,21 +55,48 @@ def _error(status_code: int, message: str, type_: str, param: str | None = None,
     )
 
 
-def _check_supported(body: ChatCompletionRequest, config: ServerConfig) -> None:
-    if body.model != config.model.name:
-        raise ApiError(404, f"The model '{body.model}' does not exist; this server serves '{config.model.name}'",
+def _check_request(config: ServerConfig, *, model: str, stream: bool, n: int, temperature: float | None,
+                   max_tokens: int | None) -> int:
+    """Rejects options NeuroServe does not support yet; returns the max_tokens to use."""
+    if model != config.model.name:
+        raise ApiError(404, f"The model '{model}' does not exist; this server serves '{config.model.name}'",
                        param="model", code="model_not_found")
-    if body.stream:
+    if stream:
         raise ApiError(400, "stream=true is not supported yet", param="stream", code="unsupported_parameter")
-    if body.n != 1:
+    if n != 1:
         raise ApiError(400, "only n=1 is supported", param="n", code="unsupported_parameter")
-    if body.temperature not in (None, 0):
+    if temperature not in (None, 0):
         raise ApiError(400, "only greedy decoding is supported yet: omit temperature or set it to 0",
                        param="temperature", code="unsupported_parameter")
-    requested = body.max_completion_tokens or body.max_tokens
-    if requested is not None and requested > config.limits.max_tokens_limit:
-        raise ApiError(400, f"max_tokens {requested} exceeds the limit of {config.limits.max_tokens_limit}",
+    if max_tokens is not None and max_tokens > config.limits.max_tokens_limit:
+        raise ApiError(400, f"max_tokens {max_tokens} exceeds the limit of {config.limits.max_tokens_limit}",
                        param="max_tokens")
+    return max_tokens or config.limits.default_max_tokens
+
+
+async def _run(call: Callable[[], GenerationResult], param: str) -> GenerationResult:
+    """Runs generation in a worker thread (the C++ engine releases the GIL) and maps errors."""
+    try:
+        return await run_in_threadpool(call)
+    except ContextLengthExceeded as exc:
+        raise ApiError(413, str(exc), param=param, code="context_length_exceeded") from exc
+    except KvCacheExhausted as exc:
+        raise ApiError(503, f"KV cache exhausted: {exc}", type_="server_error", code="kv_cache_exhausted") from exc
+    except ValueError as exc:  # invalid messages (ChatTemplateError), bad token ids, other bad input
+        raise ApiError(400, str(exc), param=param) from exc
+
+
+def _usage(result: GenerationResult) -> Usage:
+    return Usage(prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+                 total_tokens=result.prompt_tokens + result.completion_tokens)
+
+
+def _info(result: GenerationResult, options: NeuroServeOptions) -> NeuroServeInfo:
+    return NeuroServeInfo(
+        e2e_ms=round(result.e2e_ms, 2),
+        generated_tokens=result.generated_tokens,
+        completion_token_ids=list(result.token_ids) if options.return_token_ids else None,
+    )
 
 
 def create_app(config: ServerConfig, service: EngineService | None = None) -> FastAPI:
@@ -116,30 +148,36 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(body: ChatCompletionRequest, request: Request) -> ChatCompletionResponse:
         svc: EngineService = request.app.state.service
-        _check_supported(body, config)
-        max_tokens = body.max_completion_tokens or body.max_tokens or config.limits.default_max_tokens
+        max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
+                                    temperature=body.temperature,
+                                    max_tokens=body.max_completion_tokens or body.max_tokens)
         messages = [m.model_dump() for m in body.messages]
-
-        try:
-            # Runs in a worker thread; the C++ engine releases the GIL, so /health stays responsive.
-            result = await run_in_threadpool(svc.chat, messages, max_tokens)
-        except ContextLengthExceeded as exc:
-            raise ApiError(413, str(exc), param="messages", code="context_length_exceeded") from exc
-        except KvCacheExhausted as exc:
-            raise ApiError(503, f"KV cache exhausted: {exc}", type_="server_error",
-                           code="kv_cache_exhausted") from exc
-        except ValueError as exc:  # invalid messages (ChatTemplateError) and other bad input
-            raise ApiError(400, str(exc), param="messages") from exc
-
+        result = await _run(functools.partial(svc.chat, messages, max_tokens,
+                                              ignore_eos=body.neuroserve.ignore_eos), param="messages")
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
             model=config.model.name,
             choices=[Choice(index=0, message=ResponseMessage(content=result.text),
                             finish_reason=result.finish_reason)],
-            usage=Usage(prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
-                        total_tokens=result.prompt_tokens + result.completion_tokens),
-            neuroserve=NeuroServeInfo(e2e_ms=round(result.e2e_ms, 2), generated_tokens=result.generated_tokens),
+            usage=_usage(result),
+            neuroserve=_info(result, body.neuroserve),
+        )
+
+    @app.post("/v1/completions", response_model=CompletionResponse)
+    async def completions(body: CompletionRequest, request: Request) -> CompletionResponse:
+        svc: EngineService = request.app.state.service
+        max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
+                                    temperature=body.temperature, max_tokens=body.max_tokens)
+        result = await _run(functools.partial(svc.complete, body.prompt, max_tokens,
+                                              ignore_eos=body.neuroserve.ignore_eos), param="prompt")
+        return CompletionResponse(
+            id=f"cmpl-{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=config.model.name,
+            choices=[CompletionChoice(index=0, text=result.text, finish_reason=result.finish_reason)],
+            usage=_usage(result),
+            neuroserve=_info(result, body.neuroserve),
         )
 
     return app

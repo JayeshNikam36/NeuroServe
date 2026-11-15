@@ -1,4 +1,4 @@
-"""Owns the engine and tokenizer; turns chat messages into a completion."""
+"""Owns the engine and tokenizer; turns chat messages or prompts into a completion."""
 
 from __future__ import annotations
 
@@ -24,13 +24,17 @@ class ContextLengthExceeded(ValueError):
 
 
 @dataclass(frozen=True)
-class ChatResult:
-    text: str
+class GenerationResult:
+    text: str              # decoded returned tokens, without the stop token
+    token_ids: list[int]   # returned tokens, including the stop token when one was hit
     prompt_tokens: int
-    completion_tokens: int  # tokens returned to the client, including the stop token
-    generated_tokens: int   # tokens the engine produced (>= completion_tokens until Phase 2)
-    finish_reason: str      # "stop" or "length"
+    generated_tokens: int  # tokens the engine produced (>= len(token_ids) until Phase 2)
+    finish_reason: str     # "stop" or "length"
     e2e_ms: float
+
+    @property
+    def completion_tokens(self) -> int:
+        return len(self.token_ids)
 
 
 class EngineService:
@@ -75,8 +79,24 @@ class EngineService:
     def kv_stats(self) -> dict[str, Any]:
         return self._engine.kv_stats()
 
-    def chat(self, messages: list[dict[str, Any]], max_new_tokens: int) -> ChatResult:
-        prompt_ids = self._tokenizer.encode_chat(messages)
+    def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
+             ignore_eos: bool = False) -> GenerationResult:
+        prompt_ids = self._tokenizer.encode_chat(messages, date_string=self._config.model.chat_date_string)
+        return self._run(prompt_ids, max_new_tokens, ignore_eos)
+
+    def complete(self, prompt: str | list[int], max_new_tokens: int, *,
+                 ignore_eos: bool = False) -> GenerationResult:
+        if isinstance(prompt, str):
+            prompt_ids = self._tokenizer.encode(prompt)  # adds <|begin_of_text|>
+        else:
+            vocab = self._tokenizer.vocab_size
+            bad = next((t for t in prompt if not 0 <= t < vocab), None)
+            if bad is not None:
+                raise ValueError(f"token id {bad} is outside the vocabulary (0..{vocab - 1})")
+            prompt_ids = list(prompt)  # token ids are used verbatim
+        return self._run(prompt_ids, max_new_tokens, ignore_eos)
+
+    def _run(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool) -> GenerationResult:
         limit = self._config.engine.max_prompt_tokens
         if len(prompt_ids) > limit:
             raise ContextLengthExceeded(f"the prompt has {len(prompt_ids)} tokens; the limit is {limit}")
@@ -86,16 +106,18 @@ class EngineService:
             out = list(self._engine.generate(prompt_ids, max_new_tokens=max_new_tokens))
         e2e_ms = (time.perf_counter() - start) * 1000.0
 
-        stop_at = next((i for i, t in enumerate(out) if t in self._tokenizer.stop_token_ids), None)
+        stop_at = None
+        if not ignore_eos:
+            stop_at = next((i for i, t in enumerate(out) if t in self._tokenizer.stop_token_ids), None)
         if stop_at is None:
-            kept, finish_reason, completion_tokens = out, "length", len(out)
+            returned, finish_reason, text_ids = out, "length", out
         else:
-            kept, finish_reason, completion_tokens = out[:stop_at], "stop", stop_at + 1
+            returned, finish_reason, text_ids = out[:stop_at + 1], "stop", out[:stop_at]
 
-        return ChatResult(
-            text=self._tokenizer.decode(kept),
+        return GenerationResult(
+            text=self._tokenizer.decode(text_ids),
+            token_ids=returned,
             prompt_tokens=len(prompt_ids),
-            completion_tokens=completion_tokens,
             generated_tokens=len(out),
             finish_reason=finish_reason,
             e2e_ms=e2e_ms,
