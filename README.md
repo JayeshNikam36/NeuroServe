@@ -68,6 +68,10 @@ NeuroServe request options (optional `neuroserve` object): `return_token_ids` ad
 token ids to the response; `ignore_eos` generates exactly `max_tokens` (benchmarks, parity tests).
 Responses from both endpoints match Hugging Face token for token (`tests/python/test_api_parity.py`).
 
+Every response carries an `X-Request-ID` header (send your own to trace requests end to end).
+Logs are JSON lines with the request id on every record; prompts are not logged unless
+`logging.log_prompts` is enabled. Error codes: [docs/errors.md](docs/errors.md).
+
 ### Model and reference files
 
 Integration tests need the converted Llama-3.2-1B weights and Hugging Face reference outputs:

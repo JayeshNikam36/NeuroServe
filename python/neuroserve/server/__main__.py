@@ -4,13 +4,13 @@
 """
 
 import argparse
-import logging
 import os
 
 import uvicorn
 
 from .app import create_app
 from .config import load_config
+from .logging_setup import configure_logging
 
 
 def main() -> None:
@@ -20,10 +20,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, help="overrides server.port from the config")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = load_config(args.config)
+    configure_logging(config.logging.level, config.logging.format)
+    # log_config=None: uvicorn uses NeuroServe's logging; access_log=False: NeuroServe writes its own.
     uvicorn.run(create_app(config), host=args.host or config.server.host,
-                port=args.port or config.server.port, log_level="info")
+                port=args.port or config.server.port, log_config=None, access_log=False)
 
 
 if __name__ == "__main__":

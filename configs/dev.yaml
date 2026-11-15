@@ -16,6 +16,11 @@ limits:
   default_max_tokens: 128                   # used when a request sets no max_tokens
   max_tokens_limit: 512                     # larger requests are rejected with 400
 
+logging:
+  level: INFO
+  format: json                              # json (one object per line) or text
+  log_prompts: false                        # never enable where prompts may contain personal data
+
 server:
   host: 127.0.0.1                           # localhost only by default
   port: 8000
