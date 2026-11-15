@@ -13,3 +13,8 @@ if(NS_ENABLE_CUDA)
 endif()
 
 target_link_libraries(neuroserve_core PRIVATE ns_warnings)
+
+
+if(NS_ENABLE_CUDA)
+    add_subdirectory(backend)
+endif()
