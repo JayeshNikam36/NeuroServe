@@ -14,7 +14,8 @@ gtest_discover_tests(ns_unit_tests PROPERTIES LABELS "cpu")
 # ---- GPU tests (only when CUDA is enabled) ----
 if(NS_ENABLE_CUDA)
     add_executable(ns_cuda_tests
-        cuda/test_smoke.cpp)
+        cuda/test_smoke.cpp
+        cuda/test_device_info.cpp)
     target_link_libraries(ns_cuda_tests PRIVATE neuroserve::cuda GTest::gtest_main ns_warnings)
     gtest_discover_tests(ns_cuda_tests PROPERTIES LABELS "gpu")
 endif()

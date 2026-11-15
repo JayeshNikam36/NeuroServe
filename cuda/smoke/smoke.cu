@@ -2,17 +2,10 @@
 
 #include <cuda_runtime.h>
 
-#include <stdexcept>
-#include <string>
+#include "neuroserve/cuda/check.hpp"
 
 namespace neuroserve::cuda {
 namespace {
-
-void check(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
-    }
-}
 
 __global__ void axpb_kernel(float a, float b, float* out, std::size_t n) {
     const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -34,7 +27,7 @@ void run_axpb(float a, float b, float* host_out, std::size_t n) {
         return;
     }
     float* d_out = nullptr;
-    check(cudaMalloc(&d_out, n * sizeof(float)), "cudaMalloc");
+    NS_CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(float)));
 
     constexpr int kThreads = 256;
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
@@ -45,12 +38,12 @@ void run_axpb(float a, float b, float* host_out, std::size_t n) {
         err = cudaMemcpy(host_out, d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
     }
     cudaFree(d_out);  // always free, even on error
-    check(err, "axpb_kernel / cudaMemcpy");
+    NS_CUDA_CHECK(err);
 }
 
 int compiled_arch() {
     int* d_arch = nullptr;
-    check(cudaMalloc(&d_arch, sizeof(int)), "cudaMalloc");
+    NS_CUDA_CHECK(cudaMalloc(&d_arch, sizeof(int)));
     arch_kernel<<<1, 1>>>(d_arch);
 
     int arch = 0;
@@ -59,7 +52,7 @@ int compiled_arch() {
         err = cudaMemcpy(&arch, d_arch, sizeof(int), cudaMemcpyDeviceToHost);
     }
     cudaFree(d_arch);
-    check(err, "arch_kernel / cudaMemcpy");
+    NS_CUDA_CHECK(err);
     return arch;
 }
 

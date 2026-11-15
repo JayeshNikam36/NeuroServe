@@ -26,12 +26,19 @@ and split-KV decode attention.
 | `scripts/` | `dev.sh` (container), `build.sh` (configure, build, test) |
 | `third_party/cuda-llm-engine` | Execution engine (git submodule, pinned) |
 | `docs/adr` | Architecture decision records |
+| `tools/` | Command-line utilities (`ns_device_info`) |
 
 ## Build
 
 ```bash
 bash scripts/dev.sh --build bash scripts/build.sh dev-cuda   # GPU build + all tests
 bash scripts/dev.sh bash scripts/build.sh ci-cpu             # CPU-only build (same as CI)
+```
+### Check your GPU
+
+```bash
+bash scripts/dev.sh ./build/dev-cuda/tools/ns_device_info          # human-readable
+bash scripts/dev.sh ./build/dev-cuda/tools/ns_device_info --json   # machine-readable
 ```
 
 ## Getting the code
