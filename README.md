@@ -30,6 +30,8 @@ and split-KV decode attention.
 | `runtime/backend/` | `InferenceBackend` implementation on cuda-llm-engine (`neuroserve::backend`) |
 | `bindings/` | pybind11 module (`neuroserve._core`) |
 | `python/neuroserve/` | Python package |
+| `python/neuroserve/server/` | OpenAI-compatible API server (FastAPI) |
+| `configs/` | Server configuration (YAML) |
 
 ## Build
 
@@ -48,6 +50,16 @@ import neuroserve
 engine = neuroserve.Engine("/models/llama-3.2-1b-fp16")
 engine.generate(prompt_ids, max_new_tokens=32)   # greedy, GIL released during generation
 ```
+### API server
+
+```bash
+NS_PUBLISH_PORT=8000 bash scripts/dev.sh bash -c "PYTHONPATH=python python3 -m neuroserve.server --config configs/dev.yaml --host 0.0.0.0"
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "llama-3.2-1b-instruct", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 32}'
+```
+
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (greedy, non-streaming for now).
+The server listens on localhost only; the port is published to 127.0.0.1.
 
 ### Model and reference files
 
