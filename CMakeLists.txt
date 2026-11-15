@@ -43,6 +43,7 @@ endif()
 add_subdirectory(runtime)
 if(NS_ENABLE_CUDA)
     add_subdirectory(cuda)
+    add_subdirectory(tools)
 endif()
 
 if(NS_BUILD_TESTS)
