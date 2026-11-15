@@ -1,0 +1,10 @@
+{
+  "recommendations": [
+    "ms-vscode-remote.remote-wsl",
+    "ms-vscode.cmake-tools",
+    "ms-vscode.cpptools",
+    "nvidia.nsight-vscode-edition",
+    "ms-azuretools.vscode-docker",
+    "github.vscode-github-actions"
+  ]
+}

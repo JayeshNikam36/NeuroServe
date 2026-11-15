@@ -1,0 +1,37 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Models and large artifacts (never commit weights)
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Runtime output
+*.log
+*.sqlite
+*.db
+benchmarks/results/raw/
+tests/logs/
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
