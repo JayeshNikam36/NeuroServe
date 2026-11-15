@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("prompt")
     parser.add_argument("--chat", action="store_true", help="format the prompt as a user chat message")
     parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--model-dir", default=os.environ.get("NS_MODEL_DIR", "/models/llama-3.2-1b-fp16"))
+    parser.add_argument("--model-dir", default=os.environ.get("NS_MODEL_DIR", "/models/llama-3.2-1b-instruct-fp16"))
     parser.add_argument("--tokenizer-dir", default=os.environ.get("NS_TOKENIZER_DIR", "/models/llama-3.2-1b-instruct"))
     args = parser.parse_args()
 
