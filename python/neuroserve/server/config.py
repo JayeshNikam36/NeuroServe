@@ -19,6 +19,9 @@ class ModelSection(_Strict):
     name: str
     weights_dir: Path
     tokenizer_dir: Path
+    # Pins the chat template's "Today Date" line (e.g. "26 Jul 2024") so prompts are reproducible.
+    # None: use today's date, like Hugging Face.
+    chat_date_string: str | None = None
 
 
 class EngineSection(_Strict):

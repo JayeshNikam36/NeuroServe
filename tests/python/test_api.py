@@ -169,3 +169,60 @@ def test_real_engine_end_to_end():
         assert 1 <= body["usage"]["completion_tokens"] <= 16
         kv = client.get("/health").json()["kv_cache"]
         assert kv["free_pages"] == kv["total_pages"], "KV pages leaked after a request"
+
+
+# ---- Day 8: /v1/completions and NeuroServe options ----------------------------------------------
+
+def test_completions_with_text_prompt(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.post("/v1/completions",
+                           json={"model": MODEL_NAME, "prompt": "The capital of France is", "max_tokens": 16})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "text_completion" and body["id"].startswith("cmpl-")
+    assert body["choices"][0]["text"] == REPLY and body["choices"][0]["finish_reason"] == "stop"
+    assert engine.calls[0][0] == tok.encode("The capital of France is")  # text prompts get <|begin_of_text|>
+    assert body["neuroserve"]["completion_token_ids"] is None             # only on request
+
+
+def test_completions_token_ids_are_used_verbatim(tok):
+    app, engine, _ = make_app(tok)
+    prompt = [128000, 791, 6864, 315]
+    with TestClient(app) as client:
+        body = client.post("/v1/completions", json={"model": MODEL_NAME, "prompt": prompt}).json()
+    assert engine.calls[0][0] == prompt
+    assert body["usage"]["prompt_tokens"] == len(prompt)
+
+
+def test_return_token_ids_includes_the_stop_token(tok):
+    app, _, reply_ids = make_app(tok)
+    with TestClient(app) as client:
+        body = client.post("/v1/chat/completions",
+                           json=chat_body(neuroserve={"return_token_ids": True})).json()
+    assert body["neuroserve"]["completion_token_ids"] == reply_ids  # reply + <|eot_id|>
+    assert body["usage"]["completion_tokens"] == len(reply_ids)
+
+
+def test_ignore_eos_generates_exactly_max_tokens(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        body = client.post("/v1/chat/completions",
+                           json=chat_body(max_tokens=20, neuroserve={"ignore_eos": True, "return_token_ids": True})).json()
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["usage"]["completion_tokens"] == 20 == len(body["neuroserve"]["completion_token_ids"])
+
+
+@pytest.mark.parametrize("payload, param", [
+    ({"prompt": ""}, "prompt"),
+    ({"prompt": []}, "prompt"),
+    ({"prompt": [1, 999999]}, "prompt"),                       # outside the vocabulary
+    ({"prompt": "hi", "neuroserve": {"bogus": True}}, "neuroserve.bogus"),
+])
+def test_bad_completion_requests_are_400(tok, payload, param):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.post("/v1/completions", json={"model": MODEL_NAME, **payload})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["param"] == param
+    assert engine.calls == []

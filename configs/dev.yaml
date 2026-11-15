@@ -3,6 +3,7 @@ model:
   name: llama-3.2-1b-instruct               # the "model" value clients must send
   weights_dir: /models/llama-3.2-1b-instruct-fp16
   tokenizer_dir: /models/llama-3.2-1b-instruct
+  chat_date_string: null                    # e.g. "26 Jul 2024" pins the template date (tests, benchmarks)
 
 engine:
   max_prompt_tokens: 512
