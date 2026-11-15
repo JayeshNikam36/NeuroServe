@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,6 +38,13 @@ class LimitsSection(_Strict):
     max_tokens_limit: int = Field(default=512, ge=1)
 
 
+class LoggingSection(_Strict):
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    format: Literal["json", "text"] = "json"
+    # Prompts and completions can contain personal data: never logged unless explicitly enabled.
+    log_prompts: bool = False
+
+
 class ServerSection(_Strict):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
@@ -46,6 +54,7 @@ class ServerConfig(_Strict):
     model: ModelSection
     engine: EngineSection = Field(default_factory=EngineSection)
     limits: LimitsSection = Field(default_factory=LimitsSection)
+    logging: LoggingSection = Field(default_factory=LoggingSection)
     server: ServerSection = Field(default_factory=ServerSection)
 
     @model_validator(mode="after")

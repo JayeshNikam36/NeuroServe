@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,9 +17,11 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import KvCacheExhausted, __version__
+from .. import CudaError, KvCacheExhausted, __version__
 from .config import ServerConfig
 from .engine_service import ContextLengthExceeded, EngineService, GenerationResult
+from .logging_setup import request_id_var
+from .middleware import RequestContextMiddleware
 from .schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -74,14 +78,26 @@ def _check_request(config: ServerConfig, *, model: str, stream: bool, n: int, te
     return max_tokens or config.limits.default_max_tokens
 
 
-async def _run(call: Callable[[], GenerationResult], param: str) -> GenerationResult:
+async def _run(request: Request, call: Callable[[], GenerationResult], param: str) -> GenerationResult:
     """Runs generation in a worker thread (the C++ engine releases the GIL) and maps errors."""
+    failure = request.app.state.failure
+    if failure is not None:
+        raise ApiError(503, f"service unavailable after a GPU error ({failure}); restart the server",
+                       type_="server_error", code="service_unavailable")
+
+    context = contextvars.copy_context()  # carries the request id into the worker thread's log records
     try:
-        return await run_in_threadpool(call)
+        return await run_in_threadpool(context.run, call)
     except ContextLengthExceeded as exc:
         raise ApiError(413, str(exc), param=param, code="context_length_exceeded") from exc
     except KvCacheExhausted as exc:
         raise ApiError(503, f"KV cache exhausted: {exc}", type_="server_error", code="kv_cache_exhausted") from exc
+    except CudaError as exc:
+        # A CUDA failure can leave the GPU context broken: stop serving instead of returning garbage.
+        request.app.state.failure = str(exc)
+        logger.error("GPU error; server marked unhealthy", extra={"error": str(exc)})
+        raise ApiError(500, f"GPU error while generating (request id {request_id_var.get()})",
+                       type_="server_error", code="gpu_error") from exc
     except ValueError as exc:  # invalid messages (ChatTemplateError), bad token ids, other bad input
         raise ApiError(400, str(exc), param=param) from exc
 
@@ -99,6 +115,18 @@ def _info(result: GenerationResult, options: NeuroServeOptions) -> NeuroServeInf
     )
 
 
+def _record(request: Request, config: ServerConfig, prompt: Any, result: GenerationResult) -> None:
+    """Adds usage numbers to the access log line; logs content only when explicitly enabled."""
+    request.state.log_fields.update(
+        prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+        generated_tokens=result.generated_tokens, finish_reason=result.finish_reason,
+        e2e_ms=round(result.e2e_ms, 2),
+    )
+    if config.logging.log_prompts:
+        logger.info("prompt and completion", extra={"prompt_logging": True, "prompt": prompt,
+                                                    "completion": result.text})
+
+
 def create_app(config: ServerConfig, service: EngineService | None = None) -> FastAPI:
     """Builds the app. Without a service, the real model is loaded at startup."""
 
@@ -106,6 +134,7 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.service = service if service is not None else await run_in_threadpool(EngineService.load, config)
         app.state.created = int(time.time())
+        app.state.failure = None  # set after a GPU error; the server then refuses work
         logger.info("NeuroServe %s ready: model=%s gpu=%s", __version__, config.model.name,
                     app.state.service.device_name)
         try:
@@ -114,6 +143,7 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
             app.state.service = None  # releases the engine and its GPU memory
 
     app = FastAPI(title="NeuroServe", version=__version__, lifespan=lifespan)
+    app.add_middleware(RequestContextMiddleware)
 
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
@@ -133,7 +163,10 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         return _error(exc.status_code, str(exc.detail), "invalid_request_error")
 
     @app.get("/health")
-    async def health(request: Request) -> dict:
+    async def health(request: Request):
+        if request.app.state.failure is not None:
+            return JSONResponse(status_code=503, content={
+                "status": "unhealthy", "reason": request.app.state.failure, "model": config.model.name})
         svc: EngineService = request.app.state.service
         return {"status": "ok", "model": config.model.name, "gpu": svc.device_name, "kv_cache": svc.kv_stats()}
 
@@ -152,8 +185,9 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                                     temperature=body.temperature,
                                     max_tokens=body.max_completion_tokens or body.max_tokens)
         messages = [m.model_dump() for m in body.messages]
-        result = await _run(functools.partial(svc.chat, messages, max_tokens,
-                                              ignore_eos=body.neuroserve.ignore_eos), param="messages")
+        result = await _run(request, functools.partial(svc.chat, messages, max_tokens,
+                                                       ignore_eos=body.neuroserve.ignore_eos), param="messages")
+        _record(request, config, messages, result)
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -169,8 +203,9 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         svc: EngineService = request.app.state.service
         max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
                                     temperature=body.temperature, max_tokens=body.max_tokens)
-        result = await _run(functools.partial(svc.complete, body.prompt, max_tokens,
-                                              ignore_eos=body.neuroserve.ignore_eos), param="prompt")
+        result = await _run(request, functools.partial(svc.complete, body.prompt, max_tokens,
+                                                       ignore_eos=body.neuroserve.ignore_eos), param="prompt")
+        _record(request, config, body.prompt, result)
         return CompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
