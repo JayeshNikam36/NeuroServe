@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "dev-cuda",
+      "displayName": "Dev (CUDA, RelWithDebInfo)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "NS_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "89"
+      }
+    },
+    {
+      "name": "ci-cpu",
+      "displayName": "CI (CPU only, warnings as errors)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ci-cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NS_ENABLE_CUDA": "OFF",
+        "NS_WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev-cuda", "configurePreset": "dev-cuda" },
+    { "name": "ci-cpu", "configurePreset": "ci-cpu" }
+  ],
+  "testPresets": [
+    { "name": "dev-cuda", "configurePreset": "dev-cuda", "output": { "outputOnFailure": true } },
+    { "name": "ci-cpu", "configurePreset": "ci-cpu", "output": { "outputOnFailure": true } }
+  ]
+}
