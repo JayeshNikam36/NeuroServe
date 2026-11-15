@@ -1,5 +1,7 @@
 # NeuroServe
 
+[![CI](https://github.com/JayeshNikam36/NeuroServe/actions/workflows/ci.yml/badge.svg)](https://github.com/JayeshNikam36/NeuroServe/actions/workflows/ci.yml)
+
 An experimental GPU-aware LLM inference runtime featuring continuous batching,
 paged KV-cache management, CUDA execution optimization and real-time
 performance observability, measured against vLLM on an NVIDIA RTX 4050 Laptop GPU.
