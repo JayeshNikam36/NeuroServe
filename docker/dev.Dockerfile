@@ -5,11 +5,13 @@ FROM ${CUDA_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates \
-        python3 python3-pip python3-venv gdb \
+        build-essential ninja-build git ca-certificates \
+        python3 python3-dev python3-pip python3-venv gdb \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir "cmake==3.30.5" \
+# Ubuntu 22.04 ships CMake 3.22, which can't set C++20 for CUDA. Pin a modern CMake.
+# pytest runs the Python binding tests; tokenizers encodes/decodes text for demos.
+RUN python3 -m pip install --no-cache-dir "cmake==3.30.5" "pytest==8.3.3" "tokenizers==0.20.3" \
     && cmake --version
 
 # Non-root user matching the host UID/GID, so files created in the

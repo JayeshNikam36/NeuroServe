@@ -28,6 +28,8 @@ and split-KV decode attention.
 | `docs/adr` | Architecture decision records |
 | `tools/` | Command-line utilities (`ns_device_info`) |
 | `runtime/backend/` | `InferenceBackend` implementation on cuda-llm-engine (`neuroserve::backend`) |
+| `bindings/` | pybind11 module (`neuroserve._core`) |
+| `python/neuroserve/` | Python package |
 
 ## Build
 
@@ -35,6 +37,18 @@ and split-KV decode attention.
 bash scripts/dev.sh --build bash scripts/build.sh dev-cuda   # GPU build + all tests
 bash scripts/dev.sh bash scripts/build.sh ci-cpu             # CPU-only build (same as CI)
 ```
+### Python
+
+```bash
+bash scripts/dev.sh bash -c "PYTHONPATH=python python3 scripts/generate_demo.py 'The capital of France is'"
+```
+
+```python
+import neuroserve
+engine = neuroserve.Engine("/models/llama-3.2-1b-fp16")
+engine.generate(prompt_ids, max_new_tokens=32)   # greedy, GIL released during generation
+```
+
 ### Model and reference files
 
 Integration tests need the converted Llama-3.2-1B weights and Hugging Face reference outputs:
