@@ -6,9 +6,10 @@ project(NeuroServe
     LANGUAGES CXX)
 
 # ---- Options -------------------------------------------------------------
-option(NS_ENABLE_CUDA         "Build CUDA components and GPU tests" ON)
-option(NS_BUILD_TESTS         "Build unit tests"                    ON)
-option(NS_WARNINGS_AS_ERRORS  "Treat compiler warnings as errors"   OFF)
+option(NS_ENABLE_CUDA         "Build CUDA components and GPU tests"            ON)
+option(NS_BUILD_TESTS         "Build unit tests"                               ON)
+option(NS_BUILD_PYTHON        "Build the Python extension module (needs CUDA)" OFF)
+option(NS_WARNINGS_AS_ERRORS  "Treat compiler warnings as errors"              OFF)
 
 # ---- Language standards --------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
@@ -31,6 +32,14 @@ if(NS_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
 
+# ---- Python ----------------------------------------------------------------
+if(NS_BUILD_PYTHON)
+    if(NOT NS_ENABLE_CUDA)
+        message(FATAL_ERROR "NS_BUILD_PYTHON requires NS_ENABLE_CUDA=ON")
+    endif()
+    find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
+endif()
+
 # ---- Shared warning settings --------------------------------------------
 add_library(ns_warnings INTERFACE)
 target_compile_options(ns_warnings INTERFACE
@@ -49,6 +58,10 @@ if(NS_ENABLE_CUDA)
 
     add_subdirectory(cuda)
     add_subdirectory(tools)
+
+    if(NS_BUILD_PYTHON)
+        add_subdirectory(bindings)
+    endif()
 endif()
 
 if(NS_BUILD_TESTS)
@@ -56,6 +69,4 @@ if(NS_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "NeuroServe ${PROJECT_VERSION} | build=${CMAKE_BUILD_TYPE} | CUDA=${NS_ENABLE_CUDA} | archs=${CMAKE_CUDA_ARCHITECTURES}")
-
-
+message(STATUS "NeuroServe ${PROJECT_VERSION} | build=${CMAKE_BUILD_TYPE} | CUDA=${NS_ENABLE_CUDA} | Python=${NS_BUILD_PYTHON} | archs=${CMAKE_CUDA_ARCHITECTURES}")

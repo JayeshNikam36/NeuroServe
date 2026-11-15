@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "neuroserve"
+version = "0.0.1"
+description = "GPU-aware LLM inference runtime"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.28"
+ninja.version = ">=1.10"
+wheel.packages = ["python/neuroserve"]
+build-dir = "build/wheel-{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+NS_ENABLE_CUDA = "ON"
+NS_BUILD_PYTHON = "ON"
+NS_BUILD_TESTS = "OFF"
+CMAKE_CUDA_ARCHITECTURES = "89"

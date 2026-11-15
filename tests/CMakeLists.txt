@@ -7,7 +7,9 @@ include(GoogleTest)
 
 # ---- CPU unit tests (run everywhere, including CI) ----
 add_executable(ns_unit_tests
-    unit/test_version.cpp)
+    unit/test_version.cpp
+    unit/test_generate.cpp)
+target_include_directories(ns_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
 target_link_libraries(ns_unit_tests PRIVATE neuroserve::core GTest::gtest_main ns_warnings)
 gtest_discover_tests(ns_unit_tests PROPERTIES LABELS "cpu")
 
@@ -23,5 +25,14 @@ if(NS_ENABLE_CUDA)
     add_executable(ns_integration_tests
         integration/test_cuda_llm_engine_backend.cpp)
     target_link_libraries(ns_integration_tests PRIVATE neuroserve::backend GTest::gtest_main ns_warnings)
-    gtest_discover_tests(ns_integration_tests PROPERTIES LABELS "gpu;integration")
+    gtest_discover_tests(ns_integration_tests PROPERTIES LABELS "integration")
+endif()
+
+# ---- Python binding tests (GPU + model, run with pytest) ----
+if(NS_BUILD_PYTHON)
+    add_test(NAME python_bindings
+        COMMAND ${Python_EXECUTABLE} -m pytest -q -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/python)
+    set_tests_properties(python_bindings PROPERTIES
+        LABELS "integration;python"
+        ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}/python")
 endif()
