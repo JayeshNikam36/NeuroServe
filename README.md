@@ -61,6 +61,9 @@ Integration tests need the converted Llama-3.2-1B weights and Hugging Face refer
 - `~/models/llama-3.2-1b-instruct/` — tokenizer and chat template (`hf download meta-llama/Llama-3.2-1B-Instruct tokenizer.json tokenizer_config.json special_tokens_map.json generation_config.json --local-dir ~/models/llama-3.2-1b-instruct`)
 - `~/models/llama-3.2-1b-ref/chat_reference.json` — Hugging Face chat-template reference (`scripts/make_chat_reference.py`, run on the host with transformers)
 
+- `~/models/llama-3.2-1b-instruct-fp16/` — served model (Llama-3.2-1B-Instruct), converted with `scripts/export_weights.py`
+- `~/models/llama-3.2-1b-ref/instruct_greedy.json` — Hugging Face greedy outputs for chat prompts (`scripts/make_generation_reference.py`)
+
 ### Check your GPU
 
 ```bash

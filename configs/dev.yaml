@@ -1,0 +1,20 @@
+# NeuroServe development configuration (paths are inside the dev container).
+model:
+  name: llama-3.2-1b-instruct               # the "model" value clients must send
+  weights_dir: /models/llama-3.2-1b-instruct-fp16
+  tokenizer_dir: /models/llama-3.2-1b-instruct
+
+engine:
+  max_prompt_tokens: 512
+  num_pages: 2048                           # 2048 x 16 tokens x 32 KiB = 1 GiB of KV cache
+  max_batch: 8
+  max_pages_per_sequence: 64                # 1024 tokens per sequence (prompt + output)
+  device_index: 0
+
+limits:
+  default_max_tokens: 128                   # used when a request sets no max_tokens
+  max_tokens_limit: 512                     # larger requests are rejected with 400
+
+server:
+  host: 127.0.0.1                           # localhost only by default
+  port: 8000
