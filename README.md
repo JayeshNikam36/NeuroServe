@@ -27,6 +27,7 @@ and split-KV decode attention.
 | `third_party/cuda-llm-engine` | Execution engine (git submodule, pinned) |
 | `docs/adr` | Architecture decision records |
 | `tools/` | Command-line utilities (`ns_device_info`) |
+| `runtime/backend/` | `InferenceBackend` implementation on cuda-llm-engine (`neuroserve::backend`) |
 
 ## Build
 
@@ -34,6 +35,15 @@ and split-KV decode attention.
 bash scripts/dev.sh --build bash scripts/build.sh dev-cuda   # GPU build + all tests
 bash scripts/dev.sh bash scripts/build.sh ci-cpu             # CPU-only build (same as CI)
 ```
+### Model and reference files
+
+Integration tests need the converted Llama-3.2-1B weights and Hugging Face reference outputs:
+
+- `~/models/llama-3.2-1b-fp16/` — `weights.bin`, `index.tsv` (from cuda-llm-engine's export scripts)
+- `~/models/llama-3.2-1b-ref/` — `prompt_NN_ids.i32`, `prompt_NN_greedy.i32` (copied from cuda-llm-engine's `tests/reference/bin`)
+
+`scripts/dev.sh` mounts `~/models` read-only at `/models`. Without these files the integration tests are skipped.
+
 ### Check your GPU
 
 ```bash

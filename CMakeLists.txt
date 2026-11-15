@@ -41,7 +41,12 @@ endif()
 
 # ---- Components ------------------------------------------------------------
 add_subdirectory(runtime)
+
 if(NS_ENABLE_CUDA)
+    # Execution engine (git submodule). EXCLUDE_FROM_ALL: build only what NeuroServe links.
+    # SYSTEM: its headers don't trigger NeuroServe's strict warnings.
+    add_subdirectory(third_party/cuda-llm-engine EXCLUDE_FROM_ALL SYSTEM)
+
     add_subdirectory(cuda)
     add_subdirectory(tools)
 endif()
@@ -52,3 +57,5 @@ if(NS_BUILD_TESTS)
 endif()
 
 message(STATUS "NeuroServe ${PROJECT_VERSION} | build=${CMAKE_BUILD_TYPE} | CUDA=${NS_ENABLE_CUDA} | archs=${CMAKE_CUDA_ARCHITECTURES}")
+
+

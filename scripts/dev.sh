@@ -24,10 +24,17 @@ if [[ -t 0 && -t 1 ]]; then
     TTY_FLAGS=(-it)
 fi
 
+# Mount local model files read-only at /models when present.
+MODEL_MOUNT=()
+if [[ -d "${HOME}/models" ]]; then
+    MODEL_MOUNT=(-v "${HOME}/models:/models:ro")
+fi
+
 if [[ $# -eq 0 ]]; then
     set -- bash
 fi
 
 exec docker run --rm "${TTY_FLAGS[@]}" --gpus all \
+    "${MODEL_MOUNT[@]}" \
     -v "${ROOT}:/workspace" -w /workspace \
     "${IMAGE}" "$@"
