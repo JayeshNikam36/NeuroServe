@@ -1,0 +1,33 @@
+# Starvation bound of the token-budget policy (max_wait_steps=3). b (58 tokens) arrives while seven
+# short requests are decoding, so it only fits once at most 6 requests are running. Short requests
+# that arrive after b fit, and are admitted ahead of it, but only until b has waited 3 steps: then
+# b is "aged", nobody may overtake it any more, the batch drains, and b starts.
+policy token-budget max_wait_steps=3
+limits max_batch=16 total_pages=64 page_size=16 max_batch_tokens=64
+arrive step=0 id=s1 prompt=4 max_new=6
+arrive step=0 id=s2 prompt=4 max_new=6
+arrive step=0 id=s3 prompt=4 max_new=6
+arrive step=0 id=s4 prompt=4 max_new=6
+arrive step=0 id=s5 prompt=4 max_new=6
+arrive step=0 id=s6 prompt=4 max_new=6
+arrive step=0 id=s7 prompt=4 max_new=6
+arrive step=1 id=b prompt=58 max_new=2
+arrive step=1 id=t1 prompt=4 max_new=6
+arrive step=2 id=t2 prompt=4 max_new=6
+arrive step=3 id=t3 prompt=4 max_new=6
+arrive step=4 id=t4 prompt=4 max_new=6
+arrive step=5 id=t5 prompt=4 max_new=6
+--- expected
+step 0 queued=[s1 s2 s3 s4 s5 s6 s7] running=[] preempt=[] admit=[s1 s2 s3 s4 s5 s6 s7] finished=[] tokens=28+0 free_pages=57
+step 1 queued=[b t1] running=[s1 s2 s3 s4 s5 s6 s7] preempt=[] admit=[t1] finished=[] tokens=4+7 free_pages=56
+step 2 queued=[b t2] running=[s1 s2 s3 s4 s5 s6 s7 t1] preempt=[] admit=[t2] finished=[] tokens=4+8 free_pages=55
+step 3 queued=[b t3] running=[s1 s2 s3 s4 s5 s6 s7 t1 t2] preempt=[] admit=[t3] finished=[] tokens=4+9 free_pages=54
+step 4 queued=[b t4] running=[s1 s2 s3 s4 s5 s6 s7 t1 t2 t3] preempt=[] admit=[] finished=[] tokens=0+10 free_pages=54
+step 5 queued=[b t4 t5] running=[s1 s2 s3 s4 s5 s6 s7 t1 t2 t3] preempt=[] admit=[] finished=[s1 s2 s3 s4 s5 s6 s7] tokens=0+10 free_pages=61
+step 6 queued=[b t4 t5] running=[t1 t2 t3] preempt=[] admit=[b] finished=[t1] tokens=58+3 free_pages=58
+step 7 queued=[t4 t5] running=[t2 t3 b] preempt=[] admit=[t4 t5] finished=[t2 b] tokens=8+3 free_pages=61
+step 8 queued=[] running=[t3 t4 t5] preempt=[] admit=[] finished=[t3] tokens=0+3 free_pages=62
+step 9 queued=[] running=[t4 t5] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=62
+step 10 queued=[] running=[t4 t5] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=62
+step 11 queued=[] running=[t4 t5] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=62
+step 12 queued=[] running=[t4 t5] preempt=[] admit=[] finished=[t4 t5] tokens=0+2 free_pages=64

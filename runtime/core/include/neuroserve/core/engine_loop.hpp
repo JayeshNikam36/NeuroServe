@@ -139,7 +139,12 @@ public:
 
     EngineLoopStats stats() const;
 
-    std::string_view policy_name() const noexcept;
+    // Thread-safe. Name of the policy currently deciding.
+    std::string policy_name() const;
+
+    // Thread-safe. Replaces the scheduling policy from the next engine step on (for A/B comparisons
+    // on a running engine). Requests already admitted are not affected.
+    void set_policy(std::unique_ptr<SchedulingPolicy> policy);
 
     // KV-cache usage as of the engine thread's last change. Safe from any thread; up to date for a
     // request's pages by the time its wait() returns.
@@ -170,7 +175,7 @@ private:
     InferenceBackend& backend_;
     const EngineLoopOptions options_;
     const ModelInfo model_info_;
-    const std::unique_ptr<SchedulingPolicy> policy_;  // called only on the engine thread
+    std::unique_ptr<SchedulingPolicy> policy_;  // used only on the engine thread (swapped under mu_)
     int page_size_ = 0;
     int total_pages_ = 0;
     int max_sequence_tokens_ = 0;
@@ -180,6 +185,8 @@ private:
     std::condition_variable cv_;
     bool stop_ = false;
     std::uint64_t next_order_ = 0;  // arrival order of submitted requests
+    std::unique_ptr<SchedulingPolicy> next_policy_;  // set_policy(): taken at the next step
+    std::string policy_name_;
     std::deque<EntryPtr> pending_;
     EngineLoopStats stats_;
     KvCacheStats kv_snapshot_;

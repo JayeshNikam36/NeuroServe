@@ -32,7 +32,8 @@ class EngineSection(_Strict):
     max_batch_tokens: int = Field(default=512, ge=1)  # tokens one engine step may process (prefill + decode)
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
-    scheduling_policy: Literal["fcfs"] = "fcfs"  # which queued requests are admitted next
+    # which requests are admitted and preempted each step; see docs/scheduling.md
+    scheduling_policy: Literal["fcfs", "token-budget", "decode-first"] = "fcfs"
 
 
 class LimitsSection(_Strict):

@@ -1,0 +1,16 @@
+# The token_budget workload under the token-budget policy. Step 0: the prefills of a and b use 60
+# of the 64 tokens; c (50) does not fit and is skipped, so d (3) uses the remaining room instead of
+# waiting behind c as it does under FCFS. c starts in step 1.
+policy token-budget
+limits max_batch=8 total_pages=64 page_size=16 max_batch_tokens=64
+arrive step=0 id=a prompt=30 max_new=6
+arrive step=0 id=b prompt=30 max_new=4
+arrive step=0 id=c prompt=50 max_new=3
+arrive step=0 id=d prompt=3 max_new=2
+--- expected
+step 0 queued=[a b c d] running=[] preempt=[] admit=[a b d] finished=[] tokens=63+0 free_pages=59
+step 1 queued=[c] running=[a b d] preempt=[] admit=[c] finished=[d] tokens=50+3 free_pages=56
+step 2 queued=[] running=[a b c] preempt=[] admit=[] finished=[] tokens=0+3 free_pages=56
+step 3 queued=[] running=[a b c] preempt=[] admit=[] finished=[b c] tokens=0+3 free_pages=61
+step 4 queued=[] running=[a] preempt=[] admit=[] finished=[] tokens=0+1 free_pages=61
+step 5 queued=[] running=[a] preempt=[] admit=[] finished=[a] tokens=0+1 free_pages=64

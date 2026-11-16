@@ -26,7 +26,11 @@ def small_engine(refs):
 
 
 @needs_model
-def test_preempted_requests_restart_and_still_match_hugging_face(small_engine, refs):
+@pytest.mark.parametrize("policy", ["fcfs", "token-budget", "decode-first"])
+def test_preempted_requests_restart_and_still_match_hugging_face(small_engine, refs, policy):
+    # Every policy must produce exactly the Hugging Face tokens; only the order of the work differs.
+    small_engine.set_scheduling_policy(policy)
+    before = small_engine.stats()
     jobs = [refs[i % 8] for i in range(24)]
     results: list[list[int] | None] = [None] * len(jobs)
     errors: list[Exception] = []
@@ -48,7 +52,8 @@ def test_preempted_requests_restart_and_still_match_hugging_face(small_engine, r
     mismatched = [k for k, (_, expected) in enumerate(jobs) if results[k] != expected]
     assert not mismatched, f"{len(mismatched)} of {len(jobs)} differ from Hugging Face (first: request {mismatched[0]})"
     stats = small_engine.stats()
-    assert stats["preemptions"] > 0, "the KV cache was never short: preemption was not exercised"
-    assert stats["completed"] == len(jobs)
+    assert stats["policy"] == policy
+    assert stats["preemptions"] > before["preemptions"], "the KV cache was never short: preemption was not exercised"
+    assert stats["completed"] - before["completed"] == len(jobs)
     kv = small_engine.kv_stats()
     assert kv["free_pages"] == kv["total_pages"], "KV pages leaked"

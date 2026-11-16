@@ -182,14 +182,26 @@ TEST(EngineLoop, HundredConcurrentSubmittersAllCompleteCorrectly) {
     EXPECT_EQ(backend.live_sequences(), 0) << "sequences leaked";
 }
 
-TEST(EngineLoop, KvPressurePreemptsAndEveryRequestStillCompletesCorrectly) {
+// The correctness tests below run once per scheduling policy: every policy must produce exactly
+// the same tokens; only the order and timing of the work may differ.
+class EveryPolicy : public ::testing::TestWithParam<std::string> {};
+
+INSTANTIATE_TEST_SUITE_P(Policies, EveryPolicy,
+                         ::testing::Values("fcfs", "token-budget", "decode-first"),
+                         [](const ::testing::TestParamInfo<std::string>& param_info) {
+                             std::string name = param_info.param;
+                             std::replace(name.begin(), name.end(), '-', '_');  // test names: no '-'
+                             return name;
+                         });
+
+TEST_P(EveryPolicy, KvPressurePreemptsAndEveryRequestStillCompletesCorrectly) {
     // 8 pages of 16 tokens; six requests that each grow to 64 tokens (4 pages). Pages are taken on
     // demand, so all six start; when they outgrow the cache the newest are preempted, restart from
     // their prompt, and still produce exactly the right tokens.
     FakeBackend backend(1000, /*total_pages=*/8);
     FirstDecodeGate gate;
     gate.install(backend);
-    EngineLoop loop(backend, {.max_batch = 8});
+    EngineLoop loop(backend, {.max_batch = 8, .policy = GetParam()});
 
     std::vector<RequestHandle> handles;
     for (TokenId i = 0; i < 6; ++i) {
@@ -207,7 +219,7 @@ TEST(EngineLoop, KvPressurePreemptsAndEveryRequestStillCompletesCorrectly) {
     EXPECT_EQ(backend.live_sequences(), 0);
 }
 
-TEST(EngineLoop, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
+TEST_P(EveryPolicy, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
     // The plan's acceptance test: 24 requests of different lengths all complete correctly,
     // requests join a batch that is already running and leave it when done (continuous
     // batching), and no KV page leaks.
@@ -215,7 +227,7 @@ TEST(EngineLoop, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
     backend.record_batches = true;
     FirstDecodeGate gate;
     gate.install(backend);
-    EngineLoop loop(backend, {.max_batch = 8});
+    EngineLoop loop(backend, {.max_batch = 8, .policy = GetParam()});
 
     std::vector<GenerationParams> inputs;
     std::vector<RequestHandle> handles;
