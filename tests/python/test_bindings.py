@@ -124,6 +124,24 @@ def test_cancel_stops_a_running_request_and_frees_its_pages(engine):
 
 
 @needs_model
+def test_latency_is_recorded_per_request_and_as_percentiles(engine):
+    before = engine.latency()
+    results = [engine.run(prompt, len(expected)) for prompt, expected in map(reference, range(4))]
+    for r in results:
+        n = len(r.tokens)
+        assert n > 1 and 0 < r.itl_ms <= r.max_itl_ms
+        # The gaps between tokens add up to the time from the first token to the end.
+        assert r.itl_ms * (n - 1) <= r.e2e_ms - r.ttft_ms + 0.01
+        assert r.itl_ms * (n - 1) >= 0.9 * (r.e2e_ms - r.ttft_ms) - 1.0
+    after = engine.latency()
+    assert after["ttft_ms"]["count"] - before["ttft_ms"]["count"] == 4
+    assert after["itl_ms"]["count"] - before["itl_ms"]["count"] == sum(len(r.tokens) - 1 for r in results)
+    for metric in ("queue_ms", "ttft_ms", "itl_ms", "e2e_ms"):
+        s = after[metric]
+        assert 0 <= s["p50"] <= s["p95"] <= s["p99"] <= s["max"], metric
+
+
+@needs_model
 def test_generate_releases_the_gil(engine):
     """A Python thread must keep running while generate() works in C++."""
     prompt, expected = reference(0)

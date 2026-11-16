@@ -40,6 +40,12 @@ struct EngineLoop::Entry {
     std::vector<TokenId> tokens;
     Request::Clock::time_point first_token_at{};
     FinishReason finish = FinishReason::kLength;
+    // Inter-token latency, over new tokens only: tokens regenerated after a preemption are not
+    // timed again (the client already has them), but the stall before the next new token is.
+    std::size_t timed_tokens = 0;
+    Request::Clock::time_point last_token_at{};
+    double itl_sum_ms = 0.0;
+    double itl_max_ms = 0.0;
 };
 
 namespace {
@@ -355,6 +361,7 @@ void EngineLoop::loop() {
                 stats_.prefill_tokens += static_cast<std::uint64_t>(step.prefill_tokens);
                 stats_.decode_tokens += static_cast<std::uint64_t>(step.decode_tokens);
                 stats_.max_step_tokens = std::max(stats_.max_step_tokens, step.prefill_tokens + step.decode_tokens);
+                flush_itl_samples_locked();
             }
             if (options_.on_step) {
                 options_.on_step(step);
@@ -591,6 +598,17 @@ void EngineLoop::decode_active() {
 
 bool EngineLoop::append_token(Entry& entry, TokenId token) {
     entry.tokens.push_back(token);
+    if (entry.tokens.size() > entry.timed_tokens) {  // a new token, not one regenerated after a preemption
+        const auto now = Request::Clock::now();
+        if (entry.timed_tokens > 0) {
+            const double gap = ms_between(entry.last_token_at, now);
+            entry.itl_sum_ms += gap;
+            entry.itl_max_ms = std::max(entry.itl_max_ms, gap);
+            itl_samples_.push_back(gap);
+        }
+        entry.last_token_at = now;
+        entry.timed_tokens = entry.tokens.size();
+    }
     if (entry.params.stream) {
         publish_token(entry, token);
     }
@@ -625,6 +643,18 @@ void EngineLoop::publish_token(Entry& entry, TokenId token) {
         log::write(log::Level::kError, kLogger, "restarted request generated a different token than it streamed",
                    {{"engine_request_id", entry.request.id()}, {"index", index}});
     }
+}
+
+void EngineLoop::flush_itl_samples_locked() {
+    for (const double gap : itl_samples_) {
+        itl_hist_.record(gap);
+    }
+    itl_samples_.clear();
+}
+
+LatencyStats EngineLoop::latency() const {
+    std::lock_guard lock(mu_);
+    return {summarize(queue_hist_), summarize(ttft_hist_), summarize(itl_hist_), summarize(e2e_hist_)};
 }
 
 void EngineLoop::release(Entry& entry) noexcept {
@@ -663,6 +693,10 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
                                  *request.entered_at(RequestState::kAdmitted));
     result.ttft_ms = ms_between(received, entry->first_token_at);
     result.e2e_ms = ms_between(received, request.last_transition_at());
+    if (entry->timed_tokens > 1) {
+        result.itl_ms = entry->itl_sum_ms / static_cast<double>(entry->timed_tokens - 1);
+        result.max_itl_ms = entry->itl_max_ms;
+    }
     result.tokens = std::move(entry->tokens);
 
     log::write(log::Level::kInfo, kLogger, "request completed",
@@ -670,11 +704,16 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
                 {"priority", entry->params.priority},
                 {"prompt_tokens", result.prompt_tokens}, {"completion_tokens", result.tokens.size()},
                 {"finish_reason", std::string(to_string(result.finish_reason))},
-                {"queue_ms", result.queue_ms}, {"ttft_ms", result.ttft_ms}, {"e2e_ms", result.e2e_ms}});
+                {"queue_ms", result.queue_ms}, {"ttft_ms", result.ttft_ms}, {"itl_ms", result.itl_ms},
+                {"max_itl_ms", result.max_itl_ms}, {"e2e_ms", result.e2e_ms}});
     {
         std::lock_guard lock(mu_);
         ++stats_.completed;
         unfinished_.erase(entry->request.id());
+        queue_hist_.record(result.queue_ms);
+        ttft_hist_.record(result.ttft_ms);
+        e2e_hist_.record(result.e2e_ms);
+        flush_itl_samples_locked();  // so latency() includes this request's gaps once its caller has the result
     }
     deliver_result(*entry->state, std::move(result));
 }

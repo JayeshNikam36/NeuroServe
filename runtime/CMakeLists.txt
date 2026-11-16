@@ -4,7 +4,8 @@ add_library(neuroserve_core
     core/src/request.cpp
     core/src/engine_loop.cpp
     core/src/log.cpp
-    core/src/scheduler.cpp)
+    core/src/scheduler.cpp
+    core/src/latency_histogram.cpp)
 add_library(neuroserve::core ALIAS neuroserve_core)
 
 target_include_directories(neuroserve_core
