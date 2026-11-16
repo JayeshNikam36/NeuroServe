@@ -18,8 +18,8 @@ stateDiagram-v2
     DECODE --> PREEMPTED
     PREEMPTED --> QUEUED: pages reclaimed, re-admitted later
     RECEIVED --> REJECTED
-    VALIDATED --> REJECTED
-    QUEUED --> REJECTED: queue full / timeout
+    VALIDATED --> REJECTED: queue full
+    QUEUED --> REJECTED: queue timeout
     ADMITTED --> FAILED
     PREFILL --> FAILED
     DECODE --> FAILED
@@ -38,7 +38,7 @@ from `QUEUED` or `DECODE`: cancellations are applied between steps, and a reques
 | Terminal state | Meaning for the client |
 | --- | --- |
 | `COMPLETED` | Finished: stop token or `max_tokens` |
-| `REJECTED` | Never ran on the GPU: safe to retry |
+| `REJECTED` | Never ran on the GPU: safe to retry. Reasons: invalid request, queue full (`engine.max_queue`, HTTP 429), queue timeout (`engine.queue_timeout_ms`, HTTP 503; requests that were preempted after starting are exempt) |
 | `FAILED` | Error while running |
 | `CANCELLED` | Cancelled by the client |
 

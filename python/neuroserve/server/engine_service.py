@@ -140,6 +140,8 @@ class EngineService:
             device_index=e.device_index,
             scheduling_policy=e.scheduling_policy,
             priority_aging_ms=e.priority_aging_ms,
+            max_queue=e.max_queue,
+            queue_timeout_ms=e.queue_timeout_ms,
         )
         tokenizer = ChatTokenizer(config.model.tokenizer_dir)
         return cls(config, engine, tokenizer, device_info(e.device_index)["name"])

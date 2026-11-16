@@ -58,6 +58,18 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// submit() refused the request: max_queue requests are already waiting. Retry later.
+class QueueFull : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// The request waited longer than queue_timeout_ms without being admitted and was REJECTED.
+class QueueTimeout : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // The caller's side of one request. Copyable; all copies refer to the same request.
 class RequestHandle {
 public:
@@ -102,6 +114,8 @@ struct EngineLoopOptions {
     int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
     PolicyOptions policy_options{};  // settings for the policy named in `policy`
+    int max_queue = 1024;          // most requests waiting in the queue; submit() throws QueueFull beyond it
+    int queue_timeout_ms = 0;      // a request not admitted within this time is REJECTED (QueueTimeout); 0 = never
     // Called on the engine thread after every step that did work. Must be fast and must not throw.
     std::function<void(const StepStats&)> on_step{};
 };
@@ -109,7 +123,8 @@ struct EngineLoopOptions {
 // Counters for monitoring and tests. A consistent snapshot, safe to read from any thread.
 struct EngineLoopStats {
     std::uint64_t submitted = 0;  // accepted into the queue
-    std::uint64_t rejected = 0;   // refused by submit() (invalid, or engine stopped)
+    std::uint64_t rejected = 0;   // refused by submit() (invalid, queue full, or engine stopped)
+    std::uint64_t timed_out = 0;  // REJECTED after waiting longer than queue_timeout_ms
     std::uint64_t completed = 0;
     std::uint64_t failed = 0;
     std::uint64_t cancelled = 0;
@@ -188,6 +203,7 @@ private:
     void run() noexcept;
     void loop();
     void apply_cancellations();
+    void expire_queued();  // queue_timeout_ms: reject requests that waited too long for admission
     void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
     void preempt(std::vector<EntryPtr> victims);
     void start(EntryPtr entry, std::vector<EntryPtr>& joining);
@@ -197,6 +213,7 @@ private:
     void complete(EntryPtr entry) noexcept;
     void fail(EntryPtr entry, std::exception_ptr error) noexcept;
     void cancel(Entry& entry, std::exception_ptr error) noexcept;
+    void reject(Entry& entry, std::exception_ptr error) noexcept;  // a queued request that was never admitted
     void release(Entry& entry) noexcept;
     void cancel_all() noexcept;
     void refresh_kv_snapshot() noexcept;

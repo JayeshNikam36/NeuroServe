@@ -14,6 +14,8 @@ engine:
   device_index: 0
   scheduling_policy: fcfs                  # fcfs | token-budget | decode-first | priority; see docs/scheduling.md
   priority_aging_ms: 1000                  # priority policy: +1 level per second of waiting
+  max_queue: 256                           # waiting requests; beyond this, 429 queue_full
+  queue_timeout_ms: 30000                  # not admitted within 30 s: 503 queue_timeout (0 = no limit)
 
 limits:
   default_max_tokens: 128                   # used when a request sets no max_tokens

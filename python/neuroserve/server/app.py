@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import CudaError, EngineStopped, KvCacheExhausted, RequestCancelled, __version__
+from .. import CudaError, EngineStopped, KvCacheExhausted, QueueFull, QueueTimeout, RequestCancelled, __version__
 from .config import ServerConfig
 from .engine_service import ContextLengthExceeded, EngineService, GenerationResult, StreamingGeneration
 from .logging_setup import request_id_var
@@ -49,21 +49,26 @@ class ApiError(Exception):
     """An error returned to the client in OpenAI's error format."""
 
     def __init__(self, status_code: int, message: str, *, type_: str = "invalid_request_error",
-                 param: str | None = None, code: str | None = None) -> None:
+                 param: str | None = None, code: str | None = None, headers: dict[str, str] | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.type = type_
         self.param = param
         self.code = code
+        self.headers = headers  # e.g. Retry-After for 429 and 503
 
 
 def _error(status_code: int, message: str, type_: str, param: str | None = None,
-           code: str | None = None) -> JSONResponse:
+           code: str | None = None, headers: dict[str, str] | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"error": {"message": message, "type": type_, "param": param, "code": code}},
+        headers=headers,
     )
+
+
+RETRY_AFTER = {"Retry-After": "1"}  # overload errors: the client may retry after a second
 
 
 def _check_request(config: ServerConfig, *, model: str, stream: bool, stream_options: StreamOptions | None,
@@ -89,6 +94,12 @@ def _api_error(request: Request, exc: Exception, param: str) -> ApiError | None:
     """The client-facing error for an exception from the service or engine (None: a bug)."""
     if isinstance(exc, ContextLengthExceeded):
         return ApiError(413, str(exc), param=param, code="context_length_exceeded")
+    if isinstance(exc, QueueFull):
+        return ApiError(429, f"the server is busy: {exc}; retry later", type_="server_error", code="queue_full",
+                        headers=RETRY_AFTER)
+    if isinstance(exc, QueueTimeout):
+        return ApiError(503, f"the server is busy: {exc}", type_="server_error", code="queue_timeout",
+                        headers=RETRY_AFTER)
     if isinstance(exc, RequestCancelled):
         # 499 (nginx's "client closed request"): cancelled by a disconnect or DELETE /v1/requests/{id}.
         return ApiError(499, "the request was cancelled", code="request_cancelled")
@@ -286,7 +297,7 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
 
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return _error(exc.status_code, exc.message, exc.type, exc.param, exc.code)
+        return _error(exc.status_code, exc.message, exc.type, exc.param, exc.code, exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

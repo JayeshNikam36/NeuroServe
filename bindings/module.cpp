@@ -85,12 +85,11 @@ private:
 // at the same time and their requests are batched together. Heavy calls run with the GIL released.
 class Engine {
 public:
-    Engine(const ns::CudaLlmEngineConfig& config, int max_batch_tokens, std::unique_ptr<core::SchedulingPolicy> policy,
-           core::PolicyOptions policy_options)
-        : policy_options_(policy_options),
+    Engine(const ns::CudaLlmEngineConfig& config, core::EngineLoopOptions loop_options,
+           std::unique_ptr<core::SchedulingPolicy> policy)
+        : policy_options_(loop_options.policy_options),
           backend_(std::make_unique<ns::CudaLlmEngineBackend>(config)),
-          loop_(std::make_unique<core::EngineLoop>(*backend_, loop_options(config, max_batch_tokens),
-                                                   std::move(policy))) {}
+          loop_(std::make_unique<core::EngineLoop>(*backend_, std::move(loop_options), std::move(policy))) {}
 
     // Members are destroyed in reverse order: the loop (and its thread) stops before the backend goes.
 
@@ -158,6 +157,7 @@ public:
         out["completed"] = s.completed;
         out["failed"] = s.failed;
         out["cancelled"] = s.cancelled;
+        out["timed_out"] = s.timed_out;
         out["preemptions"] = s.preemptions;
         out["decode_steps"] = s.decode_steps;
         out["prefill_tokens"] = s.prefill_tokens;
@@ -171,13 +171,6 @@ public:
     }
 
 private:
-    static core::EngineLoopOptions loop_options(const ns::CudaLlmEngineConfig& config, int max_batch_tokens) {
-        core::EngineLoopOptions options;
-        options.max_batch = config.max_batch;
-        options.max_batch_tokens = max_batch_tokens;
-        return options;
-    }
-
     const core::PolicyOptions policy_options_;  // also used by set_scheduling_policy
     std::unique_ptr<ns::CudaLlmEngineBackend> backend_;
     std::unique_ptr<core::EngineLoop> loop_;
@@ -194,6 +187,8 @@ PYBIND11_MODULE(_core, m) {
     py::register_exception<ns::cuda::CudaError>(m, "CudaError", PyExc_RuntimeError);
     py::register_exception<core::EngineStopped>(m, "EngineStopped", PyExc_RuntimeError);
     py::register_exception<core::RequestCancelled>(m, "RequestCancelled", PyExc_RuntimeError);
+    py::register_exception<core::QueueFull>(m, "QueueFull", PyExc_RuntimeError);
+    py::register_exception<core::QueueTimeout>(m, "QueueTimeout", PyExc_RuntimeError);
 
     py::tuple policies(std::size(core::kPolicyNames));
     for (std::size_t i = 0; i < std::size(core::kPolicyNames); ++i) {
@@ -233,11 +228,22 @@ PYBIND11_MODULE(_core, m) {
     py::class_<Engine>(m, "Engine", "Loads a model onto the GPU and generates tokens (greedy).")
         .def(py::init([](const std::string& model_dir, int max_prompt_tokens, int num_pages,
                          int max_batch, int max_batch_tokens, int max_pages_per_sequence, int device_index,
-                         const std::string& scheduling_policy, int priority_aging_ms) {
-                 core::PolicyOptions policy_options;
-                 policy_options.priority_aging_ms = priority_aging_ms;
-                 // An unknown name or a bad option raises ValueError here, before the weights are loaded.
-                 auto policy = core::make_policy(scheduling_policy, policy_options);
+                         const std::string& scheduling_policy, int priority_aging_ms, int max_queue,
+                         int queue_timeout_ms) {
+                 core::EngineLoopOptions loop_options;
+                 loop_options.max_batch = max_batch;
+                 loop_options.max_batch_tokens = max_batch_tokens;
+                 loop_options.policy_options.priority_aging_ms = priority_aging_ms;
+                 loop_options.max_queue = max_queue;
+                 loop_options.queue_timeout_ms = queue_timeout_ms;
+                 // Bad options raise ValueError here, before the weights are loaded.
+                 if (max_queue < 1) {
+                     throw std::invalid_argument("max_queue must be at least 1");
+                 }
+                 if (queue_timeout_ms < 0) {
+                     throw std::invalid_argument("queue_timeout_ms must be 0 (no timeout) or more");
+                 }
+                 auto policy = core::make_policy(scheduling_policy, loop_options.policy_options);
                  ns::CudaLlmEngineConfig config;
                  config.model_dir = model_dir;
                  config.max_prompt_tokens = max_prompt_tokens;
@@ -246,13 +252,13 @@ PYBIND11_MODULE(_core, m) {
                  config.max_pages_per_sequence = max_pages_per_sequence;
                  config.device_index = device_index;
                  py::gil_scoped_release release;  // loading 2.5 GB of weights takes seconds
-                 return std::make_unique<Engine>(config, max_batch_tokens, std::move(policy), policy_options);
+                 return std::make_unique<Engine>(config, std::move(loop_options), std::move(policy));
              }),
              py::arg("model_dir"), py::kw_only(),
              py::arg("max_prompt_tokens") = 512, py::arg("num_pages") = 2048,
              py::arg("max_batch") = 8, py::arg("max_batch_tokens") = 512, py::arg("max_pages_per_sequence") = 64,
              py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs",
-             py::arg("priority_aging_ms") = 1000)
+             py::arg("priority_aging_ms") = 1000, py::arg("max_queue") = 1024, py::arg("queue_timeout_ms") = 0)
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",
