@@ -18,4 +18,4 @@ Search the server log for the request id to find the full context (and traceback
 | 500 | `server_error` | `internal_error` | Unexpected server error (message contains the request id; details only in the log) |
 | 500 | `server_error` | `gpu_error` | CUDA error during generation; the server marks itself unhealthy |
 | 503 | `server_error` | `kv_cache_exhausted` | Not enough free KV-cache pages for the request |
-| 503 | `server_error` | `service_unavailable` | Every request after a GPU error; `/health` also returns 503. Restart required |
+| 503 | `server_error` | `service_unavailable` | Every request after a GPU error (`/health` also returns 503; restart required), or a request caught by an engine shutdown |

@@ -62,7 +62,9 @@ class NeuroServeInfo(BaseModel):
     """NeuroServe response extension: timing, engine work and (on request) token ids."""
 
     e2e_ms: float
-    generated_tokens: int  # includes tokens generated after the stop token (wasted work until Phase 2)
+    ttft_ms: float         # time to first token, measured in the engine
+    queue_ms: float        # time spent waiting for admission
+    generated_tokens: int  # tokens the engine produced (stops on the stop token: equals completion_tokens)
     completion_token_ids: list[int] | None = None  # returned tokens, including the stop token if hit
 
 

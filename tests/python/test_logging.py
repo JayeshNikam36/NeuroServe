@@ -23,9 +23,9 @@ SECRET = "SECRET-PROMPT-7731"
 class LoggingEngine(FakeEngine):
     """A fake engine that logs from inside generate(), i.e. from the worker thread."""
 
-    def generate(self, prompt_ids, max_new_tokens):
+    def run(self, *args, **kwargs):
         logging.getLogger("test.engine").info("generating inside the worker thread")
-        return super().generate(prompt_ids, max_new_tokens)
+        return super().run(*args, **kwargs)
 
 
 @pytest.fixture
@@ -76,6 +76,15 @@ def test_access_log_is_json_with_request_id_and_usage(tok, log_buffer):
     assert line["duration_ms"] >= 0 and line["prompt_tokens"] > 0
     assert line["completion_tokens"] == resp.json()["usage"]["completion_tokens"]
     assert line["finish_reason"] == "stop"
+
+
+def test_access_log_links_to_the_engine_request(tok, log_buffer):
+    with TestClient(build_app(tok)) as client:
+        client.post("/v1/chat/completions", json=chat_body())
+    line = next(r for r in records(log_buffer)
+                if r["logger"] == "neuroserve.access" and r["path"] == "/v1/chat/completions")
+    assert line["engine_request_id"] == "ns-000001"  # the same id appears in the C++ engine's log line
+    assert line["ttft_ms"] >= 0 and line["queue_ms"] >= 0
 
 
 def test_request_id_reaches_logs_written_in_the_worker_thread(tok, log_buffer):

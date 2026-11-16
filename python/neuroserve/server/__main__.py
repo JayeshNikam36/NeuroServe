@@ -8,6 +8,7 @@ import os
 
 import uvicorn
 
+from .. import set_log_level
 from .app import create_app
 from .config import load_config
 from .logging_setup import configure_logging
@@ -22,6 +23,7 @@ def main() -> None:
 
     config = load_config(args.config)
     configure_logging(config.logging.level, config.logging.format)
+    set_log_level(config.logging.level)  # C++ engine lines: JSON on stderr
     # log_config=None: uvicorn uses NeuroServe's logging; access_log=False: NeuroServe writes its own.
     uvicorn.run(create_app(config), host=args.host or config.server.host,
                 port=args.port or config.server.port, log_config=None, access_log=False)

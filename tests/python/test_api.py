@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,23 +31,36 @@ def make_config(**engine) -> ServerConfig:
 
 
 class FakeEngine:
-    """Returns a fixed reply, padded to exactly max_new_tokens like the real engine."""
+    """Like the real engine's run(): a fixed reply, then filler, ending at the first stop token."""
 
     def __init__(self, reply_ids: list[int], filler: int, error: Exception | None = None) -> None:
         self.reply_ids = reply_ids
         self.filler = filler
         self.error = error
         self.calls: list[tuple[list[int], int]] = []
+        self.stop_token_ids: list[list[int]] = []
+        self.client_request_ids: list[str] = []
 
-    def generate(self, prompt_ids, max_new_tokens):
+    def run(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id=""):
         if self.error is not None:
             raise self.error
         self.calls.append((list(prompt_ids), max_new_tokens))
-        out = list(self.reply_ids[:max_new_tokens])
-        return out + [self.filler] * (max_new_tokens - len(out))
+        self.stop_token_ids.append(list(stop_token_ids))
+        self.client_request_ids.append(client_request_id)
+        out = []
+        for token in (self.reply_ids + [self.filler] * max_new_tokens)[:max_new_tokens]:
+            out.append(token)
+            if token in stop_token_ids:
+                break
+        finish = "stop" if out[-1] in stop_token_ids else "length"
+        return SimpleNamespace(request_id=f"ns-{len(self.calls):06d}", tokens=out, finish_reason=finish,
+                               queue_ms=0.1, ttft_ms=0.5, e2e_ms=1.0)
 
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64}
+
+    def stats(self):
+        return {"submitted": len(self.calls), "pending": 0, "active": 0}
 
 
 @pytest.fixture(scope="module")
@@ -211,6 +225,16 @@ def test_ignore_eos_generates_exactly_max_tokens(tok):
                            json=chat_body(max_tokens=20, neuroserve={"ignore_eos": True, "return_token_ids": True})).json()
     assert body["choices"][0]["finish_reason"] == "length"
     assert body["usage"]["completion_tokens"] == 20 == len(body["neuroserve"]["completion_token_ids"])
+
+
+def test_stop_tokens_and_request_id_are_passed_to_the_engine(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        client.post("/v1/chat/completions", json=chat_body(), headers={"X-Request-ID": "trace-42"})
+        client.post("/v1/chat/completions", json=chat_body(neuroserve={"ignore_eos": True}))
+    assert set(engine.stop_token_ids[0]) == set(tok.stop_token_ids)  # the engine stops, not Python
+    assert engine.stop_token_ids[1] == []                             # ignore_eos: no stop tokens
+    assert engine.client_request_ids[0] == "trace-42"                 # links engine logs to the request
 
 
 @pytest.mark.parametrize("payload, param", [

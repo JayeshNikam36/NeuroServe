@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..tokenizer import ChatTokenizer
 from .config import ServerConfig
+from .logging_setup import request_id_var
+
+
+class EngineOutput(Protocol):
+    """One finished request, as the engine reports it (neuroserve.GenerationResult or a test fake)."""
+
+    request_id: str      # the engine's id, e.g. "ns-000042"
+    tokens: list[int]    # generated tokens, including the stop token if one was hit
+    finish_reason: str   # "stop" or "length"
+    queue_ms: float
+    ttft_ms: float
+    e2e_ms: float
 
 
 class GenerationEngine(Protocol):
-    """What the service needs from an engine (the real neuroserve.Engine, or a test fake)."""
+    """What the service needs from an engine (the real neuroserve.Engine, or a test fake).
 
-    def generate(self, prompt_ids: list[int], max_new_tokens: int) -> list[int]: ...
+    run() must be safe to call from many threads at once: the real engine batches concurrent calls.
+    """
+
+    def run(self, prompt_ids: list[int], max_new_tokens: int, *, stop_token_ids: list[int],
+            client_request_id: str) -> EngineOutput: ...
 
     def kv_stats(self) -> dict[str, Any]: ...
+
+    def stats(self) -> dict[str, Any]: ...
 
 
 class ContextLengthExceeded(ValueError):
@@ -28,9 +44,12 @@ class GenerationResult:
     text: str              # decoded returned tokens, without the stop token
     token_ids: list[int]   # returned tokens, including the stop token when one was hit
     prompt_tokens: int
-    generated_tokens: int  # tokens the engine produced (>= len(token_ids) until Phase 2)
+    generated_tokens: int  # tokens the engine produced; equals completion_tokens (it stops on the stop token)
     finish_reason: str     # "stop" or "length"
     e2e_ms: float
+    ttft_ms: float
+    queue_ms: float
+    engine_request_id: str
 
     @property
     def completion_tokens(self) -> int:
@@ -38,9 +57,9 @@ class GenerationResult:
 
 
 class EngineService:
-    """One generation at a time: the engine is not thread-safe.
+    """Turns API requests into engine requests.
 
-    Continuous batching (Phase 2) replaces the lock with a scheduler.
+    No lock: the engine's own loop serialises GPU work and batches requests that arrive together.
     """
 
     def __init__(self, config: ServerConfig, engine: GenerationEngine, tokenizer: ChatTokenizer,
@@ -49,7 +68,7 @@ class EngineService:
         self._engine = engine
         self._tokenizer = tokenizer
         self._device_name = device_name
-        self._lock = threading.Lock()
+        self._stop_token_ids = sorted(tokenizer.stop_token_ids)
 
     @classmethod
     def load(cls, config: ServerConfig) -> "EngineService":
@@ -79,6 +98,9 @@ class EngineService:
     def kv_stats(self) -> dict[str, Any]:
         return self._engine.kv_stats()
 
+    def engine_stats(self) -> dict[str, Any]:
+        return self._engine.stats()
+
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
              ignore_eos: bool = False) -> GenerationResult:
         prompt_ids = self._tokenizer.encode_chat(messages, date_string=self._config.model.chat_date_string)
@@ -101,24 +123,22 @@ class EngineService:
         if len(prompt_ids) > limit:
             raise ContextLengthExceeded(f"the prompt has {len(prompt_ids)} tokens; the limit is {limit}")
 
-        start = time.perf_counter()
-        with self._lock:
-            out = list(self._engine.generate(prompt_ids, max_new_tokens=max_new_tokens))
-        e2e_ms = (time.perf_counter() - start) * 1000.0
-
-        stop_at = None
-        if not ignore_eos:
-            stop_at = next((i for i, t in enumerate(out) if t in self._tokenizer.stop_token_ids), None)
-        if stop_at is None:
-            returned, finish_reason, text_ids = out, "length", out
-        else:
-            returned, finish_reason, text_ids = out[:stop_at + 1], "stop", out[:stop_at]
-
+        # The engine stops on the step that produces a stop token (and includes it in the output).
+        out = self._engine.run(
+            prompt_ids, max_new_tokens,
+            stop_token_ids=[] if ignore_eos else self._stop_token_ids,
+            client_request_id=request_id_var.get() or "",  # links the engine's log line to this request
+        )
+        tokens = list(out.tokens)
+        stopped = out.finish_reason == "stop"
         return GenerationResult(
-            text=self._tokenizer.decode(text_ids),
-            token_ids=returned,
+            text=self._tokenizer.decode(tokens[:-1] if stopped else tokens),
+            token_ids=tokens,
             prompt_tokens=len(prompt_ids),
-            generated_tokens=len(out),
-            finish_reason=finish_reason,
-            e2e_ms=e2e_ms,
+            generated_tokens=len(tokens),
+            finish_reason=out.finish_reason,
+            e2e_ms=out.e2e_ms,
+            ttft_ms=out.ttft_ms,
+            queue_ms=out.queue_ms,
+            engine_request_id=out.request_id,
         )

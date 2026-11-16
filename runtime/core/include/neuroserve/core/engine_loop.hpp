@@ -24,6 +24,7 @@ struct GenerationParams {
     std::vector<TokenId> prompt;
     int max_new_tokens = 16;
     std::vector<TokenId> stop_token_ids;  // generation ends on (and includes) the first of these
+    std::string client_request_id;        // caller's id (e.g. HTTP X-Request-ID), only for logs
 };
 
 enum class FinishReason : std::uint8_t { kStop, kLength };
@@ -91,6 +92,7 @@ struct EngineLoopStats {
 // Only the engine thread touches the backend. Callers only enqueue and wait.
 // Each step decodes all active requests together (one decode_step call for the whole batch),
 // and a request finishes on the step that produces its stop token or its last allowed token.
+// Logs one JSON line per finished request (logger "neuroserve.engine"); never logs token ids.
 // Admission reserves KV pages for a request's whole length up front, so the cache cannot run out
 // mid-generation (Day 14 replaces this with on-demand allocation and preemption).
 class EngineLoop {
@@ -112,6 +114,10 @@ public:
 
     EngineLoopStats stats() const;
 
+    // KV-cache usage as of the engine thread's last change. Safe from any thread; up to date for a
+    // request's pages by the time its wait() returns.
+    KvCacheStats kv_stats() const;
+
 private:
     struct Entry;
     using EntryPtr = std::unique_ptr<Entry>;
@@ -131,6 +137,7 @@ private:
     void cancel(Entry& entry, std::exception_ptr error) noexcept;
     void release(Entry& entry) noexcept;
     void cancel_all() noexcept;
+    void refresh_kv_snapshot() noexcept;
 
     InferenceBackend& backend_;
     const EngineLoopOptions options_;
@@ -145,6 +152,7 @@ private:
     bool stop_ = false;
     std::deque<EntryPtr> pending_;
     EngineLoopStats stats_;
+    KvCacheStats kv_snapshot_;
 
     std::vector<EntryPtr> active_;  // engine thread only
     int reserved_pages_ = 0;        // engine thread only
