@@ -88,3 +88,47 @@ def test_generate_releases_the_gil(engine):
     stop.set()
     worker.join()
     assert during > 10_000, f"Python thread barely ran during generate ({during} ticks): GIL not released?"
+
+# ---- Day 12B: the engine loop behind Engine.run() -------------------------------------------
+
+@needs_model
+def test_run_stops_on_the_stop_token(engine):
+    prompt, expected = reference(0)
+    stop = expected[5]
+    first = expected.index(stop)  # the first occurrence ends generation
+    result = engine.run(prompt, len(expected), stop_token_ids=[stop], client_request_id="test")
+    assert result.tokens == expected[: first + 1]  # includes the stop token
+    assert result.finish_reason == "stop"
+    assert result.request_id.startswith("ns-")
+    assert 0 <= result.ttft_ms <= result.e2e_ms
+
+
+@needs_model
+def test_100_concurrent_requests_are_batched_and_match_hugging_face(engine):
+    jobs = [reference(i % 8) for i in range(100)]
+    results: list[list[int] | None] = [None] * len(jobs)
+    errors: list[Exception] = []
+
+    def worker(k: int) -> None:
+        try:
+            prompt, expected = jobs[k]
+            results[k] = engine.generate(prompt, max_new_tokens=len(expected))
+        except Exception as exc:  # collected and reported below, so a thread error cannot pass silently
+            errors.append(exc)
+
+    before = engine.stats()
+    threads = [threading.Thread(target=worker, args=(k,)) for k in range(len(jobs))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=300)
+
+    assert not errors, errors[:3]
+    mismatched = [k for k, (_, expected) in enumerate(jobs) if results[k] != expected]
+    assert not mismatched, (f"{len(mismatched)} of 100 differ from Hugging Face "
+                            f"(first: request {mismatched[0]}, reference prompt {mismatched[0] % 8})")
+    after = engine.stats()
+    assert after["completed"] - before["completed"] == 100
+    assert after["max_batch_seen"] > 1, "concurrent requests were not batched"
+    kv = engine.kv_stats()
+    assert kv["free_pages"] == kv["total_pages"], "KV pages leaked"

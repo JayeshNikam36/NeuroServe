@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "neuroserve/core/log.hpp"
+
 namespace neuroserve::core {
 
 struct RequestHandle::State {
@@ -35,6 +37,18 @@ struct EngineLoop::Entry {
 };
 
 namespace {
+
+constexpr std::string_view kLogger = "neuroserve.engine";
+
+std::string describe(const std::exception_ptr& error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "unknown error";
+    }
+}
 
 double ms_between(Request::Clock::time_point from, Request::Clock::time_point to) {
     return std::chrono::duration<double, std::milli>(to - from).count();
@@ -102,6 +116,10 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options)
     if (page_size_ < 1 || total_pages_ < 1 || max_sequence_tokens_ < 1) {
         throw std::invalid_argument("the backend reports an empty KV cache");
     }
+    kv_snapshot_ = kv;
+    log::write(log::Level::kInfo, kLogger, "engine loop started",
+               {{"backend", std::string(backend.name())}, {"max_batch", options_.max_batch},
+                {"total_pages", total_pages_}, {"page_size_tokens", page_size_}});
     thread_ = std::thread([this] { run(); });
 }
 
@@ -148,8 +166,11 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
     auto entry = std::make_unique<Entry>(ids_.next(), std::move(params));
     try {
         validate(entry->params);
-    } catch (...) {
+    } catch (const std::exception& e) {
         entry->request.transition_to(RequestState::kRejected);
+        log::write(log::Level::kDebug, kLogger, "request rejected",
+                   {{"engine_request_id", entry->request.id()},
+                    {"request_id", entry->params.client_request_id}, {"error", std::string(e.what())}});
         std::lock_guard lock(mu_);
         ++stats_.rejected;
         throw;
@@ -196,6 +217,11 @@ EngineLoopStats EngineLoop::stats() const {
     return stats_;
 }
 
+KvCacheStats EngineLoop::kv_stats() const {
+    std::lock_guard lock(mu_);
+    return kv_snapshot_;
+}
+
 // ---- EngineLoop: engine thread ---------------------------------------------------------------
 
 void EngineLoop::run() noexcept {
@@ -225,6 +251,7 @@ void EngineLoop::loop() {
         if (!active_.empty()) {
             decode_active();
         }
+        refresh_kv_snapshot();
         std::lock_guard lock(mu_);
         stats_.active = active_.size();
     }
@@ -288,6 +315,8 @@ void EngineLoop::decode_active() {
         // The backend cannot say which sequence caused the error, so the whole batch fails.
         // The loop itself keeps serving later requests.
         const auto error = std::current_exception();
+        log::write(log::Level::kError, kLogger, "decode step failed; failing its batch",
+                   {{"batch_size", seqs.size()}, {"error", describe(error)}});
         auto failed = std::move(active_);
         active_.clear();
         for (auto& entry : failed) {
@@ -341,6 +370,17 @@ void EngineLoop::release(Entry& entry) noexcept {
         reserved_pages_ -= entry.pages;
         entry.reserved = false;
     }
+    refresh_kv_snapshot();  // before the caller is answered, so it sees its pages returned
+}
+
+void EngineLoop::refresh_kv_snapshot() noexcept {
+    try {
+        const KvCacheStats kv = backend_.kv_stats();
+        std::lock_guard lock(mu_);
+        kv_snapshot_ = kv;
+    } catch (...) {
+        // Keep the previous snapshot; it is only used for monitoring.
+    }
 }
 
 void EngineLoop::complete(EntryPtr entry) noexcept {
@@ -359,6 +399,11 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
     result.e2e_ms = ms_between(received, request.last_transition_at());
     result.tokens = std::move(entry->tokens);
 
+    log::write(log::Level::kInfo, kLogger, "request completed",
+               {{"engine_request_id", result.request_id}, {"request_id", entry->params.client_request_id},
+                {"prompt_tokens", result.prompt_tokens}, {"completion_tokens", result.tokens.size()},
+                {"finish_reason", std::string(to_string(result.finish_reason))},
+                {"queue_ms", result.queue_ms}, {"ttft_ms", result.ttft_ms}, {"e2e_ms", result.e2e_ms}});
     {
         std::lock_guard lock(mu_);
         ++stats_.completed;
@@ -369,6 +414,9 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
 void EngineLoop::fail(EntryPtr entry, std::exception_ptr error) noexcept {
     release(*entry);
     entry->request.transition_to(RequestState::kFailed);
+    log::write(log::Level::kError, kLogger, "request failed",
+               {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
+                {"error", describe(error)}});
     {
         std::lock_guard lock(mu_);
         ++stats_.failed;
@@ -401,9 +449,13 @@ void EngineLoop::cancel_all() noexcept {
     for (auto& entry : active_) {
         cancel(*entry, error);
     }
+    const auto cancelled = pending.size() + active_.size();
     active_.clear();
-    std::lock_guard lock(mu_);
-    stats_.active = 0;
+    {
+        std::lock_guard lock(mu_);
+        stats_.active = 0;
+    }
+    log::write(log::Level::kInfo, kLogger, "engine loop stopped", {{"cancelled_requests", cancelled}});
 }
 
 }  // namespace neuroserve::core

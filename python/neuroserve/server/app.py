@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import CudaError, KvCacheExhausted, __version__
+from .. import CudaError, EngineStopped, KvCacheExhausted, __version__
 from .config import ServerConfig
 from .engine_service import ContextLengthExceeded, EngineService, GenerationResult
 from .logging_setup import request_id_var
@@ -90,6 +90,9 @@ async def _run(request: Request, call: Callable[[], GenerationResult], param: st
         return await run_in_threadpool(context.run, call)
     except ContextLengthExceeded as exc:
         raise ApiError(413, str(exc), param=param, code="context_length_exceeded") from exc
+    except EngineStopped as exc:
+        raise ApiError(503, "the engine is shutting down", type_="server_error",
+                       code="service_unavailable") from exc
     except KvCacheExhausted as exc:
         raise ApiError(503, f"KV cache exhausted: {exc}", type_="server_error", code="kv_cache_exhausted") from exc
     except CudaError as exc:
@@ -110,6 +113,8 @@ def _usage(result: GenerationResult) -> Usage:
 def _info(result: GenerationResult, options: NeuroServeOptions) -> NeuroServeInfo:
     return NeuroServeInfo(
         e2e_ms=round(result.e2e_ms, 2),
+        ttft_ms=round(result.ttft_ms, 2),
+        queue_ms=round(result.queue_ms, 2),
         generated_tokens=result.generated_tokens,
         completion_token_ids=list(result.token_ids) if options.return_token_ids else None,
     )
@@ -120,7 +125,8 @@ def _record(request: Request, config: ServerConfig, prompt: Any, result: Generat
     request.state.log_fields.update(
         prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
         generated_tokens=result.generated_tokens, finish_reason=result.finish_reason,
-        e2e_ms=round(result.e2e_ms, 2),
+        e2e_ms=round(result.e2e_ms, 2), ttft_ms=round(result.ttft_ms, 2),
+        queue_ms=round(result.queue_ms, 2), engine_request_id=result.engine_request_id,
     )
     if config.logging.log_prompts:
         logger.info("prompt and completion", extra={"prompt_logging": True, "prompt": prompt,
@@ -168,7 +174,8 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
             return JSONResponse(status_code=503, content={
                 "status": "unhealthy", "reason": request.app.state.failure, "model": config.model.name})
         svc: EngineService = request.app.state.service
-        return {"status": "ok", "model": config.model.name, "gpu": svc.device_name, "kv_cache": svc.kv_stats()}
+        return {"status": "ok", "model": config.model.name, "gpu": svc.device_name, "kv_cache": svc.kv_stats(),
+                "engine": svc.engine_stats()}
 
     @app.get("/v1/models")
     async def models(request: Request) -> dict:
