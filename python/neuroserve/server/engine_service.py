@@ -49,6 +49,8 @@ class GenerationEngine(Protocol):
 
     def stats(self) -> dict[str, Any]: ...
 
+    def cancel(self, request_id: str) -> bool: ...
+
 
 class ContextLengthExceeded(ValueError):
     """The prompt is longer than the engine accepts."""
@@ -86,13 +88,19 @@ class StreamingGeneration:
     def engine_request_id(self) -> str:
         return self._stream.request_id
 
-    def deltas(self) -> Iterator[str]:
-        """Text as it is generated: one piece per batch of new tokens (never half a character)."""
+    def cancel(self) -> bool:
+        """Stops the request at the next engine step (False if it has already finished)."""
+        return self._service.cancel(self.engine_request_id)
+
+    def deltas(self, poll_s: float = 0.1) -> Iterator[str]:
+        """Text as it is generated: one piece per batch of new tokens (never half a character).
+
+        Yields "" when nothing new arrived within poll_s seconds, so a caller iterating this in a
+        worker thread gets control back regularly (e.g. to notice that its client has gone).
+        """
         detokenizer = self._service.tokenizer.detokenizer()  # skips special tokens such as the stop token
-        while (tokens := self._stream.read()) is not None:
-            text = "".join(detokenizer.push(token) for token in tokens)
-            if text:
-                yield text
+        while (tokens := self._stream.read(timeout=poll_s)) is not None:
+            yield "".join(detokenizer.push(token) for token in tokens)
         tail = detokenizer.flush()
         if tail:
             yield tail
@@ -149,6 +157,9 @@ class EngineService:
 
     def engine_stats(self) -> dict[str, Any]:
         return self._engine.stats()
+
+    def cancel(self, engine_request_id: str) -> bool:
+        return self._engine.cancel(engine_request_id)
 
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
              ignore_eos: bool = False, priority: int = 1) -> GenerationResult:

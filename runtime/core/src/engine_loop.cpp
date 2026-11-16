@@ -223,6 +223,7 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
         // From here on only the engine thread touches the entry; the mutex hands it over safely.
         entry->request.transition_to(RequestState::kQueued);
         entry->order = next_order_++;
+        unfinished_.insert(entry->request.id());
         pending_.push_back(std::move(entry));
         ++stats_.submitted;
         stats_.pending = pending_.size();
@@ -241,6 +242,18 @@ void EngineLoop::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+}
+
+bool EngineLoop::cancel_request(const std::string& request_id) {
+    {
+        std::lock_guard lock(mu_);
+        if (stop_ || unfinished_.count(request_id) == 0) {
+            return false;
+        }
+        cancel_requests_.insert(request_id);
+    }
+    cv_.notify_one();
+    return true;
 }
 
 bool EngineLoop::stop_requested() const {
@@ -297,6 +310,7 @@ void EngineLoop::loop() {
                 return;
             }
         }
+        apply_cancellations();  // first: cancelled requests free their pages before this step's decisions
         const int free_pages = backend_.kv_stats().free_pages;  // backend call: outside the lock
         {
             std::lock_guard lock(mu_);
@@ -333,6 +347,40 @@ void EngineLoop::loop() {
         refresh_kv_snapshot();
         std::lock_guard lock(mu_);
         stats_.active = active_.size();
+    }
+}
+
+void EngineLoop::apply_cancellations() {
+    std::vector<EntryPtr> cancelled;
+    {
+        std::lock_guard lock(mu_);
+        if (cancel_requests_.empty()) {
+            return;
+        }
+        const auto wanted = [this](const EntryPtr& entry) { return cancel_requests_.count(entry->request.id()) > 0; };
+        for (auto& entry : pending_) {
+            if (wanted(entry)) {
+                cancelled.push_back(std::move(entry));
+            }
+        }
+        for (auto& entry : active_) {
+            if (wanted(entry)) {
+                cancelled.push_back(std::move(entry));
+            }
+        }
+        cancel_requests_.clear();  // ids that finished in the meantime have nothing left to cancel
+        std::erase_if(pending_, [](const EntryPtr& entry) { return !entry; });
+        std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
+        stats_.pending = pending_.size();
+        stats_.active = active_.size();
+    }
+    const auto error = std::make_exception_ptr(RequestCancelled("request cancelled"));
+    for (auto& entry : cancelled) {
+        log::write(log::Level::kInfo, kLogger, "request cancelled",
+                   {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
+                    {"state", std::string(to_string(entry->request.state()))},
+                    {"generated_tokens", entry->tokens.size()}});
+        cancel(*entry, error);  // frees the sequence and its KV pages, then answers the caller
     }
 }
 
@@ -574,6 +622,7 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
     {
         std::lock_guard lock(mu_);
         ++stats_.completed;
+        unfinished_.erase(entry->request.id());
     }
     deliver_result(*entry->state, std::move(result));
 }
@@ -587,6 +636,7 @@ void EngineLoop::fail(EntryPtr entry, std::exception_ptr error) noexcept {
     {
         std::lock_guard lock(mu_);
         ++stats_.failed;
+        unfinished_.erase(entry->request.id());
     }
     deliver_error(*entry->state, std::move(error));
 }
@@ -597,6 +647,7 @@ void EngineLoop::cancel(Entry& entry, std::exception_ptr error) noexcept {
     {
         std::lock_guard lock(mu_);
         ++stats_.cancelled;
+        unfinished_.erase(entry.request.id());
     }
     deliver_error(*entry.state, std::move(error));
 }

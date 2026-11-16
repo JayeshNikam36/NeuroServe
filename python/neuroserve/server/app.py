@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import json
@@ -18,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import CudaError, EngineStopped, KvCacheExhausted, __version__
+from .. import CudaError, EngineStopped, KvCacheExhausted, RequestCancelled, __version__
 from .config import ServerConfig
 from .engine_service import ContextLengthExceeded, EngineService, GenerationResult, StreamingGeneration
 from .logging_setup import request_id_var
@@ -40,6 +41,8 @@ from .schemas import (
 T = TypeVar("T")
 
 logger = logging.getLogger("neuroserve.server")
+
+DISCONNECT_POLL_S = 0.1  # how often a non-streaming request checks whether its client is still there
 
 
 class ApiError(Exception):
@@ -86,6 +89,9 @@ def _api_error(request: Request, exc: Exception, param: str) -> ApiError | None:
     """The client-facing error for an exception from the service or engine (None: a bug)."""
     if isinstance(exc, ContextLengthExceeded):
         return ApiError(413, str(exc), param=param, code="context_length_exceeded")
+    if isinstance(exc, RequestCancelled):
+        # 499 (nginx's "client closed request"): cancelled by a disconnect or DELETE /v1/requests/{id}.
+        return ApiError(499, "the request was cancelled", code="request_cancelled")
     if isinstance(exc, EngineStopped):
         return ApiError(503, "the engine is shutting down", type_="server_error", code="service_unavailable")
     if isinstance(exc, KvCacheExhausted):
@@ -116,6 +122,38 @@ async def _run(request: Request, call: Callable[[], T], param: str) -> T:
         if error is None:
             raise
         raise error from exc
+
+
+def _track(request: Request, generation: StreamingGeneration) -> None:
+    """Makes the request cancellable with DELETE /v1/requests/{its X-Request-ID}."""
+    request.app.state.in_flight.setdefault(request.state.request_id, set()).add(generation.engine_request_id)
+
+
+def _untrack(request: Request, generation: StreamingGeneration) -> None:
+    in_flight: dict[str, set[str]] = request.app.state.in_flight
+    ids = in_flight.get(request.state.request_id)
+    if ids is not None:
+        ids.discard(generation.engine_request_id)
+        if not ids:
+            del in_flight[request.state.request_id]
+
+
+async def _finish(request: Request, generation: StreamingGeneration, param: str) -> GenerationResult:
+    """Waits for a non-streaming generation; cancels it if the client disconnects first."""
+    _track(request, generation)
+    waiting = asyncio.ensure_future(_run(request, generation.result, param))
+    try:
+        while True:
+            done, _ = await asyncio.wait({waiting}, timeout=DISCONNECT_POLL_S)
+            if done:
+                return waiting.result()
+            if await request.is_disconnected():
+                logger.info("client disconnected; cancelling the request",
+                            extra={"engine_request_id": generation.engine_request_id})
+                generation.cancel()
+                return await waiting  # raises the 499; nobody is listening any more
+    finally:
+        _untrack(request, generation)
 
 
 def _usage(result: GenerationResult) -> Usage:
@@ -186,12 +224,15 @@ def _stream(request: Request, config: ServerConfig, generation: StreamingGenerat
 
     async def events() -> AsyncIterator[str]:
         token = request_id_var.set(request_id)  # the stream outlives the middleware's context
+        finished = False
         try:
             if chat:
                 yield _sse(chunk([choice("", role=True)]))
-            # deltas() blocks on the engine: each next() runs in a worker thread (GIL released).
+            # deltas() blocks on the engine: each next() runs in a worker thread (GIL released) and
+            # returns at least every 0.1 s, so a disconnect cancels the stream promptly.
             async for text in iterate_in_threadpool(generation.deltas()):
-                yield _sse(chunk([choice(text)]))
+                if text:  # "" means nothing new yet
+                    yield _sse(chunk([choice(text)]))
             result = await run_in_threadpool(generation.result)
             info = _info(result, options).model_dump()
             if include_usage:
@@ -200,6 +241,7 @@ def _stream(request: Request, config: ServerConfig, generation: StreamingGenerat
             else:
                 yield _sse(chunk([choice(finish_reason=result.finish_reason)], neuroserve=info))
             yield _sse("[DONE]")
+            finished = True
             _record(request, config, prompt, result, streamed=True)
         except Exception as exc:
             # The 200 status is already sent: report the error in the stream, as OpenAI does.
@@ -208,11 +250,18 @@ def _stream(request: Request, config: ServerConfig, generation: StreamingGenerat
                 logger.exception("unhandled error while streaming %s", request.url.path)
                 error = ApiError(500, f"internal server error (request id {request_id})",
                                  type_="server_error", code="internal_error")
+            finished = True
             yield _sse({"error": {"message": error.message, "type": error.type, "param": error.param,
                                   "code": error.code}})
         finally:
+            # Not finished here means the client went away mid-stream (the task was cancelled).
+            if not finished and generation.cancel():
+                logger.info("client disconnected; cancelling the request",
+                            extra={"engine_request_id": generation.engine_request_id})
+            _untrack(request, generation)
             request_id_var.reset(token)
 
+    _track(request, generation)
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
@@ -224,6 +273,7 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         app.state.service = service if service is not None else await run_in_threadpool(EngineService.load, config)
         app.state.created = int(time.time())
         app.state.failure = None  # set after a GPU error; the server then refuses work
+        app.state.in_flight = {}  # X-Request-ID -> engine request ids, for DELETE /v1/requests/{id}
         logger.info("NeuroServe %s ready: model=%s gpu=%s", __version__, config.model.name,
                     app.state.service.device_name)
         try:
@@ -268,6 +318,19 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                       "created": request.app.state.created, "owned_by": "neuroserve"}],
         }
 
+    @app.delete("/v1/requests/{request_id}")
+    async def cancel_request(request_id: str, request: Request) -> dict:
+        """Cancels the in-flight request(s) sent with this X-Request-ID."""
+        svc: EngineService = request.app.state.service
+        engine_ids = request.app.state.in_flight.get(request_id, set())
+        cancelled = [engine_id for engine_id in sorted(engine_ids) if svc.cancel(engine_id)]
+        if not cancelled:
+            raise ApiError(404, f"no request with id '{request_id}' is in progress", param="request_id",
+                           code="request_not_found")
+        logger.info("request cancelled by DELETE", extra={"cancelled_request_id": request_id,
+                                                         "engine_request_ids": cancelled})
+        return {"id": request_id, "object": "request.cancellation", "cancelled": True}
+
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(body: ChatCompletionRequest,
                                request: Request) -> ChatCompletionResponse | StreamingResponse:
@@ -283,9 +346,10 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                                                                priority=body.neuroserve.priority), param="messages")
             return _stream(request, config, generation, chat=True, options=body.neuroserve,
                            stream_options=body.stream_options, prompt=messages)
-        result = await _run(request, functools.partial(svc.chat, messages, max_tokens,
-                                                       ignore_eos=body.neuroserve.ignore_eos,
-                                                       priority=body.neuroserve.priority), param="messages")
+        generation = await _run(request, functools.partial(svc.start_chat, messages, max_tokens,
+                                                           ignore_eos=body.neuroserve.ignore_eos,
+                                                           priority=body.neuroserve.priority), param="messages")
+        result = await _finish(request, generation, param="messages")
         _record(request, config, messages, result)
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -308,9 +372,10 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                                                                priority=body.neuroserve.priority), param="prompt")
             return _stream(request, config, generation, chat=False, options=body.neuroserve,
                            stream_options=body.stream_options, prompt=body.prompt)
-        result = await _run(request, functools.partial(svc.complete, body.prompt, max_tokens,
-                                                       ignore_eos=body.neuroserve.ignore_eos,
-                                                       priority=body.neuroserve.priority), param="prompt")
+        generation = await _run(request, functools.partial(svc.start_completion, body.prompt, max_tokens,
+                                                           ignore_eos=body.neuroserve.ignore_eos,
+                                                           priority=body.neuroserve.priority), param="prompt")
+        result = await _finish(request, generation, param="prompt")
         _record(request, config, body.prompt, result)
         return CompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",

@@ -5,9 +5,11 @@ import os
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -42,8 +44,8 @@ def test_prompt_limit_must_fit_the_token_budget():
 class FakeStream:
     """Like neuroserve.TokenStream: hands out the tokens one per read(), then the result.
 
-    `gate`: when set, the stream waits for it after the first token (to prove the first token
-    reaches the client before generation ends). `error`: raised by result(), after the tokens.
+    `gate`: when set, generation pauses after the first token (and result() waits) until the gate
+    is set or the request is cancelled. `error`: raised by result(), after the tokens.
     """
 
     def __init__(self, out, gate: threading.Event | None = None, error: Exception | None = None) -> None:
@@ -53,19 +55,38 @@ class FakeStream:
         self._gate = gate
         self._error = error
         self._sent = 0
+        self.cancelled = threading.Event()
+        self.finished = False
+
+    def _gate_open(self, timeout: float | None) -> bool:
+        """Waits up to `timeout` s for the gate or a cancellation; None: up to 10 s, then fails."""
+        deadline = time.monotonic() + (10 if timeout is None else timeout)
+        while not (self._gate.is_set() or self.cancelled.is_set()):
+            if time.monotonic() >= deadline:
+                assert timeout is not None, "the gate was never opened (did the client get the first token?)"
+                return False
+            time.sleep(0.005)
+        return True
 
     def read(self, timeout=None):
-        if not self._pending:
+        if self._sent == 1 and self._gate is not None and not self._gate_open(timeout):
+            return []  # like the engine: nothing new within the timeout
+        if not self._pending or self.cancelled.is_set():
             return None
-        if self._sent == 1 and self._gate is not None:
-            assert self._gate.wait(timeout=10), "the client never received the first token"
         self._sent += 1
         return [self._pending.pop(0)]
 
     def result(self):
-        if self._error is not None:
-            raise self._error
-        return self._out
+        try:
+            if self._gate is not None:
+                self._gate_open(None)
+            if self.cancelled.is_set():
+                raise neuroserve.RequestCancelled("request cancelled")
+            if self._error is not None:
+                raise self._error
+            return self._out
+        finally:
+            self.finished = True
 
 
 class FakeEngine:
@@ -78,6 +99,8 @@ class FakeEngine:
         self.error = error
         self.stream_error = stream_error  # streaming: raised after the tokens, when the result is read
         self.gate = gate
+        self.streams: dict[str, FakeStream] = {}
+        self.cancelled: list[str] = []  # engine request ids cancelled, in order
         self.calls: list[tuple[list[int], int]] = []
         self.stop_token_ids: list[list[int]] = []
         self.client_request_ids: list[str] = []
@@ -102,7 +125,17 @@ class FakeEngine:
     def stream(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
         out = self.run(prompt_ids, max_new_tokens, stop_token_ids=stop_token_ids,
                        client_request_id=client_request_id, priority=priority)
-        return FakeStream(out, gate=self.gate, error=self.stream_error)
+        stream = FakeStream(out, gate=self.gate, error=self.stream_error)
+        self.streams[stream.request_id] = stream
+        return stream
+
+    def cancel(self, request_id):
+        stream = self.streams.get(request_id)
+        if stream is None or stream.finished or stream.cancelled.is_set():
+            return False
+        stream.cancelled.set()
+        self.cancelled.append(request_id)
+        return True
 
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64}
@@ -402,14 +435,11 @@ def test_the_official_openai_client_streams(tok):
     assert chunks[-1].neuroserve["generated_tokens"] == len(reply_ids)  # NeuroServe's extension field
 
 
-def test_tokens_reach_the_client_before_generation_ends(tok):
-    """Through a real HTTP server: the first token must arrive while the engine is still
-    generating (nothing on the way, such as a middleware, may buffer the stream)."""
+@contextmanager
+def live_server(app):
+    """Serves the app with uvicorn on a free local port (for tests that need a real connection)."""
     import uvicorn
-    from openai import OpenAI
 
-    gate = threading.Event()  # the fake engine produces nothing after the first token until this is set
-    app, _, _ = make_app(tok, gate=gate)
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -421,7 +451,21 @@ def test_tokens_reach_the_client_before_generation_ends(tok):
         while not server.started:
             assert time.monotonic() < deadline, "server did not start"
             time.sleep(0.01)
-        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="unused", timeout=10)
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_tokens_reach_the_client_before_generation_ends(tok):
+    """Through a real HTTP server: the first token must arrive while the engine is still
+    generating (nothing on the way, such as a middleware, may buffer the stream)."""
+    from openai import OpenAI
+
+    gate = threading.Event()  # the fake engine produces nothing after the first token until this is set
+    app, _, _ = make_app(tok, gate=gate)
+    with live_server(app) as base_url:
+        client = OpenAI(base_url=f"{base_url}/v1", api_key="unused", timeout=10)
         stream = client.chat.completions.create(
             model=MODEL_NAME, messages=[{"role": "user", "content": "hi"}], max_tokens=16, stream=True)
         pieces = []
@@ -432,7 +476,81 @@ def test_tokens_reach_the_client_before_generation_ends(tok):
                 assert gate.is_set() or len(pieces) == 1  # the first piece came while generation was paused
                 gate.set()
         assert "".join(pieces) == REPLY
-    finally:
         gate.set()
-        server.should_exit = True
-        thread.join(timeout=10)
+
+
+# ---- Day 19: cancellation ------------------------------------------------------------------------
+
+def wait_until(condition, what: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.01)
+
+
+def read_until_first_text(lines) -> None:
+    for line in lines:
+        if line.startswith("data: ") and json.loads(line[6:])["choices"][0]["delta"].get("content"):
+            return
+    raise AssertionError("the stream ended before any text")
+
+
+def test_delete_of_an_unknown_request_is_404(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.delete("/v1/requests/no-such-request")
+    assert resp.status_code == 404 and resp.json()["error"]["code"] == "request_not_found"
+
+
+def test_delete_cancels_a_streaming_request(tok):
+    gate = threading.Event()  # never set: the request would run until cancelled
+    app, engine, _ = make_app(tok, gate=gate)
+    with live_server(app) as base:
+        with httpx.stream("POST", f"{base}/v1/chat/completions", json=chat_body(stream=True),
+                          headers={"X-Request-ID": "job-1"}, timeout=10) as resp:
+            lines = resp.iter_lines()
+            read_until_first_text(lines)
+            cancel = httpx.delete(f"{base}/v1/requests/job-1", timeout=10)
+            assert cancel.status_code == 200, cancel.text
+            assert cancel.json() == {"id": "job-1", "object": "request.cancellation", "cancelled": True}
+            events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        assert events[-1]["error"]["code"] == "request_cancelled"  # the stream ends with the reason
+        assert engine.cancelled == ["ns-000001"]
+        assert httpx.delete(f"{base}/v1/requests/job-1", timeout=10).status_code == 404  # no longer in flight
+
+
+def test_delete_cancels_a_non_streaming_request(tok):
+    gate = threading.Event()
+    app, engine, _ = make_app(tok, gate=gate)
+    responses = []
+    with live_server(app) as base:
+        caller = threading.Thread(target=lambda: responses.append(httpx.post(
+            f"{base}/v1/chat/completions", json=chat_body(), headers={"X-Request-ID": "job-2"}, timeout=10)))
+        caller.start()
+        wait_until(lambda: httpx.delete(f"{base}/v1/requests/job-2", timeout=10).status_code == 200,
+                   "the request to become cancellable")
+        caller.join(timeout=10)
+    assert responses[0].status_code == 499
+    assert responses[0].json()["error"]["code"] == "request_cancelled"
+    assert engine.cancelled == ["ns-000001"]
+
+
+def test_client_disconnect_cancels_a_stream(tok):
+    gate = threading.Event()
+    app, engine, _ = make_app(tok, gate=gate)
+    with live_server(app) as base:
+        with httpx.stream("POST", f"{base}/v1/chat/completions", json=chat_body(stream=True), timeout=10) as resp:
+            read_until_first_text(resp.iter_lines())
+        # Leaving the block closes the connection mid-stream.
+        wait_until(lambda: engine.cancelled == ["ns-000001"], "the engine request to be cancelled")
+
+
+def test_client_disconnect_cancels_a_non_streaming_request(tok):
+    gate = threading.Event()
+    app, engine, _ = make_app(tok, gate=gate)
+    with live_server(app) as base:
+        with pytest.raises(httpx.ReadTimeout):  # the client gives up and closes the connection
+            httpx.post(f"{base}/v1/chat/completions", json=chat_body(), timeout=0.5)
+        wait_until(lambda: engine.cancelled == ["ns-000001"], "the engine request to be cancelled")
+        # The server forgets the request once it has finished (with its 499), a moment after the cancel.
+        wait_until(lambda: app.state.in_flight == {}, "the server to forget the cancelled request")

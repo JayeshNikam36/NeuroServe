@@ -31,7 +31,9 @@ stateDiagram-v2
 ```
 
 Every non-terminal state can also move to `CANCELLED` (client cancelled or disconnected);
-those edges are left out of the diagram for readability.
+those edges are left out of the diagram for readability. In practice the engine cancels a request
+from `QUEUED` or `DECODE`: cancellations are applied between steps, and a request is only in
+`ADMITTED` or `PREFILL` during a step (see docs/streaming.md, "Cancellation").
 
 | Terminal state | Meaning for the client |
 | --- | --- |

@@ -23,6 +23,10 @@ generation for many requests on one dedicated engine thread.
   publishes each new token to its own buffer (mutex + condition variable); a reader takes them with
   `RequestHandle::read_tokens`. Tokens regenerated after a preemption are not published twice
   (see docs/streaming.md).
+- **Cancellation at a step boundary.** `cancel_request(id)` only records the id; the engine
+  thread applies it at the start of the next step: the request leaves the queue or the batch, its
+  sequence and pages are freed before that step schedules, and its caller gets `RequestCancelled`.
+  A step is never interrupted halfway, so the batch and the KV cache stay consistent.
 - **Failure isolation.** A prefill error fails one request; a decode error fails that step's
   batch; the loop keeps serving. Sequences and their pages are always released.
 - **Clean shutdown.** `stop()` cancels queued and running requests with `EngineStopped`, so no
