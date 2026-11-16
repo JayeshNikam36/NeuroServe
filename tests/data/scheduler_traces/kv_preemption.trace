@@ -1,0 +1,26 @@
+# KV pressure with on-demand pages: 8 pages of 4 tokens; four requests that each grow to 12 tokens
+# (3 pages). On-demand allocation starts all four at once (2 pages each); up-front reservation
+# would have run only two. When they all need a third page, FCFS preempts the newest until the
+# rest fit, and admits nothing meanwhile. Preempted requests go back to the front of the queue,
+# restart from their prompt, and finish later; the oldest is never preempted.
+policy fcfs
+limits max_batch=8 total_pages=8 page_size=4
+arrive step=0 id=a prompt=4 max_new=8
+arrive step=0 id=b prompt=4 max_new=8
+arrive step=0 id=c prompt=4 max_new=8
+arrive step=0 id=d prompt=4 max_new=8
+--- expected
+step 0 queued=[a b c d] running=[] preempt=[] admit=[a b c d] finished=[] free_pages=0
+step 1 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
+step 2 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
+step 3 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
+step 4 queued=[] running=[a b c d] preempt=[d c] admit=[] finished=[] free_pages=2
+step 5 queued=[c d] running=[a b] preempt=[] admit=[c] finished=[] free_pages=0
+step 6 queued=[d] running=[a b c] preempt=[] admit=[] finished=[a b] free_pages=6
+step 7 queued=[d] running=[c] preempt=[] admit=[d] finished=[] free_pages=4
+step 8 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=4
+step 9 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=3
+step 10 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=3
+step 11 queued=[] running=[c d] preempt=[] admit=[] finished=[c] free_pages=5
+step 12 queued=[] running=[d] preempt=[] admit=[] finished=[] free_pages=5
+step 13 queued=[] running=[d] preempt=[] admit=[] finished=[d] free_pages=8

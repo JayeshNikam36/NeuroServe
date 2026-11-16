@@ -9,9 +9,9 @@ arrive step=0 id=d prompt=20 max_new=4
 arrive step=0 id=e prompt=16 max_new=6
 arrive step=0 id=f prompt=30 max_new=1
 --- expected
-step 0 queued=[a b c d e f] running=[] admit=[a b c d] finished=[c] free_pages=58
-step 1 queued=[e f] running=[a b d] admit=[e] finished=[a] free_pages=57
-step 2 queued=[f] running=[b d e] admit=[f] finished=[f d] free_pages=59
-step 3 queued=[] running=[b e] admit=[] finished=[b] free_pages=62
-step 4 queued=[] running=[e] admit=[] finished=[] free_pages=62
-step 5 queued=[] running=[e] admit=[] finished=[e] free_pages=64
+step 0 queued=[a b c d e f] running=[] preempt=[] admit=[a b c d] finished=[c] free_pages=58
+step 1 queued=[e f] running=[a b d] preempt=[] admit=[e] finished=[a] free_pages=57
+step 2 queued=[f] running=[b d e] preempt=[] admit=[f] finished=[f d] free_pages=59
+step 3 queued=[] running=[b e] preempt=[] admit=[] finished=[b] free_pages=62
+step 4 queued=[] running=[e] preempt=[] admit=[] finished=[] free_pages=62
+step 5 queued=[] running=[e] preempt=[] admit=[] finished=[e] free_pages=64

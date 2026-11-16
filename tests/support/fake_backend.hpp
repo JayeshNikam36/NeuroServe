@@ -14,6 +14,8 @@ namespace neuroserve::test_support {
 
 // Deterministic in-memory backend for CPU tests: the next token is (last token + 1) % vocab.
 // Lets generation and scheduling logic be tested in CI without a GPU or a model.
+// KV pages are counted like the real backend: a sequence holds ceil(length / page_size) pages, and
+// prefill or decode_step throw KvCacheExhausted (changing nothing) when the pages run out.
 // Like a real backend it is not thread-safe: only the engine thread may call it. Read the
 // test helpers only after the engine thread has stopped.
 class FakeBackend final : public InferenceBackend {
@@ -54,6 +56,10 @@ public:
         if (fail_prefill_token_ >= 0 && prompt.front() == fail_prefill_token_) {
             throw std::runtime_error("injected prefill failure");
         }
+        const int pages = pages_for(static_cast<int>(prompt.size()));
+        if (pages > total_pages_ - used_pages()) {
+            throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages");
+        }
         ++prefill_calls_;
         len = static_cast<int>(prompt.size());
         return next(prompt.back());
@@ -71,7 +77,18 @@ public:
             fail_once_at_ = -1;
             throw std::runtime_error("injected decode failure");
         }
+        int new_pages = 0;
+        for (const SeqId id : ids) {
+            const int len = length(id);
+            new_pages += pages_for(len + 1) - pages_for(len);
+        }
+        if (new_pages > total_pages_ - used_pages()) {
+            throw KvCacheExhausted("decode_step: needs " + std::to_string(new_pages) + " new KV pages");
+        }
         ++decode_calls_;
+        if (record_batches) {
+            decode_batches.emplace_back(ids.begin(), ids.end());
+        }
         std::vector<TokenId> out;
         for (std::size_t i = 0; i < ids.size(); ++i) {
             ++length(ids[i]);
@@ -106,6 +123,10 @@ public:
     // thread starts; tests use it to pause the engine at a known point.
     std::function<void(std::size_t batch_size)> on_decode;
 
+    // When true, every successful decode_step's sequence ids are appended to decode_batches.
+    bool record_batches = false;
+    std::vector<std::vector<SeqId>> decode_batches;
+
 private:
     int& length(SeqId id) {
         auto it = lengths_.find(id);
@@ -117,10 +138,12 @@ private:
 
     TokenId next(TokenId t) const { return (t + 1) % info_.vocab_size; }
 
+    int pages_for(int tokens) const { return (tokens + page_size_ - 1) / page_size_; }
+
     int used_pages() const {
         int pages = 0;
         for (const auto& entry : lengths_) {
-            pages += (entry.second + page_size_ - 1) / page_size_;
+            pages += pages_for(entry.second);
         }
         return pages;
     }

@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -31,7 +32,10 @@ using neuroserve::core::SchedulerInput;
 using neuroserve::core::SchedulingPolicy;
 using namespace std::chrono_literals;
 
-SchedulerInput input(int max_batch, int free_pages, std::vector<int> queued_pages, int running = 0) {
+// A snapshot with queued requests needing `queued_pages` each, and `running` requests that each
+// hold `held` pages and need `grow` new pages in their next decode step.
+SchedulerInput input(int max_batch, int free_pages, std::vector<int> queued_pages, int running = 0, int held = 1,
+                     int grow = 0) {
     SchedulerInput in;
     in.max_batch = max_batch;
     in.free_pages = free_pages;
@@ -39,40 +43,77 @@ SchedulerInput input(int max_batch, int free_pages, std::vector<int> queued_page
         in.queued.push_back(QueuedRequest{"q" + std::to_string(i), 10, 10, queued_pages[i]});
     }
     for (int i = 0; i < running; ++i) {
-        in.running.push_back(RunningRequest{"r" + std::to_string(i), 1, 1, 10});
+        in.running.push_back(RunningRequest{"r" + std::to_string(i), held, grow, 1, 10});
     }
     return in;
 }
 
-std::vector<std::size_t> fcfs(const SchedulerInput& in) { return FcfsPolicy().schedule(in).admit; }
-
-// ---- FCFS ------------------------------------------------------------------------------------
-
-TEST(Fcfs, AdmitsInArrivalOrderUpToMaxBatch) {
-    EXPECT_EQ(fcfs(input(3, 100, {1, 1, 1, 1, 1})), (std::vector<std::size_t>{0, 1, 2}));
+ScheduleDecision decide(std::vector<std::size_t> preempt, std::vector<std::size_t> admit) {
+    ScheduleDecision decision;
+    decision.preempt = std::move(preempt);
+    decision.admit = std::move(admit);
+    return decision;
 }
 
-TEST(Fcfs, RunningRequestsUseUpSlots) {
-    EXPECT_EQ(fcfs(input(3, 100, {1, 1, 1}, /*running=*/2)), (std::vector<std::size_t>{0}));
-    EXPECT_TRUE(fcfs(input(3, 100, {1}, /*running=*/3)).empty());
+using Indices = std::vector<std::size_t>;
+
+ScheduleDecision fcfs(const SchedulerInput& in) { return FcfsPolicy().schedule(in); }
+
+// ---- FCFS: admission -------------------------------------------------------------------------
+
+TEST(Fcfs, AdmitsInArrivalOrderUpToMaxBatch) {
+    EXPECT_EQ(fcfs(input(3, 100, {1, 1, 1, 1, 1})).admit, (Indices{0, 1, 2}));
+}
+
+TEST(Fcfs, RunningRequestsUseSlotsAndTheirGrowthUsesPages) {
+    EXPECT_EQ(fcfs(input(3, 100, {1, 1, 1}, /*running=*/2)).admit, (Indices{0}));
+    EXPECT_TRUE(fcfs(input(3, 100, {1}, /*running=*/3)).admit.empty());
+    // 3 free pages, but the 2 running requests each need a new page this step: 1 page left.
+    EXPECT_EQ(fcfs(input(8, 3, {1, 1, 1}, /*running=*/2, /*held=*/2, /*grow=*/1)).admit, (Indices{0}));
 }
 
 TEST(Fcfs, StopsAtTheFirstRequestThatDoesNotFit) {
     // q1 needs 8 pages but only 5 are left after q0: q2 (1 page) would fit, but must not overtake q1.
-    EXPECT_EQ(fcfs(input(8, 7, {2, 8, 1})), (std::vector<std::size_t>{0}));
+    EXPECT_EQ(fcfs(input(8, 7, {2, 8, 1})).admit, (Indices{0}));
 }
 
-TEST(Fcfs, EmptyQueueAdmitsNothing) { EXPECT_TRUE(fcfs(input(8, 100, {})).empty()); }
+TEST(Fcfs, EmptyQueueAdmitsNothing) { EXPECT_TRUE(fcfs(input(8, 100, {})).admit.empty()); }
+
+// ---- FCFS: preemption ------------------------------------------------------------------------
+
+TEST(Fcfs, PreemptsTheNewestWhenTheBatchCannotGrow) {
+    // 3 running requests hold 2 pages each and each needs 1 more; only 1 page is free.
+    // Preempting r2 frees 2 pages: r0 and r1 can grow. Nothing is admitted while memory is short.
+    const auto decision = fcfs(input(8, 1, {1}, /*running=*/3, /*held=*/2, /*grow=*/1));
+    EXPECT_EQ(decision.preempt, (Indices{2}));
+    EXPECT_TRUE(decision.admit.empty());
+}
+
+TEST(Fcfs, NeverPreemptsTheOldestRunningRequest) {
+    // No free pages at all: preempt newest first until the rest fit, but always keep r0.
+    const auto decision = fcfs(input(8, 0, {}, /*running=*/3, /*held=*/1, /*grow=*/1));
+    EXPECT_EQ(decision.preempt, (Indices{2, 1}));
+    EXPECT_NO_THROW(check_decision(input(8, 0, {}, 3, 1, 1), decision));
+}
+
+TEST(Fcfs, DoesNotPreemptWhenTheBatchCanGrow) {
+    EXPECT_TRUE(fcfs(input(8, 3, {}, /*running=*/3, /*held=*/2, /*grow=*/1)).preempt.empty());
+}
 
 // ---- Decision checks and the factory ----------------------------------------------------------
 
 TEST(CheckDecision, RejectsDecisionsThatBreakALimit) {
-    const auto in = input(2, 5, {2, 2, 2}, /*running=*/0);
-    EXPECT_NO_THROW(check_decision(in, ScheduleDecision{{0, 1}}));
-    EXPECT_THROW(check_decision(in, ScheduleDecision{{3}}), std::logic_error);        // no such request
-    EXPECT_THROW(check_decision(in, ScheduleDecision{{1, 1}}), std::logic_error);     // admitted twice
-    EXPECT_THROW(check_decision(in, ScheduleDecision{{0, 1, 2}}), std::logic_error);  // over max_batch
-    EXPECT_THROW(check_decision(input(8, 3, {2, 2}), ScheduleDecision{{0, 1}}), std::logic_error);  // pages
+    const auto in = input(2, 5, {2, 2, 2});
+    EXPECT_NO_THROW(check_decision(in, decide({}, {0, 1})));
+    EXPECT_THROW(check_decision(in, decide({}, {3})), std::logic_error);        // no such queued request
+    EXPECT_THROW(check_decision(in, decide({}, {1, 1})), std::logic_error);     // admitted twice
+    EXPECT_THROW(check_decision(in, decide({}, {0, 1, 2})), std::logic_error);  // over max_batch
+    EXPECT_THROW(check_decision(input(8, 3, {2, 2}), decide({}, {0, 1})), std::logic_error);  // pages
+
+    const auto busy = input(8, 0, {}, /*running=*/2, /*held=*/2, /*grow=*/1);  // needs 2, has 0
+    EXPECT_THROW(check_decision(busy, decide({}, {})), std::logic_error);       // cannot grow
+    EXPECT_NO_THROW(check_decision(busy, decide({1}, {})));                     // preempting r1 frees 2
+    EXPECT_THROW(check_decision(busy, decide({2}, {})), std::logic_error);      // no such running request
 }
 
 TEST(MakePolicy, KnowsFcfsAndRejectsUnknownNames) {
@@ -104,6 +145,7 @@ void check_golden(const std::string& name) {
 TEST(GoldenTrace, BurstLimitedByMaxBatch) { check_golden("burst_max_batch.trace"); }
 TEST(GoldenTrace, KvBoundHeadOfLineBlocking) { check_golden("kv_head_of_line.trace"); }
 TEST(GoldenTrace, StaggeredArrivals) { check_golden("staggered_arrivals.trace"); }
+TEST(GoldenTrace, PreemptionUnderKvPressure) { check_golden("kv_preemption.trace"); }
 
 // ---- The engine loop uses the policy ------------------------------------------------------------
 
@@ -127,7 +169,7 @@ public:
 class FaultyPolicy final : public SchedulingPolicy {
 public:
     std::string_view name() const noexcept override { return "faulty"; }
-    ScheduleDecision schedule(const SchedulerInput&) override { return ScheduleDecision{{99}}; }
+    ScheduleDecision schedule(const SchedulerInput&) override { return decide({}, {99}); }
 };
 
 TEST(EngineLoopPolicy, ThePolicyDecidesTheAdmissionOrder) {

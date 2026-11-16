@@ -1,22 +1,34 @@
 # Scheduling
 
-Which queued requests the engine admits next is decided by a **scheduling policy**
-(`runtime/core/include/neuroserve/core/scheduler.hpp`), chosen with `engine.scheduling_policy`.
+Once per engine step a **scheduling policy**
+(`runtime/core/include/neuroserve/core/scheduler.hpp`, chosen with `engine.scheduling_policy`)
+decides which running requests to preempt and which queued requests to admit.
+
+## KV pages on demand
+
+A request holds KV pages only for the tokens it has cached (`ceil(cached / 16)`) and takes one
+more page each time it crosses a page boundary. Nothing is reserved up front, so more requests fit
+at once; in exchange the running batch can outgrow the cache, and the policy must preempt.
 
 ## Policy and mechanism
 
-Once per engine step, the loop builds a `SchedulerInput` snapshot (queued requests in arrival
-order, the running batch, `max_batch`, free KV pages) and asks the policy for a
-`ScheduleDecision`: the queue indices to admit, in order. The policy is a pure function: it never
-touches the backend, the KV cache or a request. The loop checks every decision with
-`check_decision` (indices valid and unique, `max_batch` and free pages respected) before applying
-it; a decision that breaks a limit stops the engine with an error rather than corrupting state.
+The loop builds a `SchedulerInput` snapshot: queued requests in arrival order with the pages their
+first step needs (`ceil((prompt + 1) / 16)`), running requests in admission order with the pages
+they hold and the new pages their next decode needs (0 or 1), `max_batch`, and free pages. The
+policy returns a `ScheduleDecision`: running indices to preempt, queued indices to admit. The
+policy is a pure function; the loop checks every decision with `check_decision` (indices valid
+and unique, `max_batch` respected, the step's pages fit after preemption) before applying it, and
+a decision that breaks a limit stops the engine with an error.
+
+A preempted request frees its sequence and pages, goes back to the front of the queue in arrival
+order, and later restarts from its prompt. Greedy decoding is deterministic and batch-invariant on
+this engine, so it regenerates exactly the same tokens (tested on the GPU against Hugging Face).
 
 ## Policies
 
-| Name | Admits | Trade-off |
-| --- | --- | --- |
-| `fcfs` | In arrival order while requests fit; stops at the first that does not | No starvation; head-of-line blocking leaves capacity idle |
+| Name | Preempts | Admits | Trade-off |
+| --- | --- | --- | --- |
+| `fcfs` | Most recently admitted first, never the oldest, only when the batch cannot grow | In arrival order while requests fit; stops at the first that does not | No starvation or livelock; head-of-line blocking leaves capacity idle |
 
 ## Golden traces
 
@@ -25,7 +37,8 @@ step-by-step log the policy must produce. `tests/support/scheduler_sim.hpp` repl
 with the engine loop's rules, without threads or a GPU, and the `GoldenTrace.*` tests compare the
 log line by line.
 
-After an intended policy change, regenerate the expected logs and review the diff in the PR:
+After an intended change to a policy or to the loop's rules, regenerate the expected logs and
+review the diff in the PR:
 
 ```bash
 bash scripts/dev.sh bash -c "NS_UPDATE_GOLDEN=1 ./build/ci-cpu/tests/ns_unit_tests --gtest_filter='GoldenTrace.*'"
