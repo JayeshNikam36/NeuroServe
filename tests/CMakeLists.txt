@@ -9,7 +9,8 @@ include(GoogleTest)
 add_executable(ns_unit_tests
     unit/test_version.cpp
     unit/test_generate.cpp
-    unit/test_request.cpp)
+    unit/test_request.cpp
+    unit/test_engine_loop.cpp)
 target_include_directories(ns_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
 target_link_libraries(ns_unit_tests PRIVATE neuroserve::core GTest::gtest_main ns_warnings)
 gtest_discover_tests(ns_unit_tests PROPERTIES LABELS "cpu")

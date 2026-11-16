@@ -30,3 +30,29 @@ jobs:
 
       - name: Test
         run: ctest --preset ci-cpu
+
+  cpu-tsan:
+    name: ThreadSanitizer (data races)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+
+      - name: Install GCC 12 (the tsan-cpu preset's compiler)
+        run: sudo apt-get install -y g++-12
+
+      - name: Allow ThreadSanitizer's memory layout
+        # Newer kernels randomise more address bits than TSan supports ("unexpected memory mapping").
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake --preset tsan-cpu
+
+      - name: Build
+        run: cmake --build --preset tsan-cpu -j
+
+      - name: Test
+        run: ctest --preset tsan-cpu

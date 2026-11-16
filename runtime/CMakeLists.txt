@@ -1,7 +1,8 @@
 add_library(neuroserve_core
     core/src/version.cpp
     core/src/generate.cpp
-    core/src/request.cpp)
+    core/src/request.cpp
+    core/src/engine_loop.cpp)
 add_library(neuroserve::core ALIAS neuroserve_core)
 
 target_include_directories(neuroserve_core
@@ -14,7 +15,10 @@ if(NS_ENABLE_CUDA)
     target_compile_definitions(neuroserve_core PRIVATE NS_WITH_CUDA=1)
 endif()
 
-target_link_libraries(neuroserve_core PRIVATE ns_warnings)
+find_package(Threads REQUIRED)
+target_link_libraries(neuroserve_core
+    PUBLIC  Threads::Threads
+    PRIVATE ns_warnings)
 
 # Linked into the Python extension module, which is a shared library.
 set_target_properties(neuroserve_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -23,14 +23,34 @@
         "NS_ENABLE_CUDA": "OFF",
         "NS_WARNINGS_AS_ERRORS": "ON"
       }
+    },
+    {
+      "name": "tsan-cpu",
+      "displayName": "CPU only, ThreadSanitizer (data-race detection)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/tsan-cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "NS_ENABLE_CUDA": "OFF",
+        "NS_WARNINGS_AS_ERRORS": "ON",
+        "NS_SANITIZER": "thread",
+        "CMAKE_CXX_COMPILER": "g++-12"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev-cuda", "configurePreset": "dev-cuda" },
-    { "name": "ci-cpu", "configurePreset": "ci-cpu" }
+    { "name": "ci-cpu", "configurePreset": "ci-cpu" },
+    { "name": "tsan-cpu", "configurePreset": "tsan-cpu" }
   ],
   "testPresets": [
     { "name": "dev-cuda", "configurePreset": "dev-cuda", "output": { "outputOnFailure": true } },
-    { "name": "ci-cpu", "configurePreset": "ci-cpu", "output": { "outputOnFailure": true } }
+    { "name": "ci-cpu", "configurePreset": "ci-cpu", "output": { "outputOnFailure": true } },
+    {
+      "name": "tsan-cpu",
+      "configurePreset": "tsan-cpu",
+      "output": { "outputOnFailure": true },
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1" }
+    }
   ]
 }

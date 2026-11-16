@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <functional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -11,6 +14,8 @@ namespace neuroserve::test_support {
 
 // Deterministic in-memory backend for CPU tests: the next token is (last token + 1) % vocab.
 // Lets generation and scheduling logic be tested in CI without a GPU or a model.
+// Like a real backend it is not thread-safe: only the engine thread may call it. Read the
+// test helpers only after the engine thread has stopped.
 class FakeBackend final : public InferenceBackend {
 public:
     explicit FakeBackend(int vocab_size = 1000, int total_pages = 64, int page_size = 16)
@@ -46,13 +51,24 @@ public:
         if (prompt.empty()) {
             throw std::invalid_argument("prefill: empty prompt");
         }
+        if (fail_prefill_token_ >= 0 && prompt.front() == fail_prefill_token_) {
+            throw std::runtime_error("injected prefill failure");
+        }
+        ++prefill_calls_;
         len = static_cast<int>(prompt.size());
         return next(prompt.back());
     }
 
     std::vector<TokenId> decode_step(std::span<const SeqId> ids,
                                      std::span<const TokenId> tokens) override {
+        if (on_decode) {
+            on_decode(ids.size());
+        }
         if (fail_after_ >= 0 && decode_calls_ >= fail_after_) {
+            throw std::runtime_error("injected decode failure");
+        }
+        if (fail_once_at_ >= 0 && decode_calls_ == fail_once_at_) {
+            fail_once_at_ = -1;
             throw std::runtime_error("injected decode failure");
         }
         ++decode_calls_;
@@ -78,10 +94,17 @@ public:
         return it->second;
     }
 
-    // Test helpers
+    // ---- Test helpers ----
     int live_sequences() const { return static_cast<int>(lengths_.size()); }
     int decode_calls() const { return decode_calls_; }
-    void fail_decode_after(int calls) { fail_after_ = calls; }
+    int prefill_calls() const { return prefill_calls_; }
+    void fail_decode_after(int calls) { fail_after_ = calls; }          // every call from `calls` on fails
+    void fail_decode_once_at(int call) { fail_once_at_ = call; }        // only that one call fails
+    void fail_prefill_when_first_token(TokenId token) { fail_prefill_token_ = token; }
+
+    // Called at the start of every decode_step with the batch size. Set it before the engine
+    // thread starts; tests use it to pause the engine at a known point.
+    std::function<void(std::size_t batch_size)> on_decode;
 
 private:
     int& length(SeqId id) {
@@ -108,7 +131,10 @@ private:
     std::unordered_map<SeqId, int> lengths_;
     SeqId next_id_ = 1;
     int decode_calls_ = 0;
+    int prefill_calls_ = 0;
     int fail_after_ = -1;
+    int fail_once_at_ = -1;
+    TokenId fail_prefill_token_ = -1;
 };
 
 }  // namespace neuroserve::test_support
