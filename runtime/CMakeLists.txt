@@ -1,6 +1,7 @@
 add_library(neuroserve_core
     core/src/version.cpp
-    core/src/generate.cpp)
+    core/src/generate.cpp
+    core/src/request.cpp)
 add_library(neuroserve::core ALIAS neuroserve_core)
 
 target_include_directories(neuroserve_core
