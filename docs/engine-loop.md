@@ -10,7 +10,9 @@ generation for many requests on one dedicated engine thread.
   immediately and never reaches the queue.
 - **Hand-over through the mutex.** A request is changed by the caller until it is queued under the
   lock, and only by the engine thread afterwards.
-- **Batched decode.** Every step decodes all active requests with one `decode_step` call.
+- **Batched decode.** Every step decodes all running requests with one `decode_step` call;
+  requests admitted in a step are prefilled in it and join the decode batch from the next step.
+  A step's tokens (prefill + decode) are bounded by `max_batch_tokens`.
 - **Per-step stop.** A request completes on the step that produces its stop token or its last
   allowed token; no tokens are generated past the stop.
 - **On-demand KV pages with preemption.** A request holds pages only for the tokens it has

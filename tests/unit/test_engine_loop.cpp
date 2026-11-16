@@ -253,6 +253,74 @@ TEST(EngineLoop, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
     EXPECT_EQ(loop.kv_stats().free_pages, loop.kv_stats().total_pages) << "KV pages leaked";
 }
 
+TEST(EngineLoop, NoStepExceedsTheTokenBudget) {
+    // Prompts of 40-100 tokens against a 128-token budget: at most one or two prefills fit next to
+    // the running decodes in any step. Every step stays within the budget, and every request still
+    // completes correctly.
+    FakeBackend backend;
+    std::vector<neuroserve::core::StepStats> steps;  // engine thread only; read after stop()
+    neuroserve::core::EngineLoopOptions options;
+    options.max_batch = 8;
+    options.max_batch_tokens = 128;
+    options.on_step = [&steps](const neuroserve::core::StepStats& s) { steps.push_back(s); };
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, options);
+
+    std::vector<GenerationParams> inputs;
+    std::vector<RequestHandle> handles;
+    for (int i = 0; i < 12; ++i) {
+        inputs.push_back(params(std::vector<TokenId>(static_cast<std::size_t>(40 + 5 * i), i + 1), 12));
+        handles.push_back(loop.submit(inputs.back()));
+    }
+    gate.open();
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        EXPECT_EQ(finish(handles[i]).tokens, expected_tokens(inputs[i])) << "request " << i;
+    }
+    loop.stop();
+
+    ASSERT_FALSE(steps.empty());
+    int prefill_tokens = 0;
+    for (const auto& s : steps) {
+        EXPECT_LE(s.prefill_tokens + s.decode_tokens, 128) << "a step exceeded the token budget";
+        prefill_tokens += s.prefill_tokens;
+    }
+    const auto stats = loop.stats();
+    EXPECT_LE(stats.max_step_tokens, 128);
+    EXPECT_GT(stats.max_step_tokens, 64) << "the budget was never approached: the test is too easy";
+    EXPECT_EQ(stats.prefill_tokens, static_cast<std::uint64_t>(prefill_tokens));
+}
+
+TEST(EngineLoop, PromptLongerThanTheTokenBudgetIsRejected) {
+    FakeBackend backend;
+    neuroserve::core::EngineLoopOptions options;
+    options.max_batch_tokens = 64;
+    EngineLoop loop(backend, options);
+    EXPECT_THROW(loop.submit(params(std::vector<TokenId>(65, 1), 4)), std::invalid_argument);
+    EXPECT_EQ(finish(loop.submit(params(std::vector<TokenId>(64, 1), 4))).tokens.size(), 4u);
+}
+
+TEST(EngineLoop, AdmittedRequestsDecodeFromTheNextStep) {
+    // A request is prefilled in the step that admits it and decoded from the following step: the
+    // step that prefills it never counts it as a decode token, and each later step decodes it once.
+    FakeBackend backend;
+    std::vector<neuroserve::core::StepStats> steps;
+    neuroserve::core::EngineLoopOptions options;
+    options.on_step = [&steps](const neuroserve::core::StepStats& s) { steps.push_back(s); };
+    EngineLoop loop(backend, options);
+    EXPECT_EQ(finish(loop.submit(params({5, 6, 7}, 4))).tokens, (std::vector<TokenId>{8, 9, 10, 11}));
+    loop.stop();
+
+    ASSERT_EQ(steps.size(), 4u);  // 1 prefill step (token 8) + 3 decode steps (9, 10, 11)
+    EXPECT_EQ(steps[0].prefill_requests, 1u);
+    EXPECT_EQ(steps[0].prefill_tokens, 3);
+    EXPECT_EQ(steps[0].decode_tokens, 0);
+    for (std::size_t s = 1; s < steps.size(); ++s) {
+        EXPECT_EQ(steps[s].prefill_tokens, 0);
+        EXPECT_EQ(steps[s].decode_tokens, 1);
+    }
+}
+
 TEST(EngineLoop, PrefillFailureFailsOnlyThatRequest) {
     FakeBackend backend;
     backend.fail_prefill_when_first_token(13);

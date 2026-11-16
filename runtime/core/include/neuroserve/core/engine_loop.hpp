@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -68,9 +69,20 @@ private:
     std::shared_ptr<State> state_;
 };
 
+// What one engine step did (for the on_step hook, tests and metrics).
+struct StepStats {
+    std::size_t prefill_requests = 0;  // requests admitted and prefilled in this step
+    int prefill_tokens = 0;            // their prompt tokens
+    int decode_tokens = 0;             // one per request decoded in this step
+    std::size_t preempted = 0;
+};
+
 struct EngineLoopOptions {
     int max_batch = 8;             // most sequences in one decode step
+    int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
+    // Called on the engine thread after every step that did work. Must be fast and must not throw.
+    std::function<void(const StepStats&)> on_step{};
 };
 
 // Counters for monitoring and tests. A consistent snapshot, safe to read from any thread.
@@ -82,6 +94,9 @@ struct EngineLoopStats {
     std::uint64_t cancelled = 0;
     std::uint64_t preemptions = 0;  // times a running request was preempted (and later restarted)
     std::uint64_t decode_steps = 0;
+    std::uint64_t prefill_tokens = 0;  // prompt tokens processed (including restarts after preemption)
+    std::uint64_t decode_tokens = 0;
+    int max_step_tokens = 0;           // most tokens any single step processed
     std::size_t pending = 0;         // waiting in the queue
     std::size_t active = 0;          // admitted and generating
     std::size_t max_batch_seen = 0;  // largest decode batch so far
@@ -96,6 +111,8 @@ struct EngineLoopStats {
 // Each step decodes all active requests together (one decode_step call for the whole batch),
 // and a request finishes on the step that produces its stop token or its last allowed token.
 // Logs one JSON line per finished request (logger "neuroserve.engine"); never logs token ids.
+// A step prefills the requests admitted in it and decodes one token for every request that was
+// already running; its token count is bounded by max_batch_tokens.
 // KV pages are allocated on demand as requests grow. Once per step a SchedulingPolicy
 // (scheduler.hpp) decides which running requests to preempt when the batch cannot grow, and which
 // queued requests to admit; the loop checks each decision and applies it. A preempted request
@@ -140,7 +157,7 @@ private:
     void loop();
     void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
     void preempt(std::vector<EntryPtr> victims);
-    void start(EntryPtr entry);
+    void start(EntryPtr entry, std::vector<EntryPtr>& joining);
     void decode_active();
     bool append_token(Entry& entry, TokenId token);
     void complete(EntryPtr entry) noexcept;

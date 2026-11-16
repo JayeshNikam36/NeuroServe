@@ -10,17 +10,19 @@ arrive step=0 id=b prompt=4 max_new=8
 arrive step=0 id=c prompt=4 max_new=8
 arrive step=0 id=d prompt=4 max_new=8
 --- expected
-step 0 queued=[a b c d] running=[] preempt=[] admit=[a b c d] finished=[] free_pages=0
-step 1 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
-step 2 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
-step 3 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] free_pages=0
-step 4 queued=[] running=[a b c d] preempt=[d c] admit=[] finished=[] free_pages=2
-step 5 queued=[c d] running=[a b] preempt=[] admit=[c] finished=[] free_pages=0
-step 6 queued=[d] running=[a b c] preempt=[] admit=[] finished=[a b] free_pages=6
-step 7 queued=[d] running=[c] preempt=[] admit=[d] finished=[] free_pages=4
-step 8 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=4
-step 9 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=3
-step 10 queued=[] running=[c d] preempt=[] admit=[] finished=[] free_pages=3
-step 11 queued=[] running=[c d] preempt=[] admit=[] finished=[c] free_pages=5
-step 12 queued=[] running=[d] preempt=[] admit=[] finished=[] free_pages=5
-step 13 queued=[] running=[d] preempt=[] admit=[] finished=[d] free_pages=8
+step 0 queued=[a b c d] running=[] preempt=[] admit=[a b c d] finished=[] tokens=16+0 free_pages=4
+step 1 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] tokens=0+4 free_pages=0
+step 2 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] tokens=0+4 free_pages=0
+step 3 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] tokens=0+4 free_pages=0
+step 4 queued=[] running=[a b c d] preempt=[] admit=[] finished=[] tokens=0+4 free_pages=0
+step 5 queued=[] running=[a b c d] preempt=[d c] admit=[] finished=[] tokens=0+2 free_pages=2
+step 6 queued=[c d] running=[a b] preempt=[] admit=[c d] finished=[] tokens=8+2 free_pages=0
+step 7 queued=[] running=[a b c d] preempt=[d] admit=[] finished=[a b] tokens=0+3 free_pages=6
+step 8 queued=[d] running=[c] preempt=[] admit=[d] finished=[] tokens=4+1 free_pages=5
+step 9 queued=[] running=[c d] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=4
+step 10 queued=[] running=[c d] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=4
+step 11 queued=[] running=[c d] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=3
+step 12 queued=[] running=[c d] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=3
+step 13 queued=[] running=[c d] preempt=[] admit=[] finished=[c] tokens=0+2 free_pages=5
+step 14 queued=[] running=[d] preempt=[] admit=[] finished=[] tokens=0+1 free_pages=5
+step 15 queued=[] running=[d] preempt=[] admit=[] finished=[d] tokens=0+1 free_pages=8

@@ -9,6 +9,7 @@ engine:
   max_prompt_tokens: 512
   num_pages: 2048                           # 2048 x 16 tokens x 32 KiB = 1 GiB of KV cache
   max_batch: 8
+  max_batch_tokens: 512                     # tokens per engine step (prefill + decode); >= max_prompt_tokens
   max_pages_per_sequence: 64                # 1024 tokens per sequence (prompt + output)
   device_index: 0
   scheduling_policy: fcfs                  # admission order; see docs/scheduling.md
