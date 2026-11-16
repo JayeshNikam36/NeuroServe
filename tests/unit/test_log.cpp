@@ -135,7 +135,8 @@ TEST_F(LogCapture, EngineLoopLogsEachRequestWithBothIdsAndNoTokens) {
     EXPECT_TRUE(contains(*it, "\"completion_tokens\": 4"));
     EXPECT_TRUE(contains(*it, "\"finish_reason\": \"length\""));
     for (const auto& line : captured) {
-        EXPECT_FALSE(contains(line, "771")) << "prompt tokens must never be logged: " << line;
+        EXPECT_FALSE(contains(line, "771, 772")) << "prompt tokens must never be logged: " << line;
+        EXPECT_FALSE(contains(line, "\"tokens\":")) << "token ids must never be logged: " << line;
     }
 }
 

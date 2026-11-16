@@ -104,8 +104,12 @@ GenerationResult RequestHandle::wait() const {
 
 // ---- EngineLoop: caller side -----------------------------------------------------------------
 
-EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options)
-    : backend_(backend), options_(options), model_info_(backend.model_info()) {
+EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
+                       std::unique_ptr<SchedulingPolicy> policy)
+    : backend_(backend),
+      options_(std::move(options)),
+      model_info_(backend.model_info()),
+      policy_(policy ? std::move(policy) : make_policy(options_.policy)) {
     if (options_.max_batch < 1) {
         throw std::invalid_argument("max_batch must be at least 1");
     }
@@ -118,7 +122,8 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options)
     }
     kv_snapshot_ = kv;
     log::write(log::Level::kInfo, kLogger, "engine loop started",
-               {{"backend", std::string(backend.name())}, {"max_batch", options_.max_batch},
+               {{"backend", std::string(backend.name())}, {"policy", std::string(policy_->name())},
+                {"max_batch", options_.max_batch},
                 {"total_pages", total_pages_}, {"page_size_tokens", page_size_}});
     thread_ = std::thread([this] { run(); });
 }
@@ -217,6 +222,8 @@ EngineLoopStats EngineLoop::stats() const {
     return stats_;
 }
 
+std::string_view EngineLoop::policy_name() const noexcept { return policy_->name(); }
+
 KvCacheStats EngineLoop::kv_stats() const {
     std::lock_guard lock(mu_);
     return kv_snapshot_;
@@ -228,7 +235,10 @@ void EngineLoop::run() noexcept {
     try {
         loop();
     } catch (...) {
-        // Only a bug gets here. cancel_all() still answers every waiting caller.
+        // Only a bug gets here (e.g. a policy breaking a limit). cancel_all() still answers every
+        // waiting caller, and the engine refuses new work.
+        log::write(log::Level::kError, kLogger, "engine loop crashed; cancelling all requests",
+                   {{"error", describe(std::current_exception())}});
     }
     cancel_all();
 }
@@ -258,21 +268,34 @@ void EngineLoop::loop() {
 }
 
 void EngineLoop::admit_locked(std::vector<EntryPtr>& admitted) {
-    // First come, first served. Stop at the first request that does not fit, so no request
-    // can be overtaken forever by smaller ones (Day 13 moves this decision into a policy).
-    while (!pending_.empty()) {
-        Entry& next = *pending_.front();
-        const auto running = active_.size() + admitted.size();
-        if (running >= static_cast<std::size_t>(options_.max_batch) ||
-            reserved_pages_ + next.pages > total_pages_) {
-            break;
-        }
-        reserved_pages_ += next.pages;
-        next.reserved = true;
-        next.request.transition_to(RequestState::kAdmitted);
-        admitted.push_back(std::move(pending_.front()));
-        pending_.pop_front();
+    if (pending_.empty()) {
+        return;
     }
+    // The policy decides; the loop checks the decision and applies it.
+    SchedulerInput input;
+    input.max_batch = options_.max_batch;
+    input.free_pages = total_pages_ - reserved_pages_;
+    input.queued.reserve(pending_.size());
+    for (const auto& entry : pending_) {
+        input.queued.push_back({entry->request.id(), static_cast<int>(entry->params.prompt.size()),
+                                entry->params.max_new_tokens, entry->pages});
+    }
+    input.running.reserve(active_.size());
+    for (const auto& entry : active_) {
+        input.running.push_back({entry->request.id(), entry->pages, static_cast<int>(entry->tokens.size()),
+                                 entry->params.max_new_tokens});
+    }
+    const ScheduleDecision decision = policy_->schedule(input);
+    check_decision(input, decision);  // a faulty policy stops the engine loudly (see run())
+
+    for (const std::size_t index : decision.admit) {
+        EntryPtr& slot = pending_[index];
+        reserved_pages_ += slot->pages;
+        slot->reserved = true;
+        slot->request.transition_to(RequestState::kAdmitted);
+        admitted.push_back(std::move(slot));  // leaves an empty slot, removed below
+    }
+    std::erase_if(pending_, [](const EntryPtr& entry) { return !entry; });
     stats_.pending = pending_.size();
 }
 

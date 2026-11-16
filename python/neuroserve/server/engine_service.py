@@ -83,6 +83,7 @@ class EngineService:
             max_batch=e.max_batch,
             max_pages_per_sequence=e.max_pages_per_sequence,
             device_index=e.device_index,
+            scheduling_policy=e.scheduling_policy,
         )
         tokenizer = ChatTokenizer(config.model.tokenizer_dir)
         return cls(config, engine, tokenizer, device_info(e.device_index)["name"])

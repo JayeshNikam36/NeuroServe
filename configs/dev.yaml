@@ -11,6 +11,7 @@ engine:
   max_batch: 8
   max_pages_per_sequence: 64                # 1024 tokens per sequence (prompt + output)
   device_index: 0
+  scheduling_policy: fcfs                  # admission order; see docs/scheduling.md
 
 limits:
   default_max_tokens: 128                   # used when a request sets no max_tokens

@@ -1,0 +1,37 @@
+# Staggered arrivals: requests arrive over several steps and both limits matter
+# (max_batch 3, 12 pages). Shows queueing, refilling freed slots, and idle steps being skipped.
+policy fcfs
+limits max_batch=3 total_pages=12 page_size=16
+arrive step=0 id=a prompt=20 max_new=12
+arrive step=0 id=b prompt=50 max_new=10
+arrive step=1 id=c prompt=10 max_new=4
+arrive step=2 id=d prompt=60 max_new=20
+arrive step=2 id=e prompt=5 max_new=3
+arrive step=3 id=f prompt=14 max_new=2
+arrive step=5 id=g prompt=33 max_new=7
+arrive step=40 id=h prompt=8 max_new=2
+--- expected
+step 0 queued=[a b] running=[] admit=[a b] finished=[] free_pages=6
+step 1 queued=[c] running=[a b] admit=[c] finished=[] free_pages=5
+step 2 queued=[d e] running=[a b c] admit=[] finished=[] free_pages=5
+step 3 queued=[d e f] running=[a b c] admit=[] finished=[c] free_pages=6
+step 4 queued=[d e f] running=[a b] admit=[d] finished=[] free_pages=1
+step 5 queued=[e f g] running=[a b d] admit=[] finished=[] free_pages=1
+step 6 queued=[e f g] running=[a b d] admit=[] finished=[] free_pages=1
+step 7 queued=[e f g] running=[a b d] admit=[] finished=[] free_pages=1
+step 8 queued=[e f g] running=[a b d] admit=[] finished=[b] free_pages=5
+step 9 queued=[e f g] running=[a d] admit=[e] finished=[] free_pages=4
+step 10 queued=[f g] running=[a d e] admit=[] finished=[a e] free_pages=7
+step 11 queued=[f g] running=[d] admit=[f g] finished=[f] free_pages=4
+step 12 queued=[] running=[d g] admit=[] finished=[] free_pages=4
+step 13 queued=[] running=[d g] admit=[] finished=[] free_pages=4
+step 14 queued=[] running=[d g] admit=[] finished=[] free_pages=4
+step 15 queued=[] running=[d g] admit=[] finished=[] free_pages=4
+step 16 queued=[] running=[d g] admit=[] finished=[g] free_pages=7
+step 17 queued=[] running=[d] admit=[] finished=[] free_pages=7
+step 18 queued=[] running=[d] admit=[] finished=[] free_pages=7
+step 19 queued=[] running=[d] admit=[] finished=[] free_pages=7
+step 20 queued=[] running=[d] admit=[] finished=[] free_pages=7
+step 21 queued=[] running=[d] admit=[] finished=[] free_pages=7
+step 22 queued=[] running=[d] admit=[] finished=[d] free_pages=12
+step 40 queued=[h] running=[] admit=[h] finished=[h] free_pages=12
