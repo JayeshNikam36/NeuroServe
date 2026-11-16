@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "neuroserve/core/inference_backend.hpp"
@@ -47,6 +48,12 @@ struct GenerationResult {
 
 // The request was cancelled because the engine is stopping, or submit() was called after stop().
 class EngineStopped : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// The request was cancelled by EngineLoop::cancel_request (e.g. the client disconnected).
+class RequestCancelled : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
@@ -147,6 +154,12 @@ public:
     // Throws std::invalid_argument for a bad request and EngineStopped after stop().
     RequestHandle submit(GenerationParams params);
 
+    // Thread-safe. Cancels one request by its id (ns-...): at the start of the next engine step it
+    // leaves the queue or the running batch, its sequence and KV pages are freed, and its caller gets
+    // RequestCancelled (a stream ends after the tokens generated so far). Returns false if no
+    // unfinished request has this id.
+    bool cancel_request(const std::string& request_id);
+
     // Thread-safe and idempotent. Cancels queued and running requests, then joins the engine thread.
     void stop();
     bool stop_requested() const;
@@ -174,6 +187,7 @@ private:
     // Engine thread only.
     void run() noexcept;
     void loop();
+    void apply_cancellations();
     void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
     void preempt(std::vector<EntryPtr> victims);
     void start(EntryPtr entry, std::vector<EntryPtr>& joining);
@@ -202,6 +216,8 @@ private:
     std::uint64_t next_order_ = 0;  // arrival order of submitted requests
     std::unique_ptr<SchedulingPolicy> next_policy_;  // set_policy(): taken at the next step
     std::string policy_name_;
+    std::unordered_set<std::string> unfinished_;      // ids of submitted requests not finished yet
+    std::unordered_set<std::string> cancel_requests_;  // cancel_request(): applied at the next step
     std::deque<EntryPtr> pending_;
     EngineLoopStats stats_;
     KvCacheStats kv_snapshot_;

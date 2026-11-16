@@ -27,6 +27,7 @@ using neuroserve::core::EngineStopped;
 using neuroserve::core::FinishReason;
 using neuroserve::core::GenerationParams;
 using neuroserve::core::GenerationResult;
+using neuroserve::core::RequestCancelled;
 using neuroserve::core::RequestHandle;
 using neuroserve::test_support::FakeBackend;
 using namespace std::chrono_literals;
@@ -377,6 +378,98 @@ TEST(EngineLoop, OnlyStreamingRequestsCanBeRead) {
     const auto handle = loop.submit(params({1}, 2));
     EXPECT_THROW(handle.read_tokens(1ms), std::logic_error);
     EXPECT_EQ(finish(handle).tokens, (std::vector<TokenId>{2, 3}));
+}
+
+// ---- Cancellation ------------------------------------------------------------------------------
+
+// Blocks the engine inside its first prefill until open() is called.
+class FirstPrefillGate {
+public:
+    void install(FakeBackend& backend) {
+        backend.on_prefill = [this] {
+            if (first_.exchange(false)) {
+                entered_.set_value();
+                released_.wait();
+            }
+        };
+    }
+    bool wait_entered() { return entered_future_.wait_for(10s) == std::future_status::ready; }
+    void open() { release_.set_value(); }
+
+private:
+    std::atomic<bool> first_{true};
+    std::promise<void> entered_;
+    std::future<void> entered_future_ = entered_.get_future();
+    std::promise<void> release_;
+    std::shared_future<void> released_ = release_.get_future().share();
+};
+
+TEST(EngineLoop, CancelDuringPrefillFreesEverythingByTheNextStep) {
+    FakeBackend backend;
+    FirstPrefillGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend);
+    const auto handle = loop.submit(params({1}, 50));
+    ASSERT_TRUE(gate.wait_entered());           // the engine is inside this request's prefill
+    EXPECT_TRUE(loop.cancel_request(handle.id()));
+    gate.open();
+    EXPECT_THROW(finish(handle), RequestCancelled);
+    const auto kv = loop.kv_stats();            // up to date by the time the caller is answered
+    EXPECT_EQ(kv.free_pages, kv.total_pages);
+    EXPECT_FALSE(loop.cancel_request(handle.id()));  // already finished
+    loop.stop();
+    EXPECT_EQ(backend.decode_calls(), 0);       // cancelled at the start of the next step, before any decode
+    EXPECT_EQ(backend.live_sequences(), 0);
+    EXPECT_EQ(loop.stats().cancelled, 1u);
+}
+
+TEST(EngineLoop, CancelDuringDecodeStopsThatRequestOnlyAndFreesItsPages) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend);
+    const auto victim = loop.submit(streaming(params({1}, 200)));
+    ASSERT_TRUE(gate.wait_entered());           // victim is decoding; the engine is paused in a decode step
+    const auto other = loop.submit(params({500}, 5));
+    EXPECT_TRUE(loop.cancel_request(victim.id()));
+    gate.open();
+
+    const auto streamed = read_all(victim);     // what it generated before the cancellation, then the end
+    EXPECT_FALSE(streamed.empty());
+    EXPECT_LT(streamed.size(), 200u);
+    EXPECT_THROW(victim.wait(), RequestCancelled);
+    EXPECT_EQ(finish(other).tokens, expected_tokens(params({500}, 5)));  // the rest of the batch goes on
+    const auto kv = loop.kv_stats();
+    EXPECT_EQ(kv.free_pages, kv.total_pages);
+    loop.stop();
+    EXPECT_EQ(backend.live_sequences(), 0);
+}
+
+TEST(EngineLoop, CancelWhileQueuedNeverRunsTheRequest) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 1});
+    const auto running = loop.submit(params({1}, 3));
+    ASSERT_TRUE(gate.wait_entered());           // the only slot is taken
+    const auto queued = loop.submit(params({100}, 3));
+    EXPECT_TRUE(loop.cancel_request(queued.id()));
+    gate.open();
+    EXPECT_THROW(finish(queued), RequestCancelled);
+    EXPECT_EQ(finish(running).tokens, (std::vector<TokenId>{2, 3, 4}));
+    loop.stop();
+    EXPECT_EQ(backend.prefill_calls(), 1);      // the cancelled request was never prefilled
+    EXPECT_EQ(loop.stats().cancelled, 1u);
+}
+
+TEST(EngineLoop, CancellingAnUnknownRequestReturnsFalse) {
+    FakeBackend backend;
+    EngineLoop loop(backend);
+    EXPECT_FALSE(loop.cancel_request("ns-999999"));
+    const auto handle = loop.submit(params({1}, 2));
+    finish(handle);
+    EXPECT_FALSE(loop.cancel_request(handle.id()));  // finished requests cannot be cancelled
+    EXPECT_EQ(loop.stats().cancelled, 0u);
 }
 
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {

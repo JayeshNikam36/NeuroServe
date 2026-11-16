@@ -20,7 +20,9 @@ change the status (200 is already sent): the stream ends with one event
 | 400 | `invalid_request_error` | `unsupported_parameter` | `n>1`, or `temperature>0` (not supported yet) |
 | 404 | `invalid_request_error` | `model_not_found` | `model` is not the served model |
 | 404 | `invalid_request_error` | `null` | Unknown URL |
+| 404 | `invalid_request_error` | `request_not_found` | `DELETE /v1/requests/{id}`: no request with that id is in progress |
 | 413 | `invalid_request_error` | `context_length_exceeded` | Prompt longer than `engine.max_prompt_tokens` |
+| 499 | `invalid_request_error` | `request_cancelled` | The request was cancelled (`DELETE /v1/requests/{id}`, or its client disconnected); in a stream, the closing error event |
 | 500 | `server_error` | `internal_error` | Unexpected server error (message contains the request id; details only in the log) |
 | 500 | `server_error` | `gpu_error` | CUDA error during generation; the server marks itself unhealthy |
 | 503 | `server_error` | `kv_cache_exhausted` | Not enough free KV-cache pages for the request |

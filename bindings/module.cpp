@@ -144,6 +144,8 @@ public:
         return out;
     }
 
+    bool cancel(const std::string& request_id) { return loop_->cancel_request(request_id); }
+
     void set_scheduling_policy(const std::string& name) {
         loop_->set_policy(core::make_policy(name, policy_options_));  // unknown name: ValueError; next step on
     }
@@ -191,6 +193,7 @@ PYBIND11_MODULE(_core, m) {
     py::register_exception<ns::KvCacheExhausted>(m, "KvCacheExhausted", PyExc_RuntimeError);
     py::register_exception<ns::cuda::CudaError>(m, "CudaError", PyExc_RuntimeError);
     py::register_exception<core::EngineStopped>(m, "EngineStopped", PyExc_RuntimeError);
+    py::register_exception<core::RequestCancelled>(m, "RequestCancelled", PyExc_RuntimeError);
 
     py::tuple policies(std::size(core::kPolicyNames));
     for (std::size_t i = 0; i < std::size(core::kPolicyNames); ++i) {
@@ -268,6 +271,9 @@ PYBIND11_MODULE(_core, m) {
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32,
              py::call_guard<py::gil_scoped_release>(),
              "Greedy generation without stop tokens: returns exactly max_new_tokens token ids.")
+        .def("cancel", &Engine::cancel, py::arg("request_id"),
+             "Cancels an unfinished request by its id (ns-...): it stops at the next engine step, its KV "
+             "pages are freed, and its caller gets RequestCancelled. False if no unfinished request has this id.")
         .def("model_info", &Engine::model_info)
         .def("kv_stats", &Engine::kv_stats)
         .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.")

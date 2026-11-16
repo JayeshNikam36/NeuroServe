@@ -100,6 +100,24 @@ def test_stream_returns_the_tokens_of_generate_as_they_are_made(engine):
 
 
 @needs_model
+def test_cancel_stops_a_running_request_and_frees_its_pages(engine):
+    prompt, _ = reference(0)
+    stream = engine.stream(prompt, max_new_tokens=200)
+    tokens = stream.read()
+    assert tokens, "the request should be running"
+    assert engine.cancel(stream.request_id) is True
+    while (batch := stream.read()) is not None:
+        tokens += batch
+    assert len(tokens) < 200, "the request ran to the end: it was not cancelled"
+    with pytest.raises(neuroserve.RequestCancelled):
+        stream.result()
+    assert engine.cancel(stream.request_id) is False  # finished: nothing left to cancel
+    assert engine.cancel("ns-does-not-exist") is False
+    kv = engine.kv_stats()
+    assert kv["free_pages"] == kv["total_pages"], "KV pages leaked after a cancellation"
+
+
+@needs_model
 def test_generate_releases_the_gil(engine):
     """A Python thread must keep running while generate() works in C++."""
     prompt, expected = reference(0)

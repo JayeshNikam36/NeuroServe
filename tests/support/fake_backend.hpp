@@ -46,6 +46,9 @@ public:
     }
 
     TokenId prefill(SeqId id, std::span<const TokenId> prompt) override {
+        if (on_prefill) {
+            on_prefill();
+        }
         int& len = length(id);
         if (len != 0) {
             throw std::logic_error("prefill: sequence already holds tokens");
@@ -125,6 +128,7 @@ public:
     // Called at the start of every decode_step with the batch size. Set it before the engine
     // thread starts; tests use it to pause the engine at a known point.
     std::function<void(std::size_t batch_size)> on_decode;
+    std::function<void()> on_prefill;  // the same, at the start of every prefill
 
     // When true, every successful decode_step's sequence ids are appended to decode_batches, and
     // the first token of every prefilled prompt to prefill_first_tokens (the admission order).
