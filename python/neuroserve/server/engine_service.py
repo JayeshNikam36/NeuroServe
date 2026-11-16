@@ -81,6 +81,7 @@ class EngineService:
             max_prompt_tokens=e.max_prompt_tokens,
             num_pages=e.num_pages,
             max_batch=e.max_batch,
+            max_batch_tokens=e.max_batch_tokens,
             max_pages_per_sequence=e.max_pages_per_sequence,
             device_index=e.device_index,
             scheduling_policy=e.scheduling_policy,

@@ -30,6 +30,11 @@ def make_config(**engine) -> ServerConfig:
     })
 
 
+def test_prompt_limit_must_fit_the_token_budget():
+    with pytest.raises(ValueError, match="max_batch_tokens"):
+        make_config(max_prompt_tokens=600, max_batch_tokens=512)
+
+
 class FakeEngine:
     """Like the real engine's run(): a fixed reply, then filler, ending at the first stop token."""
 

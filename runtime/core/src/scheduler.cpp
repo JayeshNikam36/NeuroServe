@@ -38,8 +38,10 @@ void check_decision(const SchedulerInput& input, const ScheduleDecision& decisio
             needed += input.running[i].next_step_pages;
         }
     }
+    long long tokens = static_cast<long long>(input.running.size() - decision.preempt.size());  // decodes
     for (const std::size_t index : decision.admit) {
         needed += input.queued[index].pages;
+        tokens += input.queued[index].prompt_tokens;  // prefills
     }
 
     const auto running = input.running.size() - decision.preempt.size() + decision.admit.size();
@@ -50,6 +52,10 @@ void check_decision(const SchedulerInput& input, const ScheduleDecision& decisio
     if (needed > available) {
         throw std::logic_error("scheduling decision needs " + std::to_string(needed) +
                                " new KV pages this step; " + std::to_string(available) + " are available");
+    }
+    if (tokens > input.max_step_tokens) {
+        throw std::logic_error("scheduling decision processes " + std::to_string(tokens) +
+                               " tokens this step; the budget is " + std::to_string(input.max_step_tokens));
     }
 }
 
@@ -73,15 +79,19 @@ ScheduleDecision FcfsPolicy::schedule(const SchedulerInput& input) {
         return decision;  // no admissions while memory is short
     }
 
-    // 2. Admit in strict arrival order while there are slots and pages.
+    // 2. Admit in strict arrival order while there are slots, pages and token budget. Decode tokens
+    //    are counted first: every running request decodes one token this step.
     free_pages -= growth;
     auto slots = input.max_batch - static_cast<long long>(input.running.size());
+    auto budget = input.max_step_tokens - static_cast<long long>(input.running.size());
     for (std::size_t i = 0; i < input.queued.size() && slots > 0; ++i) {
-        if (input.queued[i].pages > free_pages) {
+        const auto& q = input.queued[i];
+        if (q.pages > free_pages || q.prompt_tokens > budget) {
             break;  // nobody behind this request may overtake it
         }
         decision.admit.push_back(i);
-        free_pages -= input.queued[i].pages;
+        free_pages -= q.pages;
+        budget -= q.prompt_tokens;
         --slots;
     }
     return decision;

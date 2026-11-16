@@ -114,6 +114,9 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     if (options_.max_batch < 1) {
         throw std::invalid_argument("max_batch must be at least 1");
     }
+    if (options_.max_batch_tokens < 1) {
+        throw std::invalid_argument("max_batch_tokens must be at least 1");
+    }
     const KvCacheStats kv = backend.kv_stats();
     page_size_ = kv.page_size_tokens;
     total_pages_ = kv.total_pages;
@@ -124,7 +127,7 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     kv_snapshot_ = kv;
     log::write(log::Level::kInfo, kLogger, "engine loop started",
                {{"backend", std::string(backend.name())}, {"policy", std::string(policy_->name())},
-                {"max_batch", options_.max_batch},
+                {"max_batch", options_.max_batch}, {"max_batch_tokens", options_.max_batch_tokens},
                 {"total_pages", total_pages_}, {"page_size_tokens", page_size_}});
     thread_ = std::thread([this] { run(); });
 }
@@ -144,6 +147,10 @@ void EngineLoop::validate(const GenerationParams& params) const {
                                     std::to_string(params.max_new_tokens));
     }
     const auto prompt_len = static_cast<long long>(params.prompt.size());
+    if (prompt_len > options_.max_batch_tokens) {  // its prefill could never fit in a step
+        throw std::invalid_argument("the prompt has " + std::to_string(prompt_len) +
+                                    " tokens; max_batch_tokens is " + std::to_string(options_.max_batch_tokens));
+    }
     if (model_info_.max_prompt_tokens > 0 && prompt_len > model_info_.max_prompt_tokens) {
         throw std::invalid_argument("the prompt has " + std::to_string(prompt_len) +
                                     " tokens; the limit is " + std::to_string(model_info_.max_prompt_tokens));
@@ -261,12 +268,33 @@ void EngineLoop::loop() {
             std::lock_guard lock(mu_);
             schedule_locked(free_pages, admitted, preempted);
         }
+        StepStats step;
+        step.preempted = preempted.size();
         preempt(std::move(preempted));  // first: admissions may count on the pages it frees
+        // Prefill the admitted requests; they join the decode batch from the next step on.
+        std::vector<EntryPtr> joining;
         for (auto& entry : admitted) {
-            start(std::move(entry));
+            ++step.prefill_requests;
+            step.prefill_tokens += static_cast<int>(entry->params.prompt.size());
+            start(std::move(entry), joining);
         }
+        step.decode_tokens = static_cast<int>(active_.size());
         if (!active_.empty()) {
             decode_active();
+        }
+        for (auto& entry : joining) {
+            active_.push_back(std::move(entry));
+        }
+        if (step.prefill_requests > 0 || step.decode_tokens > 0) {
+            {
+                std::lock_guard lock(mu_);
+                stats_.prefill_tokens += static_cast<std::uint64_t>(step.prefill_tokens);
+                stats_.decode_tokens += static_cast<std::uint64_t>(step.decode_tokens);
+                stats_.max_step_tokens = std::max(stats_.max_step_tokens, step.prefill_tokens + step.decode_tokens);
+            }
+            if (options_.on_step) {
+                options_.on_step(step);
+            }
         }
         refresh_kv_snapshot();
         std::lock_guard lock(mu_);
@@ -283,11 +311,12 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     SchedulerInput input;
     input.max_batch = options_.max_batch;
     input.free_pages = free_pages;
+    input.max_step_tokens = options_.max_batch_tokens;
     input.queued.reserve(pending_.size());
     for (const auto& entry : pending_) {
         const auto prompt = static_cast<long long>(entry->params.prompt.size());
         input.queued.push_back({entry->request.id(), static_cast<int>(prompt), entry->params.max_new_tokens,
-                                pages_for_tokens(prompt + 1)});  // prefill + this step's decode
+                                pages_for_tokens(prompt)});  // its prefill; it decodes from next step
     }
     input.running.reserve(active_.size());
     for (const auto& entry : active_) {
@@ -336,7 +365,7 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
     stats_.pending = pending_.size();
 }
 
-void EngineLoop::start(EntryPtr entry) {
+void EngineLoop::start(EntryPtr entry, std::vector<EntryPtr>& joining) {
     try {
         entry->seq = backend_.create_sequence();
         entry->has_seq = true;
@@ -351,7 +380,7 @@ void EngineLoop::start(EntryPtr entry) {
             return;
         }
         entry->request.transition_to(RequestState::kDecode);
-        active_.push_back(std::move(entry));
+        joining.push_back(std::move(entry));
     } catch (...) {
         fail(std::move(entry), std::current_exception());  // only this request fails
     }

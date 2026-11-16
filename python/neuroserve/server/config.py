@@ -29,6 +29,7 @@ class EngineSection(_Strict):
     max_prompt_tokens: int = Field(default=512, ge=1)
     num_pages: int = Field(default=2048, ge=1)
     max_batch: int = Field(default=8, ge=1)
+    max_batch_tokens: int = Field(default=512, ge=1)  # tokens one engine step may process (prefill + decode)
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
     scheduling_policy: Literal["fcfs"] = "fcfs"  # which queued requests are admitted next
@@ -65,6 +66,11 @@ class ServerConfig(_Strict):
             raise ValueError(
                 f"max_prompt_tokens ({self.engine.max_prompt_tokens}) + max_tokens_limit "
                 f"({self.limits.max_tokens_limit}) exceeds the per-sequence capacity of {per_sequence} tokens"
+            )
+        if self.engine.max_prompt_tokens > self.engine.max_batch_tokens:
+            raise ValueError(
+                f"max_prompt_tokens ({self.engine.max_prompt_tokens}) exceeds max_batch_tokens "
+                f"({self.engine.max_batch_tokens}): the longest prompt's prefill could never fit in a step"
             )
         if self.limits.default_max_tokens > self.limits.max_tokens_limit:
             raise ValueError("default_max_tokens must not exceed max_tokens_limit")

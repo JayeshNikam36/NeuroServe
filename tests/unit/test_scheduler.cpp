@@ -39,6 +39,7 @@ SchedulerInput input(int max_batch, int free_pages, std::vector<int> queued_page
     SchedulerInput in;
     in.max_batch = max_batch;
     in.free_pages = free_pages;
+    in.max_step_tokens = 1 << 20;  // budget not the limit here; the token tests set it
     for (std::size_t i = 0; i < queued_pages.size(); ++i) {
         in.queued.push_back(QueuedRequest{"q" + std::to_string(i), 10, 10, queued_pages[i]});
     }
@@ -79,6 +80,35 @@ TEST(Fcfs, StopsAtTheFirstRequestThatDoesNotFit) {
 
 TEST(Fcfs, EmptyQueueAdmitsNothing) { EXPECT_TRUE(fcfs(input(8, 100, {})).admit.empty()); }
 
+// ---- FCFS: token budget ----------------------------------------------------------------------
+
+SchedulerInput prompts(int budget, std::vector<int> prompt_tokens, int running = 0) {
+    auto in = input(8, 1000, std::vector<int>(prompt_tokens.size(), 1), running);
+    in.max_step_tokens = budget;
+    for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
+        in.queued[i].prompt_tokens = prompt_tokens[i];
+    }
+    return in;
+}
+
+TEST(Fcfs, PrefillsFitTheTokenBudget) {
+    EXPECT_EQ(fcfs(prompts(100, {40, 50, 30})).admit, (Indices{0, 1}));  // 40 + 50; 30 more would be 120
+}
+
+TEST(Fcfs, DecodeTokensAreCountedFirst) {
+    // 6 running requests each decode one token: 94 of 100 left, so the 90-token prompt fits...
+    EXPECT_EQ(fcfs(prompts(100, {90}, /*running=*/6)).admit, (Indices{0}));
+    // ...but with 6 + 90 = 96 used, a 5-token prompt behind it does not.
+    EXPECT_EQ(fcfs(prompts(100, {90, 5}, /*running=*/6)).admit, (Indices{0}));
+    EXPECT_TRUE(fcfs(prompts(100, {95}, /*running=*/6)).admit.empty());
+}
+
+TEST(Fcfs, ALongPromptBlocksShorterOnesBehindIt) {
+    // Strict arrival order applies to the token budget too: the 80-token prompt waits, and so
+    // does the 10-token prompt behind it.
+    EXPECT_TRUE(fcfs(prompts(100, {80, 10}, /*running=*/30)).admit.empty());
+}
+
 // ---- FCFS: preemption ------------------------------------------------------------------------
 
 TEST(Fcfs, PreemptsTheNewestWhenTheBatchCannotGrow) {
@@ -109,6 +139,10 @@ TEST(CheckDecision, RejectsDecisionsThatBreakALimit) {
     EXPECT_THROW(check_decision(in, decide({}, {1, 1})), std::logic_error);     // admitted twice
     EXPECT_THROW(check_decision(in, decide({}, {0, 1, 2})), std::logic_error);  // over max_batch
     EXPECT_THROW(check_decision(input(8, 3, {2, 2}), decide({}, {0, 1})), std::logic_error);  // pages
+
+    auto budget = prompts(50, {30, 30});
+    EXPECT_NO_THROW(check_decision(budget, decide({}, {0})));
+    EXPECT_THROW(check_decision(budget, decide({}, {0, 1})), std::logic_error);  // 60 tokens > 50
 
     const auto busy = input(8, 0, {}, /*running=*/2, /*held=*/2, /*grow=*/1);  // needs 2, has 0
     EXPECT_THROW(check_decision(busy, decide({}, {})), std::logic_error);       // cannot grow
@@ -146,6 +180,7 @@ TEST(GoldenTrace, BurstLimitedByMaxBatch) { check_golden("burst_max_batch.trace"
 TEST(GoldenTrace, KvBoundHeadOfLineBlocking) { check_golden("kv_head_of_line.trace"); }
 TEST(GoldenTrace, StaggeredArrivals) { check_golden("staggered_arrivals.trace"); }
 TEST(GoldenTrace, PreemptionUnderKvPressure) { check_golden("kv_preemption.trace"); }
+TEST(GoldenTrace, TokenBudget) { check_golden("token_budget.trace"); }
 
 // ---- The engine loop uses the policy ------------------------------------------------------------
 

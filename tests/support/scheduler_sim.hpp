@@ -14,17 +14,18 @@
 // same rules as EngineLoop, so policies can be tested deterministically without threads or a GPU:
 //   * KV pages are allocated on demand: a request holds ceil(cached tokens / page_size) pages;
 //   * each step: preempted requests free their pages and go back to the front of the queue (in
-//     arrival order) to restart from their prompt; admitted requests are prefilled (first token);
-//     then one batched decode adds a token to every running request, which finishes at max_new
-//     tokens and frees its pages;
+//     arrival order) to restart from their prompt; admitted requests are prefilled (first token)
+//     and join the decode batch from the next step; one batched decode adds a token to every
+//     request that was already running, which finishes at max_new tokens and frees its pages;
+//   * a step's tokens (admitted prompt tokens + one per decoded request) must fit max_batch_tokens;
 //   * the simulator fails if a step would need more pages than exist, like the real backend.
 //
 // File format (lines starting with '#' are comments):
 //   policy fcfs
-//   limits max_batch=4 total_pages=64 page_size=16
+//   limits max_batch=4 total_pages=64 page_size=16 max_batch_tokens=512   (the last one is optional)
 //   arrive step=0 id=a prompt=12 max_new=3
 //   --- expected
-//   step 0 queued=[a] running=[] preempt=[] admit=[a] finished=[] free_pages=63
+//   step 0 queued=[a] running=[] preempt=[] admit=[a] finished=[] tokens=12+0 free_pages=63
 namespace neuroserve::test_support {
 
 struct TraceSpec {
@@ -32,6 +33,7 @@ struct TraceSpec {
     int max_batch = 0;
     int total_pages = 0;
     int page_size = 16;
+    int max_batch_tokens = 1 << 30;  // effectively unlimited unless the trace sets it
     struct Arrival {
         int step = 0;
         std::string id;
@@ -97,10 +99,13 @@ inline TraceFile parse_trace(const std::string& text) {
         }
         if (kind == "policy" && tokens.size() == 1) {
             trace.spec.policy = tokens[0];
-        } else if (kind == "limits" && tokens.size() == 3) {
+        } else if (kind == "limits" && (tokens.size() == 3 || tokens.size() == 4)) {
             trace.spec.max_batch = int_field(tokens[0], "max_batch");
             trace.spec.total_pages = int_field(tokens[1], "total_pages");
             trace.spec.page_size = int_field(tokens[2], "page_size");
+            if (tokens.size() == 4) {
+                trace.spec.max_batch_tokens = int_field(tokens[3], "max_batch_tokens");
+            }
         } else if (kind == "arrive" && tokens.size() == 4) {
             trace.spec.arrivals.push_back({int_field(tokens[0], "step"), text_field(tokens[1], "id"),
                                            int_field(tokens[2], "prompt"), int_field(tokens[3], "max_new")});
@@ -157,11 +162,12 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         neuroserve::core::SchedulerInput input;
         input.max_batch = spec.max_batch;
         input.free_pages = spec.total_pages - used_pages;
+        input.max_step_tokens = spec.max_batch_tokens;
         std::vector<std::string> queued_ids;
         std::vector<std::string> running_ids;
         for (const auto& r : queued) {
             queued_ids.push_back(r.id);
-            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt + 1)});
+            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt)});
         }
         for (const auto& r : running) {
             running_ids.push_back(r.id);
@@ -190,14 +196,17 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         }
         running = std::move(still_running);
 
-        // Admit: prefill produces the first token.
+        // Admit: prefill produces the first token; the request decodes from the next step on.
         std::vector<std::string> admitted_ids;
         std::vector<std::string> finished_ids;
+        std::vector<Request> joining;
+        int prefill_tokens = 0;
         std::vector<bool> taken(queued.size(), false);
         for (const std::size_t index : decision.admit) {
             Request r = queued[index];
             taken[index] = true;
             admitted_ids.push_back(r.id);
+            prefill_tokens += r.prompt;
             r.cached = r.prompt;
             r.generated = 1;
             used_pages += pages_for(r.cached);
@@ -205,7 +214,7 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
                 finished_ids.push_back(r.id);
                 used_pages -= pages_for(r.cached);
             } else {
-                running.push_back(r);
+                joining.push_back(r);
             }
         }
         std::vector<Request> still_queued;
@@ -218,7 +227,11 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         queued = victims;
         queued.insert(queued.end(), still_queued.begin(), still_queued.end());
 
-        // One batched decode step for everything running, including requests admitted this step.
+        // One batched decode step for the requests that were already running.
+        const int decode_tokens = static_cast<int>(running.size());
+        if (prefill_tokens + decode_tokens > spec.max_batch_tokens) {
+            throw std::runtime_error("step " + std::to_string(step) + " exceeded max_batch_tokens");
+        }
         still_running.clear();
         for (auto& r : running) {
             used_pages += pages_for(r.cached + 1) - pages_for(r.cached);
@@ -231,14 +244,15 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
             }
         }
         running = std::move(still_running);
+        running.insert(running.end(), joining.begin(), joining.end());
         if (used_pages > spec.total_pages) {
             throw std::runtime_error("step " + std::to_string(step) + " needed more KV pages than exist");
         }
 
         log += "step " + std::to_string(step) + " queued=" + id_list(queued_ids) + " running=" +
                id_list(running_ids) + " preempt=" + id_list(preempted_ids) + " admit=" + id_list(admitted_ids) +
-               " finished=" + id_list(finished_ids) + " free_pages=" + std::to_string(spec.total_pages - used_pages) +
-               "\n";
+               " finished=" + id_list(finished_ids) + " tokens=" + std::to_string(prefill_tokens) + "+" +
+               std::to_string(decode_tokens) + " free_pages=" + std::to_string(spec.total_pages - used_pages) + "\n";
     }
     throw std::runtime_error("trace did not finish within 100000 steps (a policy that never admits?)");
 }

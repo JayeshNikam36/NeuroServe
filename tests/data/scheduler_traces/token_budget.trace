@@ -1,0 +1,18 @@
+# Token budget: 64 tokens per step, plenty of pages and slots. Each step first counts one decode
+# token for every running request, then prefills queued prompts in arrival order while they fit in
+# what is left. In step 0 the prefills of a and b use 60 tokens: the 50-token c does not fit, and
+# the 3-token d waits behind c although it would fit (strict arrival order). Admitted requests
+# decode from the step after their prefill.
+policy fcfs
+limits max_batch=8 total_pages=64 page_size=16 max_batch_tokens=64
+arrive step=0 id=a prompt=30 max_new=6
+arrive step=0 id=b prompt=30 max_new=4
+arrive step=0 id=c prompt=50 max_new=3
+arrive step=0 id=d prompt=3 max_new=2
+--- expected
+step 0 queued=[a b c d] running=[] preempt=[] admit=[a b] finished=[] tokens=60+0 free_pages=60
+step 1 queued=[c d] running=[a b] preempt=[] admit=[c d] finished=[] tokens=53+2 free_pages=55
+step 2 queued=[] running=[a b c d] preempt=[] admit=[] finished=[d] tokens=0+4 free_pages=56
+step 3 queued=[] running=[a b c] preempt=[] admit=[] finished=[b c] tokens=0+3 free_pages=61
+step 4 queued=[] running=[a] preempt=[] admit=[] finished=[] tokens=0+1 free_pages=61
+step 5 queued=[] running=[a] preempt=[] admit=[] finished=[a] tokens=0+1 free_pages=64
