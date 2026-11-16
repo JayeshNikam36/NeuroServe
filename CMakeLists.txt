@@ -48,6 +48,15 @@ if(NS_WARNINGS_AS_ERRORS)
     target_compile_options(ns_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
 endif()
 
+# ---- Sanitizers (CPU-only presets) ------------------------------------------
+# Applies to every C++ target defined below, GoogleTest included, so the whole test binary is instrumented.
+set(NS_SANITIZER "" CACHE STRING "Sanitizer for all C++ code: thread, address, or empty for none")
+if(NS_SANITIZER)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fsanitize=${NS_SANITIZER}>
+                        $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>)
+    add_link_options(-fsanitize=${NS_SANITIZER})
+endif()
+
 # ---- Components ------------------------------------------------------------
 add_subdirectory(runtime)
 
@@ -69,4 +78,4 @@ if(NS_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "NeuroServe ${PROJECT_VERSION} | build=${CMAKE_BUILD_TYPE} | CUDA=${NS_ENABLE_CUDA} | Python=${NS_BUILD_PYTHON} | archs=${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "NeuroServe ${PROJECT_VERSION} | build=${CMAKE_BUILD_TYPE} | CUDA=${NS_ENABLE_CUDA} | Python=${NS_BUILD_PYTHON} | sanitizer=${NS_SANITIZER} | archs=${CMAKE_CUDA_ARCHITECTURES}")

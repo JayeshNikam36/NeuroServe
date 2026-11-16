@@ -7,8 +7,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ninja-build git ca-certificates curl \
         python3 python3-dev python3-pip python3-venv gdb \
+        g++-12 \
     && rm -rf /var/lib/apt/lists/*
 
+# g++-12: only for the tsan-cpu preset. GCC 11's ThreadSanitizer cannot see pthread_cond_clockwait
+# (used by condition_variable::wait_for) and reports false "double lock" errors.
 # Ubuntu 22.04 ships CMake 3.22, which can't set C++20 for CUDA. Pin a modern CMake.
 # pytest/httpx: tests. tokenizers/jinja2: tokenization. fastapi/uvicorn/pydantic/pyyaml: API server.
 RUN python3 -m pip install --no-cache-dir \
