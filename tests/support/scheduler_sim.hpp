@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,7 +22,7 @@
 //   * the simulator fails if a step would need more pages than exist, like the real backend.
 //
 // File format (lines starting with '#' are comments):
-//   policy fcfs
+//   policy fcfs                                   (or: policy token-budget max_wait_steps=4)
 //   limits max_batch=4 total_pages=64 page_size=16 max_batch_tokens=512   (the last one is optional)
 //   arrive step=0 id=a prompt=12 max_new=3
 //   --- expected
@@ -30,6 +31,7 @@ namespace neuroserve::test_support {
 
 struct TraceSpec {
     std::string policy = "fcfs";
+    int max_wait_steps = -1;  // token-budget only; -1 = the policy's default
     int max_batch = 0;
     int total_pages = 0;
     int page_size = 16;
@@ -97,8 +99,11 @@ inline TraceFile parse_trace(const std::string& text) {
         for (std::string token; words >> token;) {
             tokens.push_back(token);
         }
-        if (kind == "policy" && tokens.size() == 1) {
+        if (kind == "policy" && (tokens.size() == 1 || tokens.size() == 2)) {
             trace.spec.policy = tokens[0];
+            if (tokens.size() == 2) {
+                trace.spec.max_wait_steps = int_field(tokens[1], "max_wait_steps");
+            }
         } else if (kind == "limits" && (tokens.size() == 3 || tokens.size() == 4)) {
             trace.spec.max_batch = int_field(tokens[0], "max_batch");
             trace.spec.total_pages = int_field(tokens[1], "total_pages");
@@ -127,6 +132,14 @@ inline std::string id_list(const std::vector<std::string>& ids) {
     return out + "]";
 }
 
+// The policy a trace asks for, with its options.
+inline std::unique_ptr<neuroserve::core::SchedulingPolicy> make_trace_policy(const TraceSpec& spec) {
+    if (spec.policy == "token-budget" && spec.max_wait_steps >= 0) {
+        return std::make_unique<neuroserve::core::TokenBudgetPolicy>(spec.max_wait_steps);
+    }
+    return neuroserve::core::make_policy(spec.policy);
+}
+
 // Replays the workload with `policy` and returns the step log (one line per non-idle step).
 inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingPolicy& policy) {
     struct Request {
@@ -136,6 +149,7 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         int max_new = 0;
         int cached = 0;     // tokens in the KV cache
         int generated = 0;
+        int waited = 0;     // steps waited since it was (re)queued
     };
     const auto pages_for = [&](int tokens) { return (tokens + spec.page_size - 1) / spec.page_size; };
     std::vector<Request> queued;
@@ -167,7 +181,7 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         std::vector<std::string> running_ids;
         for (const auto& r : queued) {
             queued_ids.push_back(r.id);
-            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt)});
+            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt), r.waited});
         }
         for (const auto& r : running) {
             running_ids.push_back(r.id);
@@ -221,6 +235,7 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         for (std::size_t i = 0; i < queued.size(); ++i) {
             if (!taken[i]) {
                 still_queued.push_back(queued[i]);
+                ++still_queued.back().waited;  // passed over this step
             }
         }
         std::sort(victims.begin(), victims.end(), [](const Request& a, const Request& b) { return a.order < b.order; });

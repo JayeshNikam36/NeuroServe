@@ -30,6 +30,7 @@ struct EngineLoop::Entry {
     std::shared_ptr<RequestHandle::State> state;
     std::uint64_t order = 0;  // arrival order; preempted requests re-enter the queue in this order
     int cached = 0;           // tokens in the KV cache (prompt + fed-back generated tokens)
+    int waited_steps = 0;     // engine steps spent in the queue since it was (re)queued
     SeqId seq = 0;
     bool has_seq = false;
     std::vector<TokenId> tokens;
@@ -125,6 +126,7 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
         throw std::invalid_argument("the backend reports an empty KV cache");
     }
     kv_snapshot_ = kv;
+    policy_name_ = std::string(policy_->name());
     log::write(log::Level::kInfo, kLogger, "engine loop started",
                {{"backend", std::string(backend.name())}, {"policy", std::string(policy_->name())},
                 {"max_batch", options_.max_batch}, {"max_batch_tokens", options_.max_batch_tokens},
@@ -230,7 +232,18 @@ EngineLoopStats EngineLoop::stats() const {
     return stats_;
 }
 
-std::string_view EngineLoop::policy_name() const noexcept { return policy_->name(); }
+std::string EngineLoop::policy_name() const {
+    std::lock_guard lock(mu_);
+    return policy_name_;
+}
+
+void EngineLoop::set_policy(std::unique_ptr<SchedulingPolicy> policy) {
+    if (!policy) {
+        throw std::invalid_argument("set_policy: no policy");
+    }
+    std::lock_guard lock(mu_);
+    next_policy_ = std::move(policy);
+}
 
 KvCacheStats EngineLoop::kv_stats() const {
     std::lock_guard lock(mu_);
@@ -304,6 +317,12 @@ void EngineLoop::loop() {
 
 void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted,
                                  std::vector<EntryPtr>& preempted) {
+    if (next_policy_) {  // set_policy() was called: switch between steps
+        policy_ = std::move(next_policy_);
+        log::write(log::Level::kInfo, kLogger, "scheduling policy switched",
+                   {{"from", policy_name_}, {"to", std::string(policy_->name())}});
+        policy_name_ = std::string(policy_->name());
+    }
     if (pending_.empty() && active_.empty()) {
         return;
     }
@@ -316,7 +335,7 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     for (const auto& entry : pending_) {
         const auto prompt = static_cast<long long>(entry->params.prompt.size());
         input.queued.push_back({entry->request.id(), static_cast<int>(prompt), entry->params.max_new_tokens,
-                                pages_for_tokens(prompt)});  // its prefill; it decodes from next step
+                                pages_for_tokens(prompt), entry->waited_steps});  // prefill; decodes next step
     }
     input.running.reserve(active_.size());
     for (const auto& entry : active_) {
@@ -337,6 +356,9 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
         admitted.push_back(std::move(slot));
     }
     std::erase_if(pending_, [](const EntryPtr& entry) { return !entry; });
+    for (auto& entry : pending_) {
+        ++entry->waited_steps;  // passed over this step
+    }
     stats_.pending = pending_.size();
 }
 
@@ -349,6 +371,7 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
         release(*entry);  // frees the sequence and its KV pages
         entry->tokens.clear();  // restart from the prompt: greedy decoding regenerates the same tokens
         entry->cached = 0;
+        entry->waited_steps = 0;
         entry->request.transition_to(RequestState::kPreempted);
         entry->request.transition_to(RequestState::kQueued);
         log::write(log::Level::kInfo, kLogger, "request preempted",

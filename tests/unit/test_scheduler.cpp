@@ -23,6 +23,7 @@
 namespace {
 
 using neuroserve::core::check_decision;
+using neuroserve::core::DecodeFirstPolicy;
 using neuroserve::core::FcfsPolicy;
 using neuroserve::core::make_policy;
 using neuroserve::core::QueuedRequest;
@@ -30,6 +31,7 @@ using neuroserve::core::RunningRequest;
 using neuroserve::core::ScheduleDecision;
 using neuroserve::core::SchedulerInput;
 using neuroserve::core::SchedulingPolicy;
+using neuroserve::core::TokenBudgetPolicy;
 using namespace std::chrono_literals;
 
 // A snapshot with queued requests needing `queued_pages` each, and `running` requests that each
@@ -150,9 +152,49 @@ TEST(CheckDecision, RejectsDecisionsThatBreakALimit) {
     EXPECT_THROW(check_decision(busy, decide({2}, {})), std::logic_error);      // no such running request
 }
 
-TEST(MakePolicy, KnowsFcfsAndRejectsUnknownNames) {
-    EXPECT_EQ(make_policy("fcfs")->name(), "fcfs");
+TEST(MakePolicy, KnowsEveryPolicyAndRejectsUnknownNames) {
+    for (const auto name : neuroserve::core::kPolicyNames) {
+        EXPECT_EQ(make_policy(name)->name(), name);
+    }
     EXPECT_THROW(make_policy("lifo"), std::invalid_argument);
+}
+
+// ---- Token-budget policy ---------------------------------------------------------------------
+
+TEST(TokenBudget, SkipsWhatDoesNotFitAndPacksTheBudget) {
+    // FCFS stops at q1 (80 tokens > 60 left); token-budget skips it and admits q2 and q3.
+    const auto in = prompts(100, {40, 80, 10, 20});
+    EXPECT_EQ(fcfs(in).admit, (Indices{0}));
+    EXPECT_EQ(TokenBudgetPolicy().schedule(in).admit, (Indices{0, 2, 3}));
+}
+
+TEST(TokenBudget, AnAgedRequestCannotBeOvertaken) {
+    auto in = prompts(100, {40, 80, 10});
+    in.queued[1].waited_steps = 4;  // q1 has waited long enough: from it on, FCFS order applies
+    EXPECT_EQ(TokenBudgetPolicy(/*max_wait_steps=*/4).schedule(in).admit, (Indices{0}));
+    EXPECT_EQ(TokenBudgetPolicy(/*max_wait_steps=*/5).schedule(in).admit, (Indices{0, 2}));
+}
+
+// ---- Decode-first policy ---------------------------------------------------------------------
+
+TEST(DecodeFirst, CapsPrefillTokensWhileRequestsAreDecoding) {
+    // Budget 100 with 2 decoding: prefills are capped at 100 / 4 = 25 tokens this step.
+    EXPECT_EQ(DecodeFirstPolicy().schedule(prompts(100, {20, 10}, /*running=*/2)).admit, (Indices{0}));
+    EXPECT_TRUE(DecodeFirstPolicy().schedule(prompts(100, {30, 5}, /*running=*/2)).admit.empty());  // strict order
+    EXPECT_EQ(fcfs(prompts(100, {30, 5}, /*running=*/2)).admit, (Indices{0, 1}));  // FCFS would take both
+}
+
+TEST(DecodeFirst, UsesTheWholeBudgetWhenNothingIsRunning) {
+    EXPECT_EQ(DecodeFirstPolicy().schedule(prompts(100, {60, 30})).admit, (Indices{0, 1}));
+}
+
+TEST(Policies, AllPreemptTheSameWayUnderMemoryPressure) {
+    const auto in = input(8, 1, {1}, /*running=*/3, /*held=*/2, /*grow=*/1);
+    for (const auto name : neuroserve::core::kPolicyNames) {
+        const auto decision = make_policy(name)->schedule(in);
+        EXPECT_EQ(decision.preempt, (Indices{2})) << name;
+        EXPECT_TRUE(decision.admit.empty()) << name;
+    }
 }
 
 // ---- Golden traces ----------------------------------------------------------------------------
@@ -164,7 +206,7 @@ TEST(MakePolicy, KnowsFcfsAndRejectsUnknownNames) {
 void check_golden(const std::string& name) {
     const std::string path = std::string(NS_TEST_DATA_DIR) + "/scheduler_traces/" + name;
     const auto trace = neuroserve::test_support::parse_trace(neuroserve::test_support::read_file(path));
-    const auto policy = make_policy(trace.spec.policy);
+    const auto policy = neuroserve::test_support::make_trace_policy(trace.spec);
     const std::string actual = neuroserve::test_support::simulate(trace.spec, *policy);
 
     const char* update = std::getenv("NS_UPDATE_GOLDEN");
@@ -181,6 +223,9 @@ TEST(GoldenTrace, KvBoundHeadOfLineBlocking) { check_golden("kv_head_of_line.tra
 TEST(GoldenTrace, StaggeredArrivals) { check_golden("staggered_arrivals.trace"); }
 TEST(GoldenTrace, PreemptionUnderKvPressure) { check_golden("kv_preemption.trace"); }
 TEST(GoldenTrace, TokenBudget) { check_golden("token_budget.trace"); }
+TEST(GoldenTrace, TokenBudgetPolicyPacksTheBudget) { check_golden("token_budget_policy.trace"); }
+TEST(GoldenTrace, TokenBudgetPolicyAging) { check_golden("token_budget_aging.trace"); }
+TEST(GoldenTrace, DecodeFirstPolicy) { check_golden("decode_first_policy.trace"); }
 
 // ---- The engine loop uses the policy ------------------------------------------------------------
 
@@ -237,6 +282,23 @@ TEST(EngineLoopPolicy, ThePolicyDecidesTheAdmissionOrder) {
     }
     loop.stop();
     EXPECT_EQ(recorder->admitted, (std::vector<std::string>{"ns-000001", "ns-000003", "ns-000002"}));
+}
+
+TEST(EngineLoopPolicy, ThePolicyCanBeSwitchedWhileServing) {
+    neuroserve::test_support::FakeBackend backend;
+    neuroserve::core::EngineLoop loop(backend);
+    EXPECT_EQ(loop.policy_name(), "fcfs");
+    neuroserve::core::GenerationParams p;
+    p.prompt = {1};
+    p.max_new_tokens = 3;
+    ASSERT_TRUE(loop.submit(p).wait_for(10s));
+
+    loop.set_policy(make_policy("decode-first"));
+    auto handle = loop.submit(p);  // the switch happens at the next engine step
+    ASSERT_TRUE(handle.wait_for(10s));
+    EXPECT_EQ(handle.wait().tokens, (std::vector<neuroserve::TokenId>{2, 3, 4}));
+    EXPECT_EQ(loop.policy_name(), "decode-first");
+    EXPECT_THROW(loop.set_policy(nullptr), std::invalid_argument);
 }
 
 TEST(EngineLoopPolicy, AFaultyPolicyStopsTheEngineLoudly) {

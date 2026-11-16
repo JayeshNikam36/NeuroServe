@@ -39,6 +39,15 @@ def test_version_is_semver():
     assert neuroserve.__version__.count(".") == 2
 
 
+def test_config_offers_exactly_the_engine_policies():
+    import typing
+
+    from neuroserve.server.config import EngineSection
+
+    allowed = typing.get_args(EngineSection.model_fields["scheduling_policy"].annotation)
+    assert set(allowed) == set(neuroserve.scheduling_policies) == {"fcfs", "token-budget", "decode-first"}
+
+
 def test_unknown_scheduling_policy_is_rejected_before_loading():
     with pytest.raises(ValueError, match="unknown scheduling policy 'lifo'"):
         neuroserve.Engine("/no/such/model", scheduling_policy="lifo")

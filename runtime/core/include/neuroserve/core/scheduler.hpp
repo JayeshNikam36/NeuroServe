@@ -28,7 +28,8 @@ struct QueuedRequest {
     std::string id;
     int prompt_tokens = 0;
     int max_new_tokens = 0;
-    int pages = 0;  // pages its prefill needs if admitted now
+    int pages = 0;         // pages its prefill needs if admitted now
+    int waited_steps = 0;  // engine steps it has waited since it was (re)queued
 };
 
 struct RunningRequest {
@@ -80,7 +81,40 @@ public:
     ScheduleDecision schedule(const SchedulerInput& input) override;
 };
 
-// Creates a policy by its config name ("fcfs"). Throws std::invalid_argument for an unknown name.
+// Packs the token budget: admits queued requests in arrival order, but a request that does not
+// fit (slots, pages or tokens) is skipped so smaller ones behind it can use the capacity. To bound
+// starvation, a request that has waited max_wait_steps or more can no longer be overtaken: once it
+// is "aged", FCFS order applies from it on. Same preemption rule as FCFS.
+// Trade-off vs FCFS: higher utilisation and lower queueing for short prompts; long prompts wait
+// longer (up to max_wait_steps plus the time to free room).
+class TokenBudgetPolicy final : public SchedulingPolicy {
+public:
+    explicit TokenBudgetPolicy(int max_wait_steps = 16) : max_wait_steps_(max_wait_steps) {}
+    std::string_view name() const noexcept override { return "token-budget"; }
+    ScheduleDecision schedule(const SchedulerInput& input) override;
+    int max_wait_steps() const noexcept { return max_wait_steps_; }
+
+private:
+    int max_wait_steps_;
+};
+
+// Protects the running requests' time between tokens: while any request is decoding, a step's
+// prefill tokens are capped at max_step_tokens / 4, so no step is much slower than a pure decode
+// step. With nothing running the whole budget is used. Admission is in strict arrival order, as in
+// FCFS (a prompt larger than the cap waits until the running batch drains). Same preemption rule.
+// Trade-off vs FCFS: smoother decoding for running requests; new requests wait longer to start.
+class DecodeFirstPolicy final : public SchedulingPolicy {
+public:
+    static constexpr int kPrefillShareDivisor = 4;
+    std::string_view name() const noexcept override { return "decode-first"; }
+    ScheduleDecision schedule(const SchedulerInput& input) override;
+};
+
+// The policies make_policy knows, by config name.
+inline constexpr std::string_view kPolicyNames[] = {"fcfs", "token-budget", "decode-first"};
+
+// Creates a policy by its config name ("fcfs", "token-budget" or "decode-first") with default
+// settings. Throws std::invalid_argument for an unknown name.
 std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name);
 
 }  // namespace neuroserve::core

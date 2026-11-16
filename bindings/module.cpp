@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
@@ -85,6 +86,10 @@ public:
         return out;
     }
 
+    void set_scheduling_policy(const std::string& name) {
+        loop_->set_policy(core::make_policy(name));  // unknown name: ValueError; applies from the next step
+    }
+
     py::dict stats() const {
         const core::EngineLoopStats s = loop_->stats();
         py::dict out;
@@ -127,6 +132,12 @@ PYBIND11_MODULE(_core, m) {
     py::register_exception<ns::KvCacheExhausted>(m, "KvCacheExhausted", PyExc_RuntimeError);
     py::register_exception<ns::cuda::CudaError>(m, "CudaError", PyExc_RuntimeError);
     py::register_exception<core::EngineStopped>(m, "EngineStopped", PyExc_RuntimeError);
+
+    py::tuple policies(std::size(core::kPolicyNames));
+    for (std::size_t i = 0; i < std::size(core::kPolicyNames); ++i) {
+        policies[i] = std::string(core::kPolicyNames[i]);
+    }
+    m.attr("scheduling_policies") = policies;  // the names engine.scheduling_policy accepts
 
     m.def("set_log_level", [](const std::string& level) { core::log::set_level(core::log::parse_level(level)); },
           py::arg("level"), "Level of the C++ runtime's JSON log lines (stderr): DEBUG, INFO, WARNING or ERROR.");
@@ -180,5 +191,7 @@ PYBIND11_MODULE(_core, m) {
              "Greedy generation without stop tokens: returns exactly max_new_tokens token ids.")
         .def("model_info", &Engine::model_info)
         .def("kv_stats", &Engine::kv_stats)
-        .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.");
+        .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.")
+        .def("set_scheduling_policy", &Engine::set_scheduling_policy, py::arg("name"),
+             "Switches the scheduling policy from the next engine step on (A/B comparisons).");
 }
