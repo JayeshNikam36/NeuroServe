@@ -1,6 +1,7 @@
 #include "neuroserve/core/engine_loop.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 
 #include "neuroserve/core/log.hpp"
@@ -27,8 +28,8 @@ struct EngineLoop::Entry {
     Request request;
     GenerationParams params;
     std::shared_ptr<RequestHandle::State> state;
-    int pages = 0;          // KV pages reserved for the whole request
-    bool reserved = false;  // pages are counted in reserved_pages_
+    std::uint64_t order = 0;  // arrival order; preempted requests re-enter the queue in this order
+    int cached = 0;           // tokens in the KV cache (prompt + fed-back generated tokens)
     SeqId seq = 0;
     bool has_seq = false;
     std::vector<TokenId> tokens;
@@ -130,8 +131,7 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
 
 EngineLoop::~EngineLoop() { stop(); }
 
-int EngineLoop::pages_for(const GenerationParams& params) const noexcept {
-    const auto tokens = static_cast<long long>(params.prompt.size()) + params.max_new_tokens;
+int EngineLoop::pages_for_tokens(long long tokens) const noexcept {
     return static_cast<int>((tokens + page_size_ - 1) / page_size_);
 }
 
@@ -162,7 +162,8 @@ void EngineLoop::validate(const GenerationParams& params) const {
                                     std::to_string(prompt_len + params.max_new_tokens) +
                                     " tokens; a sequence holds at most " + std::to_string(max_sequence_tokens_));
     }
-    if (pages_for(params) > total_pages_) {
+    // Every request must fit alone, so the oldest running request can always finish.
+    if (pages_for_tokens(prompt_len + params.max_new_tokens) > total_pages_) {
         throw std::invalid_argument("the request needs more KV pages than the cache has");
     }
 }
@@ -181,7 +182,6 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
         throw;
     }
     entry->request.transition_to(RequestState::kValidated);
-    entry->pages = pages_for(entry->params);
     RequestHandle handle(entry->state);
     {
         std::lock_guard lock(mu_);
@@ -192,6 +192,7 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
         }
         // From here on only the engine thread touches the entry; the mutex hands it over safely.
         entry->request.transition_to(RequestState::kQueued);
+        entry->order = next_order_++;
         pending_.push_back(std::move(entry));
         ++stats_.submitted;
         stats_.pending = pending_.size();
@@ -246,6 +247,7 @@ void EngineLoop::run() noexcept {
 void EngineLoop::loop() {
     for (;;) {
         std::vector<EntryPtr> admitted;
+        std::vector<EntryPtr> preempted;
         {
             std::unique_lock lock(mu_);
             // Sleep only when there is nothing to do; while requests are active, keep stepping.
@@ -253,8 +255,13 @@ void EngineLoop::loop() {
             if (stop_) {
                 return;
             }
-            admit_locked(admitted);
         }
+        const int free_pages = backend_.kv_stats().free_pages;  // backend call: outside the lock
+        {
+            std::lock_guard lock(mu_);
+            schedule_locked(free_pages, admitted, preempted);
+        }
+        preempt(std::move(preempted));  // first: admissions may count on the pages it frees
         for (auto& entry : admitted) {
             start(std::move(entry));
         }
@@ -267,35 +274,65 @@ void EngineLoop::loop() {
     }
 }
 
-void EngineLoop::admit_locked(std::vector<EntryPtr>& admitted) {
-    if (pending_.empty()) {
+void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted,
+                                 std::vector<EntryPtr>& preempted) {
+    if (pending_.empty() && active_.empty()) {
         return;
     }
     // The policy decides; the loop checks the decision and applies it.
     SchedulerInput input;
     input.max_batch = options_.max_batch;
-    input.free_pages = total_pages_ - reserved_pages_;
+    input.free_pages = free_pages;
     input.queued.reserve(pending_.size());
     for (const auto& entry : pending_) {
-        input.queued.push_back({entry->request.id(), static_cast<int>(entry->params.prompt.size()),
-                                entry->params.max_new_tokens, entry->pages});
+        const auto prompt = static_cast<long long>(entry->params.prompt.size());
+        input.queued.push_back({entry->request.id(), static_cast<int>(prompt), entry->params.max_new_tokens,
+                                pages_for_tokens(prompt + 1)});  // prefill + this step's decode
     }
     input.running.reserve(active_.size());
     for (const auto& entry : active_) {
-        input.running.push_back({entry->request.id(), entry->pages, static_cast<int>(entry->tokens.size()),
-                                 entry->params.max_new_tokens});
+        const int held = pages_for_tokens(entry->cached);
+        input.running.push_back({entry->request.id(), held, pages_for_tokens(entry->cached + 1) - held,
+                                 static_cast<int>(entry->tokens.size()), entry->params.max_new_tokens});
     }
     const ScheduleDecision decision = policy_->schedule(input);
     check_decision(input, decision);  // a faulty policy stops the engine loudly (see run())
 
+    for (const std::size_t index : decision.preempt) {
+        preempted.push_back(std::move(active_[index]));  // leaves an empty slot, removed below
+    }
+    std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
     for (const std::size_t index : decision.admit) {
         EntryPtr& slot = pending_[index];
-        reserved_pages_ += slot->pages;
-        slot->reserved = true;
         slot->request.transition_to(RequestState::kAdmitted);
-        admitted.push_back(std::move(slot));  // leaves an empty slot, removed below
+        admitted.push_back(std::move(slot));
     }
     std::erase_if(pending_, [](const EntryPtr& entry) { return !entry; });
+    stats_.pending = pending_.size();
+}
+
+void EngineLoop::preempt(std::vector<EntryPtr> victims) {
+    if (victims.empty()) {
+        return;
+    }
+    for (auto& entry : victims) {
+        const auto discarded = entry->tokens.size();
+        release(*entry);  // frees the sequence and its KV pages
+        entry->tokens.clear();  // restart from the prompt: greedy decoding regenerates the same tokens
+        entry->cached = 0;
+        entry->request.transition_to(RequestState::kPreempted);
+        entry->request.transition_to(RequestState::kQueued);
+        log::write(log::Level::kInfo, kLogger, "request preempted",
+                   {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
+                    {"discarded_tokens", discarded}});
+    }
+    // Back to the front of the queue, in arrival order: they were waiting before anything queued now.
+    std::sort(victims.begin(), victims.end(),
+              [](const EntryPtr& a, const EntryPtr& b) { return a->order < b->order; });
+    std::lock_guard lock(mu_);
+    stats_.preemptions += victims.size();
+    pending_.insert(pending_.begin(), std::make_move_iterator(victims.begin()),
+                    std::make_move_iterator(victims.end()));
     stats_.pending = pending_.size();
 }
 
@@ -305,7 +342,10 @@ void EngineLoop::start(EntryPtr entry) {
         entry->has_seq = true;
         entry->request.transition_to(RequestState::kPrefill);
         const TokenId first = backend_.prefill(entry->seq, entry->params.prompt);
-        entry->first_token_at = Request::Clock::now();
+        entry->cached = static_cast<int>(entry->params.prompt.size());
+        if (entry->first_token_at == Request::Clock::time_point{}) {
+            entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
+        }
         if (append_token(*entry, first)) {
             complete(std::move(entry));  // stop token or max_new_tokens == 1: no decode needed
             return;
@@ -353,6 +393,9 @@ void EngineLoop::decode_active() {
         ++stats_.decode_steps;
         stats_.max_batch_seen = std::max(stats_.max_batch_seen, seqs.size());
     }
+    for (auto& entry : active_) {
+        ++entry->cached;  // the fed-back token is now in the KV cache
+    }
 
     std::vector<EntryPtr> still_running;
     still_running.reserve(active_.size());
@@ -388,10 +431,6 @@ void EngineLoop::release(Entry& entry) noexcept {
             // Nothing more can be done for this sequence; the request still finishes.
         }
         entry.has_seq = false;
-    }
-    if (entry.reserved) {
-        reserved_pages_ -= entry.pages;
-        entry.reserved = false;
     }
     refresh_kv_snapshot();  // before the caller is answered, so it sees its pages returned
 }

@@ -80,6 +80,7 @@ struct EngineLoopStats {
     std::uint64_t completed = 0;
     std::uint64_t failed = 0;
     std::uint64_t cancelled = 0;
+    std::uint64_t preemptions = 0;  // times a running request was preempted (and later restarted)
     std::uint64_t decode_steps = 0;
     std::size_t pending = 0;         // waiting in the queue
     std::size_t active = 0;          // admitted and generating
@@ -95,10 +96,11 @@ struct EngineLoopStats {
 // Each step decodes all active requests together (one decode_step call for the whole batch),
 // and a request finishes on the step that produces its stop token or its last allowed token.
 // Logs one JSON line per finished request (logger "neuroserve.engine"); never logs token ids.
-// Which queued requests are admitted is decided by a SchedulingPolicy (scheduler.hpp); the loop
-// checks each decision and applies it. Admission reserves KV pages for a request's whole length up
-// front, so the cache cannot run out mid-generation (Day 14 replaces this with on-demand allocation
-// and preemption).
+// KV pages are allocated on demand as requests grow. Once per step a SchedulingPolicy
+// (scheduler.hpp) decides which running requests to preempt when the batch cannot grow, and which
+// queued requests to admit; the loop checks each decision and applies it. A preempted request
+// frees its pages, goes back to the front of the queue and later restarts from its prompt
+// (greedy decoding regenerates the same tokens).
 class EngineLoop {
 public:
     // Starts the engine thread. The backend must outlive the loop. Without an explicit `policy`,
@@ -131,12 +133,13 @@ private:
     using EntryPtr = std::unique_ptr<Entry>;
 
     void validate(const GenerationParams& params) const;
-    int pages_for(const GenerationParams& params) const noexcept;
+    int pages_for_tokens(long long tokens) const noexcept;  // KV pages that hold this many tokens
 
     // Engine thread only.
     void run() noexcept;
     void loop();
-    void admit_locked(std::vector<EntryPtr>& admitted);
+    void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
+    void preempt(std::vector<EntryPtr> victims);
     void start(EntryPtr entry);
     void decode_active();
     bool append_token(Entry& entry, TokenId token);
@@ -159,12 +162,12 @@ private:
     mutable std::mutex mu_;  // guards everything down to stats_
     std::condition_variable cv_;
     bool stop_ = false;
+    std::uint64_t next_order_ = 0;  // arrival order of submitted requests
     std::deque<EntryPtr> pending_;
     EngineLoopStats stats_;
     KvCacheStats kv_snapshot_;
 
-    std::vector<EntryPtr> active_;  // engine thread only
-    int reserved_pages_ = 0;        // engine thread only
+    std::vector<EntryPtr> active_;  // engine thread only; in admission order
 
     std::mutex join_mu_;
     std::thread thread_;  // last member: started after everything above is initialised

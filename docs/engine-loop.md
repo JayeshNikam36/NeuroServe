@@ -13,11 +13,12 @@ generation for many requests on one dedicated engine thread.
 - **Batched decode.** Every step decodes all active requests with one `decode_step` call.
 - **Per-step stop.** A request completes on the step that produces its stop token or its last
   allowed token; no tokens are generated past the stop.
-- **Up-front KV reservation.** Admission reserves pages for prompt + `max_new_tokens`, so the cache
-  cannot run out mid-generation. Simple and safe, but it under-uses memory; on-demand allocation
-  with preemption replaces it later.
+- **On-demand KV pages with preemption.** A request holds pages only for the tokens it has
+  cached. Each step the scheduling policy sees how many new pages the running batch needs; if they
+  are not free, it preempts the most recently admitted requests, which free their pages, go back
+  to the front of the queue and restart from their prompt (see docs/scheduling.md and ADR-0004).
 - **Failure isolation.** A prefill error fails one request; a decode error fails that step's
-  batch; the loop keeps serving. Sequences and reservations are always released.
+  batch; the loop keeps serving. Sequences and their pages are always released.
 - **Clean shutdown.** `stop()` cancels queued and running requests with `EngineStopped`, so no
   caller waits forever.
 

@@ -182,8 +182,11 @@ TEST(EngineLoop, HundredConcurrentSubmittersAllCompleteCorrectly) {
     EXPECT_EQ(backend.live_sequences(), 0) << "sequences leaked";
 }
 
-TEST(EngineLoop, KvReservationLimitsConcurrentRequests) {
-    FakeBackend backend(1000, /*total_pages=*/8);  // each request below needs 4 of the 8 pages
+TEST(EngineLoop, KvPressurePreemptsAndEveryRequestStillCompletesCorrectly) {
+    // 8 pages of 16 tokens; six requests that each grow to 64 tokens (4 pages). Pages are taken on
+    // demand, so all six start; when they outgrow the cache the newest are preempted, restart from
+    // their prompt, and still produce exactly the right tokens.
+    FakeBackend backend(1000, /*total_pages=*/8);
     FirstDecodeGate gate;
     gate.install(backend);
     EngineLoop loop(backend, {.max_batch = 8});
@@ -197,8 +200,57 @@ TEST(EngineLoop, KvReservationLimitsConcurrentRequests) {
         EXPECT_EQ(finish(handles[static_cast<std::size_t>(i)]).tokens, expected_tokens(params({i}, 63)));
     }
     loop.stop();
-    EXPECT_EQ(loop.stats().max_batch_seen, 2u) << "admitted more requests than the KV cache can hold";
+    const auto stats = loop.stats();
+    EXPECT_GT(stats.preemptions, 0u) << "the cache was never short: the test does not exercise preemption";
+    EXPECT_GT(stats.max_batch_seen, 2u) << "on-demand pages should run more than 2 requests at once";
+    EXPECT_EQ(stats.completed, 6u);
     EXPECT_EQ(backend.live_sequences(), 0);
+}
+
+TEST(EngineLoop, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
+    // The plan's acceptance test: 24 requests of different lengths all complete correctly,
+    // requests join a batch that is already running and leave it when done (continuous
+    // batching), and no KV page leaks.
+    FakeBackend backend(1000, /*total_pages=*/16);
+    backend.record_batches = true;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 8});
+
+    std::vector<GenerationParams> inputs;
+    std::vector<RequestHandle> handles;
+    for (int i = 0; i < 24; ++i) {
+        inputs.push_back(params({static_cast<TokenId>(10 * i + 1)}, 3 + (i * 7) % 29));
+        handles.push_back(loop.submit(inputs.back()));
+    }
+    gate.open();
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        EXPECT_EQ(finish(handles[i]).tokens, expected_tokens(inputs[i])) << "request " << i;
+    }
+    loop.stop();
+
+    int joins = 0;   // a step whose batch has a new sequence next to ones from the previous step
+    int leaves = 0;  // a step that lost a sequence while others carried on
+    const auto& batches = backend.decode_batches;
+    for (std::size_t s = 1; s < batches.size(); ++s) {
+        const auto& prev = batches[s - 1];
+        const auto& cur = batches[s];
+        const auto in = [](const std::vector<neuroserve::SeqId>& v, neuroserve::SeqId id) {
+            return std::find(v.begin(), v.end(), id) != v.end();
+        };
+        const bool kept_any = std::any_of(cur.begin(), cur.end(), [&](auto id) { return in(prev, id); });
+        if (kept_any && std::any_of(cur.begin(), cur.end(), [&](auto id) { return !in(prev, id); })) {
+            ++joins;
+        }
+        if (kept_any && std::any_of(prev.begin(), prev.end(), [&](auto id) { return !in(cur, id); })) {
+            ++leaves;
+        }
+    }
+    EXPECT_GT(joins, 5) << "requests did not join a running batch";
+    EXPECT_GT(leaves, 5) << "finished requests did not leave a running batch";
+    EXPECT_EQ(loop.stats().completed, 24u);
+    EXPECT_EQ(backend.live_sequences(), 0);
+    EXPECT_EQ(loop.kv_stats().free_pages, loop.kv_stats().total_pages) << "KV pages leaked";
 }
 
 TEST(EngineLoop, PrefillFailureFailsOnlyThatRequest) {

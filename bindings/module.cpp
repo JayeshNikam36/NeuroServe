@@ -92,6 +92,7 @@ public:
         out["completed"] = s.completed;
         out["failed"] = s.failed;
         out["cancelled"] = s.cancelled;
+        out["preemptions"] = s.preemptions;
         out["decode_steps"] = s.decode_steps;
         out["pending"] = s.pending;
         out["active"] = s.active;
