@@ -111,7 +111,7 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     : backend_(backend),
       options_(std::move(options)),
       model_info_(backend.model_info()),
-      policy_(policy ? std::move(policy) : make_policy(options_.policy)) {
+      policy_(policy ? std::move(policy) : make_policy(options_.policy, options_.policy_options)) {
     if (options_.max_batch < 1) {
         throw std::invalid_argument("max_batch must be at least 1");
     }
@@ -147,6 +147,10 @@ void EngineLoop::validate(const GenerationParams& params) const {
     if (params.max_new_tokens < 1) {
         throw std::invalid_argument("max_new_tokens must be at least 1, got " +
                                     std::to_string(params.max_new_tokens));
+    }
+    if (params.priority < kLowPriority || params.priority > kHighPriority) {
+        throw std::invalid_argument("priority must be 0 (low), 1 (normal) or 2 (high), got " +
+                                    std::to_string(params.priority));
     }
     const auto prompt_len = static_cast<long long>(params.prompt.size());
     if (prompt_len > options_.max_batch_tokens) {  // its prefill could never fit in a step
@@ -331,17 +335,24 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     input.max_batch = options_.max_batch;
     input.free_pages = free_pages;
     input.max_step_tokens = options_.max_batch_tokens;
+    const auto now = Request::Clock::now();
+    const auto age_ms = [now](const Entry& entry) {  // since arrival; preemption does not reset it
+        const auto received = *entry.request.entered_at(RequestState::kReceived);
+        return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - received).count());
+    };
     input.queued.reserve(pending_.size());
     for (const auto& entry : pending_) {
         const auto prompt = static_cast<long long>(entry->params.prompt.size());
         input.queued.push_back({entry->request.id(), static_cast<int>(prompt), entry->params.max_new_tokens,
-                                pages_for_tokens(prompt), entry->waited_steps});  // prefill; decodes next step
+                                pages_for_tokens(prompt), entry->waited_steps,  // prefill; decodes next step
+                                entry->params.priority, age_ms(*entry)});
     }
     input.running.reserve(active_.size());
     for (const auto& entry : active_) {
         const int held = pages_for_tokens(entry->cached);
         input.running.push_back({entry->request.id(), held, pages_for_tokens(entry->cached + 1) - held,
-                                 static_cast<int>(entry->tokens.size()), entry->params.max_new_tokens});
+                                 static_cast<int>(entry->tokens.size()), entry->params.max_new_tokens,
+                                 entry->params.priority, age_ms(*entry)});
     }
     const ScheduleDecision decision = policy_->schedule(input);
     check_decision(input, decision);  // a faulty policy stops the engine loudly (see run())
@@ -515,6 +526,7 @@ void EngineLoop::complete(EntryPtr entry) noexcept {
 
     log::write(log::Level::kInfo, kLogger, "request completed",
                {{"engine_request_id", result.request_id}, {"request_id", entry->params.client_request_id},
+                {"priority", entry->params.priority},
                 {"prompt_tokens", result.prompt_tokens}, {"completion_tokens", result.tokens.size()},
                 {"finish_reason", std::string(to_string(result.finish_reason))},
                 {"queue_ms", result.queue_ms}, {"ttft_ms", result.ttft_ms}, {"e2e_ms", result.e2e_ms}});

@@ -42,25 +42,28 @@ py::dict device_info(int index) {
 // at the same time and their requests are batched together. Heavy calls run with the GIL released.
 class Engine {
 public:
-    Engine(const ns::CudaLlmEngineConfig& config, int max_batch_tokens, std::unique_ptr<core::SchedulingPolicy> policy)
-        : backend_(std::make_unique<ns::CudaLlmEngineBackend>(config)),
+    Engine(const ns::CudaLlmEngineConfig& config, int max_batch_tokens, std::unique_ptr<core::SchedulingPolicy> policy,
+           core::PolicyOptions policy_options)
+        : policy_options_(policy_options),
+          backend_(std::make_unique<ns::CudaLlmEngineBackend>(config)),
           loop_(std::make_unique<core::EngineLoop>(*backend_, loop_options(config, max_batch_tokens),
                                                    std::move(policy))) {}
 
     // Members are destroyed in reverse order: the loop (and its thread) stops before the backend goes.
 
     core::GenerationResult run(std::vector<ns::TokenId> prompt_ids, int max_new_tokens,
-                               std::vector<ns::TokenId> stop_token_ids, std::string client_request_id) {
+                               std::vector<ns::TokenId> stop_token_ids, std::string client_request_id, int priority) {
         core::GenerationParams params;
         params.prompt = std::move(prompt_ids);
         params.max_new_tokens = max_new_tokens;
         params.stop_token_ids = std::move(stop_token_ids);
         params.client_request_id = std::move(client_request_id);
+        params.priority = priority;
         return loop_->submit(std::move(params)).wait();
     }
 
     std::vector<ns::TokenId> generate(std::vector<ns::TokenId> prompt_ids, int max_new_tokens) {
-        return run(std::move(prompt_ids), max_new_tokens, {}, {}).tokens;
+        return run(std::move(prompt_ids), max_new_tokens, {}, {}, core::kNormalPriority).tokens;
     }
 
     py::dict model_info() const {
@@ -87,7 +90,7 @@ public:
     }
 
     void set_scheduling_policy(const std::string& name) {
-        loop_->set_policy(core::make_policy(name));  // unknown name: ValueError; applies from the next step
+        loop_->set_policy(core::make_policy(name, policy_options_));  // unknown name: ValueError; next step on
     }
 
     py::dict stats() const {
@@ -118,6 +121,7 @@ private:
         return options;
     }
 
+    const core::PolicyOptions policy_options_;  // also used by set_scheduling_policy
     std::unique_ptr<ns::CudaLlmEngineBackend> backend_;
     std::unique_ptr<core::EngineLoop> loop_;
 };
@@ -163,8 +167,11 @@ PYBIND11_MODULE(_core, m) {
     py::class_<Engine>(m, "Engine", "Loads a model onto the GPU and generates tokens (greedy).")
         .def(py::init([](const std::string& model_dir, int max_prompt_tokens, int num_pages,
                          int max_batch, int max_batch_tokens, int max_pages_per_sequence, int device_index,
-                         const std::string& scheduling_policy) {
-                 auto policy = core::make_policy(scheduling_policy);  // unknown name: ValueError, before loading
+                         const std::string& scheduling_policy, int priority_aging_ms) {
+                 core::PolicyOptions policy_options;
+                 policy_options.priority_aging_ms = priority_aging_ms;
+                 // An unknown name or a bad option raises ValueError here, before the weights are loaded.
+                 auto policy = core::make_policy(scheduling_policy, policy_options);
                  ns::CudaLlmEngineConfig config;
                  config.model_dir = model_dir;
                  config.max_prompt_tokens = max_prompt_tokens;
@@ -173,18 +180,21 @@ PYBIND11_MODULE(_core, m) {
                  config.max_pages_per_sequence = max_pages_per_sequence;
                  config.device_index = device_index;
                  py::gil_scoped_release release;  // loading 2.5 GB of weights takes seconds
-                 return std::make_unique<Engine>(config, max_batch_tokens, std::move(policy));
+                 return std::make_unique<Engine>(config, max_batch_tokens, std::move(policy), policy_options);
              }),
              py::arg("model_dir"), py::kw_only(),
              py::arg("max_prompt_tokens") = 512, py::arg("num_pages") = 2048,
              py::arg("max_batch") = 8, py::arg("max_batch_tokens") = 512, py::arg("max_pages_per_sequence") = 64,
-             py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs")
+             py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs",
+             py::arg("priority_aging_ms") = 1000)
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",
+             py::arg("priority") = core::kNormalPriority,
              py::call_guard<py::gil_scoped_release>(),
              "Submits one request to the engine loop and waits for it. Stops on (and includes) the first "
-             "stop token. Thread-safe: concurrent calls are batched.")
+             "stop token. priority: 0 low, 1 normal, 2 high (used by the 'priority' policy). "
+             "Thread-safe: concurrent calls are batched.")
         .def("generate", &Engine::generate,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32,
              py::call_guard<py::gil_scoped_release>(),

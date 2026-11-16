@@ -65,7 +65,9 @@ Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /
 (prompt as text or token ids). Greedy, non-streaming for now.
 
 NeuroServe request options (optional `neuroserve` object): `return_token_ids` adds the generated
-token ids to the response; `ignore_eos` generates exactly `max_tokens` (benchmarks, parity tests).
+token ids to the response; `ignore_eos` generates exactly `max_tokens` (benchmarks, parity tests);
+`priority` is 0 (low), 1 (normal, default) or 2 (high), used by the `priority` scheduling policy
+([docs/scheduling.md](docs/scheduling.md)).
 Responses from both endpoints match Hugging Face token for token (`tests/python/test_api_parity.py`).
 
 Every response carries an `X-Request-ID` header (send your own to trace requests end to end).

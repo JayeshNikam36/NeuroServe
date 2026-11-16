@@ -27,6 +27,7 @@ struct GenerationParams {
     int max_new_tokens = 16;
     std::vector<TokenId> stop_token_ids;  // generation ends on (and includes) the first of these
     std::string client_request_id;        // caller's id (e.g. HTTP X-Request-ID), only for logs
+    int priority = kNormalPriority;       // 0 low, 1 normal, 2 high; used by the "priority" policy
 };
 
 enum class FinishReason : std::uint8_t { kStop, kLength };
@@ -81,6 +82,7 @@ struct EngineLoopOptions {
     int max_batch = 8;             // most sequences in one decode step
     int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
+    PolicyOptions policy_options{};  // settings for the policy named in `policy`
     // Called on the engine thread after every step that did work. Must be fast and must not throw.
     std::function<void(const StepStats&)> on_step{};
 };

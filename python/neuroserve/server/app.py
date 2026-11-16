@@ -193,7 +193,8 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                                     max_tokens=body.max_completion_tokens or body.max_tokens)
         messages = [m.model_dump() for m in body.messages]
         result = await _run(request, functools.partial(svc.chat, messages, max_tokens,
-                                                       ignore_eos=body.neuroserve.ignore_eos), param="messages")
+                                                       ignore_eos=body.neuroserve.ignore_eos,
+                                                       priority=body.neuroserve.priority), param="messages")
         _record(request, config, messages, result)
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -211,7 +212,8 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
                                     temperature=body.temperature, max_tokens=body.max_tokens)
         result = await _run(request, functools.partial(svc.complete, body.prompt, max_tokens,
-                                                       ignore_eos=body.neuroserve.ignore_eos), param="prompt")
+                                                       ignore_eos=body.neuroserve.ignore_eos,
+                                                       priority=body.neuroserve.priority), param="prompt")
         _record(request, config, body.prompt, result)
         return CompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",

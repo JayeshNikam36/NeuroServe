@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@ using neuroserve::core::check_decision;
 using neuroserve::core::DecodeFirstPolicy;
 using neuroserve::core::FcfsPolicy;
 using neuroserve::core::make_policy;
+using neuroserve::core::PriorityPolicy;
 using neuroserve::core::QueuedRequest;
 using neuroserve::core::RunningRequest;
 using neuroserve::core::ScheduleDecision;
@@ -189,12 +191,109 @@ TEST(DecodeFirst, UsesTheWholeBudgetWhenNothingIsRunning) {
 }
 
 TEST(Policies, AllPreemptTheSameWayUnderMemoryPressure) {
+    // All requests have the same priority, so the priority policy preempts like the others.
     const auto in = input(8, 1, {1}, /*running=*/3, /*held=*/2, /*grow=*/1);
     for (const auto name : neuroserve::core::kPolicyNames) {
         const auto decision = make_policy(name)->schedule(in);
         EXPECT_EQ(decision.preempt, (Indices{2})) << name;
         EXPECT_TRUE(decision.admit.empty()) << name;
     }
+}
+
+// ---- Priority policy --------------------------------------------------------------------------
+
+using neuroserve::core::kHighPriority;
+using neuroserve::core::kLowPriority;
+using neuroserve::core::kNormalPriority;
+
+SchedulerInput with_priorities(SchedulerInput in, std::vector<int> queued, std::vector<int> running = {}) {
+    for (std::size_t i = 0; i < queued.size(); ++i) {
+        in.queued[i].priority = queued[i];
+    }
+    for (std::size_t i = 0; i < running.size(); ++i) {
+        in.running[i].priority = running[i];
+    }
+    return in;
+}
+
+TEST(Priority, AdmitsHigherPriorityFirstThenInQueueOrder) {
+    const auto in = with_priorities(input(3, 100, {1, 1, 1, 1}), {kLowPriority, kNormalPriority, kHighPriority,
+                                                                  kNormalPriority});
+    EXPECT_EQ(PriorityPolicy().schedule(in).admit, (Indices{2, 1, 3}));
+    EXPECT_EQ(fcfs(in).admit, (Indices{0, 1, 2}));  // FCFS ignores priorities
+}
+
+TEST(Priority, StopsAtTheFirstRequestThatDoesNotFitInPriorityOrder) {
+    // The high-priority q1 needs 8 pages but only 5 are free: nothing may overtake it.
+    const auto in = with_priorities(input(8, 5, {1, 8, 1}), {kNormalPriority, kHighPriority, kNormalPriority});
+    EXPECT_TRUE(PriorityPolicy().schedule(in).admit.empty());
+}
+
+TEST(Priority, AgingRaisesPriorityOneLevelPerInterval) {
+    const PriorityPolicy policy(/*aging_ms=*/100);
+    EXPECT_EQ(policy.effective_priority(kLowPriority, 0), kLowPriority);
+    EXPECT_EQ(policy.effective_priority(kLowPriority, 99), kLowPriority);
+    EXPECT_EQ(policy.effective_priority(kLowPriority, 100), kNormalPriority);
+    EXPECT_EQ(policy.effective_priority(kLowPriority, 250), kHighPriority);
+    EXPECT_EQ(policy.effective_priority(kLowPriority, 1'000'000), kHighPriority);  // capped at high
+    EXPECT_EQ(policy.effective_priority(kHighPriority, 0), kHighPriority);
+    EXPECT_THROW(PriorityPolicy(0), std::invalid_argument);
+}
+
+TEST(Priority, AnAgedRequestIsServedBeforeNewerHighPriorityOnes) {
+    auto in = with_priorities(input(1, 100, {1, 1}), {kLowPriority, kHighPriority});
+    EXPECT_EQ(PriorityPolicy(/*aging_ms=*/100).schedule(in).admit, (Indices{1}));  // not aged yet
+    in.queued[0].age_ms = 200;  // two intervals: now high too, and ahead in the queue
+    EXPECT_EQ(PriorityPolicy(/*aging_ms=*/100).schedule(in).admit, (Indices{0}));
+}
+
+TEST(Priority, PreemptsTheLowestPriorityFirstUnderMemoryPressure) {
+    // As in Fcfs.PreemptsTheNewestWhenTheBatchCannotGrow, but r1 is low priority and r2 is high.
+    const auto in = with_priorities(input(8, 1, {1}, /*running=*/3, /*held=*/2, /*grow=*/1), {kNormalPriority},
+                                    {kNormalPriority, kLowPriority, kHighPriority});
+    EXPECT_EQ(PriorityPolicy().schedule(in).preempt, (Indices{1}));
+    EXPECT_EQ(fcfs(in).preempt, (Indices{2}));  // FCFS preempts the newest, whatever its priority
+}
+
+TEST(Priority, NeverPreemptsTheOldestRunningRequest) {
+    // r0 has the lowest priority, but it is the oldest: the others go first, newest first.
+    const auto in = with_priorities(input(8, 0, {}, /*running=*/3, /*held=*/1, /*grow=*/1), {},
+                                    {kLowPriority, kHighPriority, kHighPriority});
+    const auto decision = PriorityPolicy().schedule(in);
+    EXPECT_EQ(decision.preempt, (Indices{2, 1}));
+    EXPECT_NO_THROW(check_decision(in, decision));
+}
+
+// The starvation test: one low-priority request and a stream of high-priority requests that keeps
+// the single slot busy. With aging the low request is admitted after 2 x aging_ms; without it, only
+// once the stream ends.
+int step_admitted(const std::string& log, const std::string& id) {
+    std::istringstream lines(log);
+    for (std::string line; std::getline(lines, line);) {
+        if (line.find(" admit=[" + id + "]") != std::string::npos) {
+            return std::stoi(line.substr(5));  // "step N ..."
+        }
+    }
+    return -1;
+}
+
+TEST(Priority, ALowPriorityRequestIsNotStarvedByAStreamOfUrgentOnes) {
+    neuroserve::test_support::TraceSpec spec;
+    spec.max_batch = 1;
+    spec.total_pages = 64;
+    spec.max_batch_tokens = 64;
+    spec.arrivals.push_back({0, "low", 4, 2, kLowPriority});
+    for (int i = 0; i < 50; ++i) {  // one urgent request per step; each needs two steps
+        spec.arrivals.push_back({i, "h" + std::to_string(i), 4, 2, kHighPriority});
+    }
+    constexpr int kAgingMs = 40;  // 4 simulated steps
+    PriorityPolicy aging(kAgingMs);
+    const int with_aging = step_admitted(neuroserve::test_support::simulate(spec, aging), "low");
+    EXPECT_GE(with_aging, 0);
+    EXPECT_LE(with_aging * neuroserve::test_support::kSimStepMs, 2 * kAgingMs);  // the starvation bound
+
+    PriorityPolicy no_aging(/*aging_ms=*/1'000'000);
+    EXPECT_GE(step_admitted(neuroserve::test_support::simulate(spec, no_aging), "low"), 100);  // after all 50
 }
 
 // ---- Golden traces ----------------------------------------------------------------------------
@@ -226,6 +325,9 @@ TEST(GoldenTrace, TokenBudget) { check_golden("token_budget.trace"); }
 TEST(GoldenTrace, TokenBudgetPolicyPacksTheBudget) { check_golden("token_budget_policy.trace"); }
 TEST(GoldenTrace, TokenBudgetPolicyAging) { check_golden("token_budget_aging.trace"); }
 TEST(GoldenTrace, DecodeFirstPolicy) { check_golden("decode_first_policy.trace"); }
+TEST(GoldenTrace, PriorityOrder) { check_golden("priority_order.trace"); }
+TEST(GoldenTrace, PriorityAging) { check_golden("priority_aging.trace"); }
+TEST(GoldenTrace, PriorityPreemption) { check_golden("priority_preemption.trace"); }
 
 // ---- The engine loop uses the policy ------------------------------------------------------------
 

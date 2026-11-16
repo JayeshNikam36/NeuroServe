@@ -28,7 +28,7 @@ class GenerationEngine(Protocol):
     """
 
     def run(self, prompt_ids: list[int], max_new_tokens: int, *, stop_token_ids: list[int],
-            client_request_id: str) -> EngineOutput: ...
+            client_request_id: str, priority: int) -> EngineOutput: ...
 
     def kv_stats(self) -> dict[str, Any]: ...
 
@@ -85,6 +85,7 @@ class EngineService:
             max_pages_per_sequence=e.max_pages_per_sequence,
             device_index=e.device_index,
             scheduling_policy=e.scheduling_policy,
+            priority_aging_ms=e.priority_aging_ms,
         )
         tokenizer = ChatTokenizer(config.model.tokenizer_dir)
         return cls(config, engine, tokenizer, device_info(e.device_index)["name"])
@@ -104,12 +105,12 @@ class EngineService:
         return self._engine.stats()
 
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
-             ignore_eos: bool = False) -> GenerationResult:
+             ignore_eos: bool = False, priority: int = 1) -> GenerationResult:
         prompt_ids = self._tokenizer.encode_chat(messages, date_string=self._config.model.chat_date_string)
-        return self._run(prompt_ids, max_new_tokens, ignore_eos)
+        return self._run(prompt_ids, max_new_tokens, ignore_eos, priority)
 
     def complete(self, prompt: str | list[int], max_new_tokens: int, *,
-                 ignore_eos: bool = False) -> GenerationResult:
+                 ignore_eos: bool = False, priority: int = 1) -> GenerationResult:
         if isinstance(prompt, str):
             prompt_ids = self._tokenizer.encode(prompt)  # adds <|begin_of_text|>
         else:
@@ -118,9 +119,9 @@ class EngineService:
             if bad is not None:
                 raise ValueError(f"token id {bad} is outside the vocabulary (0..{vocab - 1})")
             prompt_ids = list(prompt)  # token ids are used verbatim
-        return self._run(prompt_ids, max_new_tokens, ignore_eos)
+        return self._run(prompt_ids, max_new_tokens, ignore_eos, priority)
 
-    def _run(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool) -> GenerationResult:
+    def _run(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool, priority: int) -> GenerationResult:
         limit = self._config.engine.max_prompt_tokens
         if len(prompt_ids) > limit:
             raise ContextLengthExceeded(f"the prompt has {len(prompt_ids)} tokens; the limit is {limit}")
@@ -130,6 +131,7 @@ class EngineService:
             prompt_ids, max_new_tokens,
             stop_token_ids=[] if ignore_eos else self._stop_token_ids,
             client_request_id=request_id_var.get() or "",  # links the engine's log line to this request
+            priority=priority,
         )
         tokens = list(out.tokens)
         stopped = out.finish_reason == "stop"

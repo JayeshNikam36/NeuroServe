@@ -61,6 +61,9 @@ public:
             throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages");
         }
         ++prefill_calls_;
+        if (record_batches) {
+            prefill_first_tokens.push_back(prompt.front());
+        }
         len = static_cast<int>(prompt.size());
         return next(prompt.back());
     }
@@ -123,9 +126,11 @@ public:
     // thread starts; tests use it to pause the engine at a known point.
     std::function<void(std::size_t batch_size)> on_decode;
 
-    // When true, every successful decode_step's sequence ids are appended to decode_batches.
+    // When true, every successful decode_step's sequence ids are appended to decode_batches, and
+    // the first token of every prefilled prompt to prefill_first_tokens (the admission order).
     bool record_batches = false;
     std::vector<std::vector<SeqId>> decode_batches;
+    std::vector<TokenId> prefill_first_tokens;
 
 private:
     int& length(SeqId id) {

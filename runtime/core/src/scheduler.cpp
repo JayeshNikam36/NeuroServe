@@ -1,6 +1,7 @@
 #include "neuroserve/core/scheduler.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 
 namespace neuroserve::core {
@@ -153,7 +154,76 @@ ScheduleDecision DecodeFirstPolicy::schedule(const SchedulerInput& input) {
     return decision;
 }
 
-std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name) {
+PriorityPolicy::PriorityPolicy(int aging_ms) : aging_ms_(aging_ms) {
+    if (aging_ms < 1) {
+        throw std::invalid_argument("priority aging_ms must be at least 1, got " + std::to_string(aging_ms));
+    }
+}
+
+int PriorityPolicy::effective_priority(int priority, long long age_ms) const noexcept {
+    const long long levels = std::max(0LL, age_ms) / aging_ms_;
+    return static_cast<int>(std::min<long long>(kHighPriority, priority + levels));
+}
+
+ScheduleDecision PriorityPolicy::schedule(const SchedulerInput& input) {
+    ScheduleDecision decision;
+    long long free_pages = input.free_pages;
+    long long growth = 0;
+    for (const auto& r : input.running) {
+        growth += r.next_step_pages;
+    }
+
+    // 1. Memory pressure: preempt the lowest effective priority first, the most recently admitted
+    //    among equals, until the rest can grow. The oldest running request (index 0) is never
+    //    preempted, so it always finishes.
+    if (growth > free_pages) {
+        std::vector<std::size_t> victims;
+        for (std::size_t i = 1; i < input.running.size(); ++i) {
+            victims.push_back(i);
+        }
+        std::sort(victims.begin(), victims.end(), [&](std::size_t a, std::size_t b) {
+            const int pa = effective_priority(input.running[a].priority, input.running[a].age_ms);
+            const int pb = effective_priority(input.running[b].priority, input.running[b].age_ms);
+            return pa != pb ? pa < pb : a > b;
+        });
+        for (const std::size_t i : victims) {
+            if (growth <= free_pages) {
+                break;
+            }
+            decision.preempt.push_back(i);
+            free_pages += input.running[i].pages;
+            growth -= input.running[i].next_step_pages;
+        }
+        if (!decision.preempt.empty()) {
+            return decision;  // no admissions while memory is short
+        }
+    }
+    free_pages -= growth;
+
+    // 2. Admit by effective priority (queue order among equals) while slots, pages and the token
+    //    budget last; stop at the first that does not fit, so nothing overtakes it.
+    std::vector<std::size_t> order(input.queued.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return effective_priority(input.queued[a].priority, input.queued[a].age_ms) >
+               effective_priority(input.queued[b].priority, input.queued[b].age_ms);
+    });
+    auto slots = input.max_batch - static_cast<long long>(input.running.size());
+    auto budget = input.max_step_tokens - static_cast<long long>(input.running.size());
+    for (const std::size_t i : order) {
+        const auto& q = input.queued[i];
+        if (slots <= 0 || q.pages > free_pages || q.prompt_tokens > budget) {
+            break;
+        }
+        decision.admit.push_back(i);
+        free_pages -= q.pages;
+        budget -= q.prompt_tokens;
+        --slots;
+    }
+    return decision;
+}
+
+std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name, const PolicyOptions& options) {
     if (name == "fcfs") {
         return std::make_unique<FcfsPolicy>();
     }
@@ -163,8 +233,11 @@ std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name) {
     if (name == "decode-first") {
         return std::make_unique<DecodeFirstPolicy>();
     }
+    if (name == "priority") {
+        return std::make_unique<PriorityPolicy>(options.priority_aging_ms);
+    }
     throw std::invalid_argument("unknown scheduling policy '" + std::string(name) +
-                                "' (available: fcfs, token-budget, decode-first)");
+                                "' (available: fcfs, token-budget, decode-first, priority)");
 }
 
 }  // namespace neuroserve::core

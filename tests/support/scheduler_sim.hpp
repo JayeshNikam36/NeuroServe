@@ -19,19 +19,24 @@
 //     and join the decode batch from the next step; one batched decode adds a token to every
 //     request that was already running, which finishes at max_new tokens and frees its pages;
 //   * a step's tokens (admitted prompt tokens + one per decoded request) must fit max_batch_tokens;
-//   * the simulator fails if a step would need more pages than exist, like the real backend.
+//   * the simulator fails if a step would need more pages than exist, like the real backend;
+//   * each step takes kSimStepMs of simulated time; a request's age (for priority aging) is the
+//     time since it arrived.
 //
 // File format (lines starting with '#' are comments):
-//   policy fcfs                                   (or: policy token-budget max_wait_steps=4)
+//   policy fcfs                    (or: policy token-budget max_wait_steps=4, policy priority aging_ms=40)
 //   limits max_batch=4 total_pages=64 page_size=16 max_batch_tokens=512   (the last one is optional)
-//   arrive step=0 id=a prompt=12 max_new=3
+//   arrive step=0 id=a prompt=12 max_new=3          (optional: priority=0|1|2, default 1)
 //   --- expected
 //   step 0 queued=[a] running=[] preempt=[] admit=[a] finished=[] tokens=12+0 free_pages=63
 namespace neuroserve::test_support {
 
+inline constexpr int kSimStepMs = 10;  // simulated duration of one engine step
+
 struct TraceSpec {
     std::string policy = "fcfs";
     int max_wait_steps = -1;  // token-budget only; -1 = the policy's default
+    int aging_ms = -1;        // priority only; -1 = the policy's default
     int max_batch = 0;
     int total_pages = 0;
     int page_size = 16;
@@ -41,6 +46,7 @@ struct TraceSpec {
         std::string id;
         int prompt = 0;
         int max_new = 0;
+        int priority = neuroserve::core::kNormalPriority;
     };
     std::vector<Arrival> arrivals;
 };
@@ -101,7 +107,9 @@ inline TraceFile parse_trace(const std::string& text) {
         }
         if (kind == "policy" && (tokens.size() == 1 || tokens.size() == 2)) {
             trace.spec.policy = tokens[0];
-            if (tokens.size() == 2) {
+            if (tokens.size() == 2 && tokens[1].rfind("aging_ms=", 0) == 0) {
+                trace.spec.aging_ms = int_field(tokens[1], "aging_ms");
+            } else if (tokens.size() == 2) {
                 trace.spec.max_wait_steps = int_field(tokens[1], "max_wait_steps");
             }
         } else if (kind == "limits" && (tokens.size() == 3 || tokens.size() == 4)) {
@@ -111,9 +119,11 @@ inline TraceFile parse_trace(const std::string& text) {
             if (tokens.size() == 4) {
                 trace.spec.max_batch_tokens = int_field(tokens[3], "max_batch_tokens");
             }
-        } else if (kind == "arrive" && tokens.size() == 4) {
+        } else if (kind == "arrive" && (tokens.size() == 4 || tokens.size() == 5)) {
             trace.spec.arrivals.push_back({int_field(tokens[0], "step"), text_field(tokens[1], "id"),
-                                           int_field(tokens[2], "prompt"), int_field(tokens[3], "max_new")});
+                                           int_field(tokens[2], "prompt"), int_field(tokens[3], "max_new"),
+                                           tokens.size() == 5 ? int_field(tokens[4], "priority")
+                                                              : neuroserve::core::kNormalPriority});
         } else {
             throw std::runtime_error("cannot parse trace line: " + line);
         }
@@ -137,6 +147,9 @@ inline std::unique_ptr<neuroserve::core::SchedulingPolicy> make_trace_policy(con
     if (spec.policy == "token-budget" && spec.max_wait_steps >= 0) {
         return std::make_unique<neuroserve::core::TokenBudgetPolicy>(spec.max_wait_steps);
     }
+    if (spec.policy == "priority" && spec.aging_ms >= 0) {
+        return std::make_unique<neuroserve::core::PriorityPolicy>(spec.aging_ms);
+    }
     return neuroserve::core::make_policy(spec.policy);
 }
 
@@ -150,6 +163,8 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         int cached = 0;     // tokens in the KV cache
         int generated = 0;
         int waited = 0;     // steps waited since it was (re)queued
+        int priority = neuroserve::core::kNormalPriority;
+        int arrived = 0;    // step it arrived in
     };
     const auto pages_for = [&](int tokens) { return (tokens + spec.page_size - 1) / spec.page_size; };
     std::vector<Request> queued;
@@ -162,7 +177,7 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
     for (int step = 0; step < 100000; ++step) {
         for (const auto& a : spec.arrivals) {
             if (a.step == step) {
-                queued.push_back({a.id, next_order++, a.prompt, a.max_new, 0, 0});
+                queued.push_back({a.id, next_order++, a.prompt, a.max_new, 0, 0, 0, a.priority, step});
                 ++arrived;
             }
         }
@@ -179,14 +194,16 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         input.max_step_tokens = spec.max_batch_tokens;
         std::vector<std::string> queued_ids;
         std::vector<std::string> running_ids;
+        const auto age_ms = [step](const Request& r) { return static_cast<long long>(step - r.arrived) * kSimStepMs; };
         for (const auto& r : queued) {
             queued_ids.push_back(r.id);
-            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt), r.waited});
+            input.queued.push_back({r.id, r.prompt, r.max_new, pages_for(r.prompt), r.waited, r.priority, age_ms(r)});
         }
         for (const auto& r : running) {
             running_ids.push_back(r.id);
             const int held = pages_for(r.cached);
-            input.running.push_back({r.id, held, pages_for(r.cached + 1) - held, r.generated, r.max_new});
+            input.running.push_back(
+                {r.id, held, pages_for(r.cached + 1) - held, r.generated, r.max_new, r.priority, age_ms(r)});
         }
         const auto decision = policy.schedule(input);
         neuroserve::core::check_decision(input, decision);
@@ -203,7 +220,11 @@ inline std::string simulate(const TraceSpec& spec, neuroserve::core::SchedulingP
         for (std::size_t i = 0; i < running.size(); ++i) {
             if (preempted[i]) {
                 used_pages -= pages_for(running[i].cached);
-                victims.push_back({running[i].id, running[i].order, running[i].prompt, running[i].max_new, 0, 0});
+                Request victim = running[i];  // restarts from its prompt; keeps its arrival and priority
+                victim.cached = 0;
+                victim.generated = 0;
+                victim.waited = 0;
+                victims.push_back(victim);
             } else {
                 still_running.push_back(running[i]);
             }
