@@ -120,7 +120,7 @@ class FakeEngine:
                 break
         finish = "stop" if out[-1] in stop_token_ids else "length"
         return SimpleNamespace(request_id=f"ns-{len(self.calls):06d}", tokens=out, finish_reason=finish,
-                               queue_ms=0.1, ttft_ms=0.5, e2e_ms=1.0)
+                               queue_ms=0.1, ttft_ms=0.5, e2e_ms=1.0, itl_ms=0.05, max_itl_ms=0.08)
 
     def stream(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
         out = self.run(prompt_ids, max_new_tokens, stop_token_ids=stop_token_ids,
@@ -142,6 +142,10 @@ class FakeEngine:
 
     def stats(self):
         return {"submitted": len(self.calls), "pending": 0, "active": 0}
+
+    def latency(self):
+        summary = {"count": len(self.calls), "mean": 1.0, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0}
+        return {name: dict(summary) for name in ("queue_ms", "ttft_ms", "itl_ms", "e2e_ms")}
 
 
 @pytest.fixture(scope="module")
@@ -169,6 +173,7 @@ def test_health_and_models(tok):
     with TestClient(app) as client:
         health = client.get("/health").json()
         assert health["status"] == "ok" and health["model"] == MODEL_NAME and health["gpu"] == "fake-gpu"
+        assert set(health["latency"]) == {"queue_ms", "ttft_ms", "itl_ms", "e2e_ms"}
         models = client.get("/v1/models").json()
         assert models["object"] == "list" and models["data"][0]["id"] == MODEL_NAME
 
@@ -611,3 +616,16 @@ def test_a_queue_timeout_ends_a_stream_with_an_error_event(tok):
 def test_bad_queue_limits_in_the_config_are_refused(engine_overrides):
     with pytest.raises(ValueError):
         make_config(**engine_overrides)
+
+
+# ---- Day 21: latency instrumentation -------------------------------------------------------------
+
+def test_every_response_carries_its_timings(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        plain = client.post("/v1/chat/completions", json=chat_body()).json()["neuroserve"]
+        events = sse_events(client.post("/v1/chat/completions", json=chat_body(stream=True)))
+    streamed = events[-2]["neuroserve"]  # the last chunk before [DONE]
+    for info in (plain, streamed):
+        assert info["queue_ms"] == 0.1 and info["ttft_ms"] == 0.5 and info["e2e_ms"] == 1.0
+        assert info["itl_ms"] == 0.05 and info["max_itl_ms"] == 0.08

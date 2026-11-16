@@ -149,6 +149,26 @@ public:
         loop_->set_policy(core::make_policy(name, policy_options_));  // unknown name: ValueError; next step on
     }
 
+    py::dict latency() const {
+        const core::LatencyStats l = loop_->latency();
+        const auto summary = [](const core::LatencySummary& s) {
+            py::dict d;
+            d["count"] = s.count;
+            d["mean"] = s.mean;
+            d["p50"] = s.p50;
+            d["p95"] = s.p95;
+            d["p99"] = s.p99;
+            d["max"] = s.max;
+            return d;
+        };
+        py::dict out;
+        out["queue_ms"] = summary(l.queue_ms);
+        out["ttft_ms"] = summary(l.ttft_ms);
+        out["itl_ms"] = summary(l.itl_ms);
+        out["e2e_ms"] = summary(l.e2e_ms);
+        return out;
+    }
+
     py::dict stats() const {
         const core::EngineLoopStats s = loop_->stats();
         py::dict out;
@@ -209,6 +229,8 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("queue_ms", &core::GenerationResult::queue_ms)
         .def_readonly("ttft_ms", &core::GenerationResult::ttft_ms)
         .def_readonly("e2e_ms", &core::GenerationResult::e2e_ms)
+        .def_readonly("itl_ms", &core::GenerationResult::itl_ms)
+        .def_readonly("max_itl_ms", &core::GenerationResult::max_itl_ms)
         .def("__repr__", [](const core::GenerationResult& r) {
             return "<GenerationResult " + r.request_id + " tokens=" + std::to_string(r.tokens.size()) +
                    " finish_reason=" + std::string(core::to_string(r.finish_reason)) + ">";
@@ -283,6 +305,9 @@ PYBIND11_MODULE(_core, m) {
         .def("model_info", &Engine::model_info)
         .def("kv_stats", &Engine::kv_stats)
         .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.")
+        .def("latency", &Engine::latency,
+             "Latency since start, per metric (queue_ms, ttft_ms, itl_ms, e2e_ms): count, mean, p50, p95, p99, "
+             "max. Fixed-bucket histograms: percentiles are within one bucket (about 9%) of the exact value.")
         .def("set_scheduling_policy", &Engine::set_scheduling_policy, py::arg("name"),
              "Switches the scheduling policy from the next engine step on (A/B comparisons).");
 }

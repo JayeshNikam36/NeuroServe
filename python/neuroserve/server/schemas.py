@@ -71,6 +71,8 @@ class NeuroServeInfo(BaseModel):
     e2e_ms: float
     ttft_ms: float         # time to first token, measured in the engine
     queue_ms: float        # time spent waiting for admission
+    itl_ms: float          # mean inter-token latency (time between consecutive tokens)
+    max_itl_ms: float      # the longest gap between two tokens
     generated_tokens: int  # tokens the engine produced (stops on the stop token: equals completion_tokens)
     completion_token_ids: list[int] | None = None  # returned tokens, including the stop token if hit
 

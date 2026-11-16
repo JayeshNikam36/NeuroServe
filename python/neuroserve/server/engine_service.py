@@ -20,6 +20,8 @@ class EngineOutput(Protocol):
     queue_ms: float
     ttft_ms: float
     e2e_ms: float
+    itl_ms: float        # mean time between consecutive tokens
+    max_itl_ms: float
 
 
 class EngineStream(Protocol):
@@ -49,6 +51,8 @@ class GenerationEngine(Protocol):
 
     def stats(self) -> dict[str, Any]: ...
 
+    def latency(self) -> dict[str, Any]: ...
+
     def cancel(self, request_id: str) -> bool: ...
 
 
@@ -66,6 +70,8 @@ class GenerationResult:
     e2e_ms: float
     ttft_ms: float
     queue_ms: float
+    itl_ms: float          # mean inter-token latency
+    max_itl_ms: float      # the longest gap between two tokens
     engine_request_id: str
 
     @property
@@ -160,6 +166,9 @@ class EngineService:
     def engine_stats(self) -> dict[str, Any]:
         return self._engine.stats()
 
+    def latency(self) -> dict[str, Any]:
+        return self._engine.latency()
+
     def cancel(self, engine_request_id: str) -> bool:
         return self._engine.cancel(engine_request_id)
 
@@ -227,5 +236,7 @@ class EngineService:
             e2e_ms=out.e2e_ms,
             ttft_ms=out.ttft_ms,
             queue_ms=out.queue_ms,
+            itl_ms=out.itl_ms,
+            max_itl_ms=out.max_itl_ms,
             engine_request_id=out.request_id,
         )

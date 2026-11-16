@@ -12,7 +12,8 @@ server-sent events (`text/event-stream`) in OpenAI's chunk format, ending with `
 - With `"stream_options": {"include_usage": true}`, a last chunk with `"choices": []` carries the
   `usage`, as in OpenAI's API.
 - The last chunk before `[DONE]` carries the `neuroserve` block: `e2e_ms`, `ttft_ms`, `queue_ms`,
-  `generated_tokens`, and `completion_token_ids` when `neuroserve.return_token_ids` is set.
+  `itl_ms`, `max_itl_ms`, `generated_tokens`, and `completion_token_ids` when
+  `neuroserve.return_token_ids` is set (see docs/latency.md).
 - The streamed text is exactly the text of the same request without streaming (tested), and the
   streamed tokens match Hugging Face through the official `openai` client
   (`tests/python/test_api_parity.py`).

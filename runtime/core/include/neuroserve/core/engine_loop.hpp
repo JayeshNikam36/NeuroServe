@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "neuroserve/core/inference_backend.hpp"
+#include "neuroserve/core/latency_histogram.hpp"
 #include "neuroserve/core/request.hpp"
 #include "neuroserve/core/scheduler.hpp"
 
@@ -44,6 +45,8 @@ struct GenerationResult {
     double queue_ms = 0.0;  // first QUEUED -> ADMITTED
     double ttft_ms = 0.0;   // RECEIVED -> first token (time to first token)
     double e2e_ms = 0.0;    // RECEIVED -> COMPLETED
+    double itl_ms = 0.0;      // mean inter-token latency: time between consecutive new tokens (0 with < 2)
+    double max_itl_ms = 0.0;  // the longest gap between two new tokens (a preemption shows up here)
 };
 
 // The request was cancelled because the engine is stopping, or submit() was called after stop().
@@ -120,6 +123,15 @@ struct EngineLoopOptions {
     std::function<void(const StepStats&)> on_step{};
 };
 
+// Latency of completed requests (queue, TTFT, e2e: one sample per request) and of every gap
+// between two new tokens (ITL: one sample per token after the first). A consistent snapshot.
+struct LatencyStats {
+    LatencySummary queue_ms;
+    LatencySummary ttft_ms;
+    LatencySummary itl_ms;
+    LatencySummary e2e_ms;
+};
+
 // Counters for monitoring and tests. A consistent snapshot, safe to read from any thread.
 struct EngineLoopStats {
     std::uint64_t submitted = 0;  // accepted into the queue
@@ -181,6 +193,9 @@ public:
 
     EngineLoopStats stats() const;
 
+    // Thread-safe. Latency percentiles since the engine started (fixed-bucket histograms).
+    LatencyStats latency() const;
+
     // Thread-safe. Name of the policy currently deciding.
     std::string policy_name() const;
 
@@ -210,6 +225,7 @@ private:
     void decode_active();
     bool append_token(Entry& entry, TokenId token);
     void publish_token(Entry& entry, TokenId token);  // stream: hand a new token to the reader
+    void flush_itl_samples_locked();  // itl_samples_ -> itl_hist_; caller holds mu_
     void complete(EntryPtr entry) noexcept;
     void fail(EntryPtr entry, std::exception_ptr error) noexcept;
     void cancel(Entry& entry, std::exception_ptr error) noexcept;
@@ -234,6 +250,11 @@ private:
     std::unique_ptr<SchedulingPolicy> next_policy_;  // set_policy(): taken at the next step
     std::string policy_name_;
     std::unordered_set<std::string> unfinished_;      // ids of submitted requests not finished yet
+    LatencyHistogram queue_hist_;  // guarded by mu_, like the stats
+    LatencyHistogram ttft_hist_;
+    LatencyHistogram itl_hist_;
+    LatencyHistogram e2e_hist_;
+    std::vector<double> itl_samples_;  // engine thread only: gaps of this step, added to itl_hist_ under mu_
     std::unordered_set<std::string> cancel_requests_;  // cancel_request(): applied at the next step
     std::deque<EntryPtr> pending_;
     EngineLoopStats stats_;

@@ -541,6 +541,48 @@ TEST(EngineLoop, QueueLimitsAreValidated) {
     EXPECT_THROW(EngineLoop(backend, {.queue_timeout_ms = -1}), std::invalid_argument);
 }
 
+// ---- Latency -----------------------------------------------------------------------------------
+
+TEST(EngineLoop, RecordsLatencyPerRequestAndInTheHistograms) {
+    FakeBackend backend;
+    backend.on_decode = [](std::size_t) { std::this_thread::sleep_for(2ms); };  // every decode step >= 2 ms
+    EngineLoop loop(backend);
+    const auto result = finish(loop.submit(params({1}, 6)));
+    ASSERT_EQ(result.tokens.size(), 6u);
+    EXPECT_GE(result.itl_ms, 2.0);                       // 5 gaps, each at least one decode step
+    EXPECT_GE(result.max_itl_ms, result.itl_ms);
+    EXPECT_GT(result.ttft_ms, 0.0);
+    EXPECT_LE(result.itl_ms * 5, result.e2e_ms - result.ttft_ms);  // the gaps fit between first token and end
+
+    const auto latency = loop.latency();
+    EXPECT_EQ(latency.ttft_ms.count, 1u);
+    EXPECT_EQ(latency.queue_ms.count, 1u);
+    EXPECT_EQ(latency.e2e_ms.count, 1u);
+    EXPECT_EQ(latency.itl_ms.count, 5u);                 // one sample per token after the first
+    EXPECT_GE(latency.itl_ms.p50, 2.0);
+    EXPECT_LE(latency.itl_ms.p50, latency.itl_ms.p99);
+    EXPECT_DOUBLE_EQ(latency.e2e_ms.max, result.e2e_ms);
+}
+
+TEST(EngineLoop, TokensRegeneratedAfterPreemptionAreNotTimedTwice) {
+    FakeBackend backend(1000, /*total_pages=*/8);
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 8});
+    std::vector<RequestHandle> handles;
+    for (TokenId i = 0; i < 6; ++i) {
+        handles.push_back(loop.submit(params({i}, 63)));
+    }
+    gate.open();
+    for (const auto& handle : handles) {
+        EXPECT_GT(finish(handle).max_itl_ms, 0.0);
+    }
+    loop.stop();
+    EXPECT_GT(loop.stats().preemptions, 0u) << "the cache was never short: the test does not exercise preemption";
+    EXPECT_EQ(loop.latency().itl_ms.count, 6u * 62u);  // 62 gaps per request, whatever was regenerated
+    EXPECT_EQ(loop.latency().ttft_ms.count, 6u);
+}
+
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {
     // Prompts of 40-100 tokens against a 128-token budget: at most one or two prefills fit next to
     // the running decodes in any step. Every step stays within the budget, and every request still
