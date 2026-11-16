@@ -16,6 +16,7 @@
 
 #include "neuroserve/core/inference_backend.hpp"
 #include "neuroserve/core/request.hpp"
+#include "neuroserve/core/scheduler.hpp"
 
 namespace neuroserve::core {
 
@@ -68,7 +69,8 @@ private:
 };
 
 struct EngineLoopOptions {
-    int max_batch = 8;  // most sequences in one decode step
+    int max_batch = 8;             // most sequences in one decode step
+    std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
 };
 
 // Counters for monitoring and tests. A consistent snapshot, safe to read from any thread.
@@ -93,12 +95,16 @@ struct EngineLoopStats {
 // Each step decodes all active requests together (one decode_step call for the whole batch),
 // and a request finishes on the step that produces its stop token or its last allowed token.
 // Logs one JSON line per finished request (logger "neuroserve.engine"); never logs token ids.
-// Admission reserves KV pages for a request's whole length up front, so the cache cannot run out
-// mid-generation (Day 14 replaces this with on-demand allocation and preemption).
+// Which queued requests are admitted is decided by a SchedulingPolicy (scheduler.hpp); the loop
+// checks each decision and applies it. Admission reserves KV pages for a request's whole length up
+// front, so the cache cannot run out mid-generation (Day 14 replaces this with on-demand allocation
+// and preemption).
 class EngineLoop {
 public:
-    // Starts the engine thread. The backend must outlive the loop.
-    explicit EngineLoop(InferenceBackend& backend, EngineLoopOptions options = {});
+    // Starts the engine thread. The backend must outlive the loop. Without an explicit `policy`,
+    // the one named in options.policy is created (std::invalid_argument for an unknown name).
+    explicit EngineLoop(InferenceBackend& backend, EngineLoopOptions options = {},
+                        std::unique_ptr<SchedulingPolicy> policy = nullptr);
     ~EngineLoop();  // stop()
 
     EngineLoop(const EngineLoop&) = delete;
@@ -113,6 +119,8 @@ public:
     bool stop_requested() const;
 
     EngineLoopStats stats() const;
+
+    std::string_view policy_name() const noexcept;
 
     // KV-cache usage as of the engine thread's last change. Safe from any thread; up to date for a
     // request's pages by the time its wait() returns.
@@ -142,6 +150,7 @@ private:
     InferenceBackend& backend_;
     const EngineLoopOptions options_;
     const ModelInfo model_info_;
+    const std::unique_ptr<SchedulingPolicy> policy_;  // called only on the engine thread
     int page_size_ = 0;
     int total_pages_ = 0;
     int max_sequence_tokens_ = 0;

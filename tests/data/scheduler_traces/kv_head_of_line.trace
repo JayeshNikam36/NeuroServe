@@ -1,0 +1,21 @@
+# KV-bound with head-of-line blocking: 10 pages in total. a needs 3, the large b needs 10, the
+# small c needs 2. After a is admitted only 7 pages are free, so b must wait, and FCFS also makes
+# c wait behind b even though c would fit. That idle capacity is what later policies trade
+# against fairness.
+policy fcfs
+limits max_batch=8 total_pages=10 page_size=16
+arrive step=0 id=a prompt=30 max_new=4
+arrive step=0 id=b prompt=150 max_new=6
+arrive step=0 id=c prompt=16 max_new=4
+--- expected
+step 0 queued=[a b c] running=[] admit=[a] finished=[] free_pages=7
+step 1 queued=[b c] running=[a] admit=[] finished=[] free_pages=7
+step 2 queued=[b c] running=[a] admit=[] finished=[a] free_pages=10
+step 3 queued=[b c] running=[] admit=[b] finished=[] free_pages=0
+step 4 queued=[c] running=[b] admit=[] finished=[] free_pages=0
+step 5 queued=[c] running=[b] admit=[] finished=[] free_pages=0
+step 6 queued=[c] running=[b] admit=[] finished=[] free_pages=0
+step 7 queued=[c] running=[b] admit=[] finished=[b] free_pages=10
+step 8 queued=[c] running=[] admit=[c] finished=[] free_pages=8
+step 9 queued=[] running=[c] admit=[] finished=[] free_pages=8
+step 10 queued=[] running=[c] admit=[] finished=[c] free_pages=10

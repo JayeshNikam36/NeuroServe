@@ -39,6 +39,11 @@ def test_version_is_semver():
     assert neuroserve.__version__.count(".") == 2
 
 
+def test_unknown_scheduling_policy_is_rejected_before_loading():
+    with pytest.raises(ValueError, match="unknown scheduling policy 'lifo'"):
+        neuroserve.Engine("/no/such/model", scheduling_policy="lifo")
+
+
 def test_device_info_reports_gpu():
     info = neuroserve.device_info()
     assert info["name"]

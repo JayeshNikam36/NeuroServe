@@ -31,6 +31,7 @@ class EngineSection(_Strict):
     max_batch: int = Field(default=8, ge=1)
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
+    scheduling_policy: Literal["fcfs"] = "fcfs"  # which queued requests are admitted next
 
 
 class LimitsSection(_Strict):

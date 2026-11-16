@@ -10,6 +10,7 @@
 #include "neuroserve/core/engine_loop.hpp"
 #include "neuroserve/core/inference_backend.hpp"
 #include "neuroserve/core/log.hpp"
+#include "neuroserve/core/scheduler.hpp"
 #include "neuroserve/core/version.hpp"
 #include "neuroserve/cuda/check.hpp"
 #include "neuroserve/cuda/device_info.hpp"
@@ -40,9 +41,9 @@ py::dict device_info(int index) {
 // at the same time and their requests are batched together. Heavy calls run with the GIL released.
 class Engine {
 public:
-    explicit Engine(const ns::CudaLlmEngineConfig& config)
+    Engine(const ns::CudaLlmEngineConfig& config, std::unique_ptr<core::SchedulingPolicy> policy)
         : backend_(std::make_unique<ns::CudaLlmEngineBackend>(config)),
-          loop_(std::make_unique<core::EngineLoop>(*backend_, core::EngineLoopOptions{config.max_batch})) {}
+          loop_(std::make_unique<core::EngineLoop>(*backend_, loop_options(config), std::move(policy))) {}
 
     // Members are destroyed in reverse order: the loop (and its thread) stops before the backend goes.
 
@@ -95,10 +96,17 @@ public:
         out["pending"] = s.pending;
         out["active"] = s.active;
         out["max_batch_seen"] = s.max_batch_seen;
+        out["policy"] = std::string(loop_->policy_name());
         return out;
     }
 
 private:
+    static core::EngineLoopOptions loop_options(const ns::CudaLlmEngineConfig& config) {
+        core::EngineLoopOptions options;
+        options.max_batch = config.max_batch;
+        return options;
+    }
+
     std::unique_ptr<ns::CudaLlmEngineBackend> backend_;
     std::unique_ptr<core::EngineLoop> loop_;
 };
@@ -137,7 +145,9 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<Engine>(m, "Engine", "Loads a model onto the GPU and generates tokens (greedy).")
         .def(py::init([](const std::string& model_dir, int max_prompt_tokens, int num_pages,
-                         int max_batch, int max_pages_per_sequence, int device_index) {
+                         int max_batch, int max_pages_per_sequence, int device_index,
+                         const std::string& scheduling_policy) {
+                 auto policy = core::make_policy(scheduling_policy);  // unknown name: ValueError, before loading
                  ns::CudaLlmEngineConfig config;
                  config.model_dir = model_dir;
                  config.max_prompt_tokens = max_prompt_tokens;
@@ -146,12 +156,12 @@ PYBIND11_MODULE(_core, m) {
                  config.max_pages_per_sequence = max_pages_per_sequence;
                  config.device_index = device_index;
                  py::gil_scoped_release release;  // loading 2.5 GB of weights takes seconds
-                 return std::make_unique<Engine>(config);
+                 return std::make_unique<Engine>(config, std::move(policy));
              }),
              py::arg("model_dir"), py::kw_only(),
              py::arg("max_prompt_tokens") = 512, py::arg("num_pages") = 2048,
              py::arg("max_batch") = 8, py::arg("max_pages_per_sequence") = 64,
-             py::arg("device_index") = 0)
+             py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs")
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",
