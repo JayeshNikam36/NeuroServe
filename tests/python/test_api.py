@@ -222,6 +222,10 @@ def test_temperature_zero_is_accepted(tok):
     ({"messages": [{"role": "robot", "content": "hi"}]}, 400, "messages.0.role"),
     ({"neuroserve": {"priority": 3}}, 400, "neuroserve.priority"),
     ({"neuroserve": {"priority": -1}}, 400, "neuroserve.priority"),
+    ({"max_tokens": "ten"}, 400, "max_tokens"),
+    ({"temperature": -1}, 400, "temperature"),
+    ({"top_p": 0}, 400, "top_p"),
+    ({"neuroserve": {"no_such_option": True}}, 400, "neuroserve.no_such_option"),
 ])
 def test_bad_requests_get_openai_errors(tok, overrides, status, param):
     app, engine, _ = make_app(tok)
@@ -554,3 +558,56 @@ def test_client_disconnect_cancels_a_non_streaming_request(tok):
         wait_until(lambda: engine.cancelled == ["ns-000001"], "the engine request to be cancelled")
         # The server forgets the request once it has finished (with its 499), a moment after the cancel.
         wait_until(lambda: app.state.in_flight == {}, "the server to forget the cancelled request")
+
+
+# ---- Day 20: input limits, queue limits, validation ----------------------------------------------
+
+def test_malformed_json_is_400(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", content=b'{"model": "x", "messages": [',
+                           headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400 and resp.json()["error"]["type"] == "invalid_request_error"
+    assert engine.calls == []
+
+
+def test_completions_prompt_over_the_limit_is_413(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.post("/v1/completions", json={"model": MODEL_NAME, "prompt": [1] * 129})  # limit is 128
+    assert resp.status_code == 413
+    assert resp.json()["error"] == {"message": resp.json()["error"]["message"], "type": "invalid_request_error",
+                                    "param": "prompt", "code": "context_length_exceeded"}
+    assert engine.calls == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_full_queue_is_429_with_retry_after(tok, stream):
+    app, _, _ = make_app(tok, error=neuroserve.QueueFull("the queue is full: 256 requests are waiting"))
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=chat_body(stream=stream))
+    assert resp.status_code == 429  # before any stream starts: submit is refused at once
+    assert resp.headers["Retry-After"] == "1"
+    assert resp.json()["error"]["code"] == "queue_full"
+
+
+def test_a_queue_timeout_is_503_with_retry_after(tok):
+    app, _, _ = make_app(tok, stream_error=neuroserve.QueueTimeout("the request waited 30001 ms in the queue"))
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=chat_body())
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "1"
+    assert resp.json()["error"]["code"] == "queue_timeout"
+
+
+def test_a_queue_timeout_ends_a_stream_with_an_error_event(tok):
+    app, _, _ = make_app(tok, stream_error=neuroserve.QueueTimeout("the request waited 30001 ms in the queue"))
+    with TestClient(app) as client:
+        events = sse_events(client.post("/v1/chat/completions", json=chat_body(stream=True)))
+    assert events[-1]["error"]["code"] == "queue_timeout"
+
+
+@pytest.mark.parametrize("engine_overrides", [{"max_queue": 0}, {"queue_timeout_ms": -1}])
+def test_bad_queue_limits_in_the_config_are_refused(engine_overrides):
+    with pytest.raises(ValueError):
+        make_config(**engine_overrides)

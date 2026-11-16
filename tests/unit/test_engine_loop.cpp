@@ -472,6 +472,75 @@ TEST(EngineLoop, CancellingAnUnknownRequestReturnsFalse) {
     EXPECT_EQ(loop.stats().cancelled, 0u);
 }
 
+// ---- Queue limits ------------------------------------------------------------------------------
+
+TEST(EngineLoop, AFullQueueRejectsNewRequests) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 1, .max_queue = 2});
+    const auto running = loop.submit(params({1}, 3));
+    ASSERT_TRUE(gate.wait_entered());                 // the only slot is taken; the queue fills up
+    const auto q1 = loop.submit(params({10}, 3));
+    const auto q2 = loop.submit(params({20}, 3));
+    EXPECT_THROW(loop.submit(params({30}, 3)), neuroserve::core::QueueFull);
+    EXPECT_EQ(loop.stats().rejected, 1u);
+    gate.open();
+    for (const auto* handle : {&running, &q1, &q2}) {
+        EXPECT_NO_THROW(finish(*handle));
+    }
+    EXPECT_EQ(finish(loop.submit(params({30}, 3))).tokens, (std::vector<TokenId>{31, 32, 33}));  // room again
+}
+
+TEST(EngineLoop, ARequestThatWaitsTooLongIsRejected) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 1, .queue_timeout_ms = 50});
+    const auto running = loop.submit(params({1}, 3));
+    ASSERT_TRUE(gate.wait_entered());                 // the only slot is taken
+    const auto waiting = loop.submit(params({10}, 3));
+    std::this_thread::sleep_for(100ms);               // longer than the queue timeout
+    gate.open();
+    EXPECT_THROW(finish(waiting), neuroserve::core::QueueTimeout);
+    EXPECT_EQ(finish(running).tokens, (std::vector<TokenId>{2, 3, 4}));
+    loop.stop();
+    EXPECT_EQ(backend.prefill_calls(), 1);            // the rejected request never ran
+    EXPECT_EQ(loop.stats().timed_out, 1u);
+    EXPECT_EQ(backend.live_sequences(), 0);
+}
+
+TEST(EngineLoop, PreemptedRequestsAreNotRejectedByTheQueueTimeout) {
+    // KV pressure preempts requests that have already started; they may wait in the queue far
+    // longer than the timeout (every step is slowed to 2 ms) but must finish, not be rejected.
+    FakeBackend backend(1000, /*total_pages=*/8);
+    FirstDecodeGate gate;
+    gate.install(backend);
+    const auto open_gate = backend.on_decode;
+    backend.on_decode = [&open_gate](std::size_t batch) {
+        open_gate(batch);
+        std::this_thread::sleep_for(2ms);
+    };
+    EngineLoop loop(backend, {.max_batch = 8, .queue_timeout_ms = 20});
+    std::vector<RequestHandle> handles;
+    for (TokenId i = 0; i < 6; ++i) {
+        handles.push_back(loop.submit(params({i}, 63)));
+    }
+    gate.open();
+    for (TokenId i = 0; i < 6; ++i) {
+        EXPECT_EQ(finish(handles[static_cast<std::size_t>(i)]).tokens, expected_tokens(params({i}, 63)));
+    }
+    loop.stop();
+    EXPECT_GT(loop.stats().preemptions, 0u) << "the cache was never short: the test does not exercise preemption";
+    EXPECT_EQ(loop.stats().timed_out, 0u);
+}
+
+TEST(EngineLoop, QueueLimitsAreValidated) {
+    FakeBackend backend;
+    EXPECT_THROW(EngineLoop(backend, {.max_queue = 0}), std::invalid_argument);
+    EXPECT_THROW(EngineLoop(backend, {.queue_timeout_ms = -1}), std::invalid_argument);
+}
+
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {
     // Prompts of 40-100 tokens against a 128-token budget: at most one or two prefills fit next to
     // the running decodes in any step. Every step stays within the budget, and every request still

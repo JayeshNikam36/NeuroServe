@@ -135,6 +135,12 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     if (options_.max_batch_tokens < 1) {
         throw std::invalid_argument("max_batch_tokens must be at least 1");
     }
+    if (options_.max_queue < 1) {
+        throw std::invalid_argument("max_queue must be at least 1");
+    }
+    if (options_.queue_timeout_ms < 0) {
+        throw std::invalid_argument("queue_timeout_ms must be 0 (no timeout) or more");
+    }
     const KvCacheStats kv = backend.kv_stats();
     page_size_ = kv.page_size_tokens;
     total_pages_ = kv.total_pages;
@@ -219,6 +225,15 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
             entry->request.transition_to(RequestState::kRejected);
             ++stats_.rejected;
             throw EngineStopped("the engine is stopped");
+        }
+        if (pending_.size() >= static_cast<std::size_t>(options_.max_queue)) {
+            entry->request.transition_to(RequestState::kRejected);
+            ++stats_.rejected;
+            log::write(log::Level::kInfo, kLogger, "request rejected",
+                       {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
+                        {"reason", "queue full"}, {"max_queue", options_.max_queue}});
+            throw QueueFull("the queue is full (" + std::to_string(pending_.size()) + " waiting, the limit is " +
+                            std::to_string(options_.max_queue) + ")");
         }
         // From here on only the engine thread touches the entry; the mutex hands it over safely.
         entry->request.transition_to(RequestState::kQueued);
@@ -311,6 +326,7 @@ void EngineLoop::loop() {
             }
         }
         apply_cancellations();  // first: cancelled requests free their pages before this step's decisions
+        expire_queued();
         const int free_pages = backend_.kv_stats().free_pages;  // backend call: outside the lock
         {
             std::lock_guard lock(mu_);
@@ -381,6 +397,42 @@ void EngineLoop::apply_cancellations() {
                     {"state", std::string(to_string(entry->request.state()))},
                     {"generated_tokens", entry->tokens.size()}});
         cancel(*entry, error);  // frees the sequence and its KV pages, then answers the caller
+    }
+}
+
+void EngineLoop::expire_queued() {
+    if (options_.queue_timeout_ms <= 0) {
+        return;
+    }
+    const auto now = Request::Clock::now();
+    const auto limit = std::chrono::milliseconds(options_.queue_timeout_ms);
+    std::vector<EntryPtr> expired;
+    {
+        std::lock_guard lock(mu_);
+        for (auto& entry : pending_) {
+            // Only requests never admitted: a preempted request already streamed tokens and is
+            // restarted as soon as there is room, so it is not rejected halfway.
+            const auto queued = entry->request.entered_at(RequestState::kQueued);
+            if (entry->request.preemption_count() == 0 && queued && now - *queued >= limit) {
+                expired.push_back(std::move(entry));
+            }
+        }
+        if (expired.empty()) {
+            return;
+        }
+        std::erase_if(pending_, [](const EntryPtr& entry) { return !entry; });
+        stats_.pending = pending_.size();
+    }
+    for (auto& entry : expired) {
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - *entry->request.entered_at(RequestState::kQueued));
+        log::write(log::Level::kInfo, kLogger, "request rejected",
+                   {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
+                    {"reason", "queue timeout"}, {"waited_ms", waited.count()},
+                    {"queue_timeout_ms", options_.queue_timeout_ms}});
+        reject(*entry, std::make_exception_ptr(QueueTimeout(
+                           "the request waited " + std::to_string(waited.count()) + " ms in the queue (limit " +
+                           std::to_string(options_.queue_timeout_ms) + " ms)")));
     }
 }
 
@@ -639,6 +691,16 @@ void EngineLoop::fail(EntryPtr entry, std::exception_ptr error) noexcept {
         unfinished_.erase(entry->request.id());
     }
     deliver_error(*entry->state, std::move(error));
+}
+
+void EngineLoop::reject(Entry& entry, std::exception_ptr error) noexcept {
+    entry.request.transition_to(RequestState::kRejected);  // never admitted: no sequence, no pages
+    {
+        std::lock_guard lock(mu_);
+        ++stats_.timed_out;
+        unfinished_.erase(entry.request.id());
+    }
+    deliver_error(*entry.state, std::move(error));
 }
 
 void EngineLoop::cancel(Entry& entry, std::exception_ptr error) noexcept {

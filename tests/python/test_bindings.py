@@ -48,6 +48,12 @@ def test_config_offers_exactly_the_engine_policies():
     assert set(allowed) == set(neuroserve.scheduling_policies) == {"fcfs", "token-budget", "decode-first", "priority"}
 
 
+@pytest.mark.parametrize("options", [{"max_queue": 0}, {"queue_timeout_ms": -1}])
+def test_bad_queue_limits_are_rejected_before_loading(options):
+    with pytest.raises(ValueError):
+        neuroserve.Engine("/no/such/model", **options)
+
+
 def test_unknown_scheduling_policy_is_rejected_before_loading():
     with pytest.raises(ValueError, match="unknown scheduling policy 'lifo'"):
         neuroserve.Engine("/no/such/model", scheduling_policy="lifo")

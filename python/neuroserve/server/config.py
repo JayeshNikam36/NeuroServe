@@ -36,6 +36,10 @@ class EngineSection(_Strict):
     scheduling_policy: Literal["fcfs", "token-budget", "decode-first", "priority"] = "fcfs"
     # "priority" policy: a waiting request rises one priority level per this many ms (no starvation)
     priority_aging_ms: int = Field(default=1000, ge=1)
+    # Overload protection: beyond max_queue waiting requests a new one gets 429; a request not
+    # admitted within queue_timeout_ms is rejected with 503 (0 = wait as long as it takes).
+    max_queue: int = Field(default=256, ge=1)
+    queue_timeout_ms: int = Field(default=30000, ge=0)
 
 
 class LimitsSection(_Strict):

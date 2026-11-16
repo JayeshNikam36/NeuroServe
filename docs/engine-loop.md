@@ -27,6 +27,10 @@ generation for many requests on one dedicated engine thread.
   thread applies it at the start of the next step: the request leaves the queue or the batch, its
   sequence and pages are freed before that step schedules, and its caller gets `RequestCancelled`.
   A step is never interrupted halfway, so the batch and the KV cache stay consistent.
+- **Bounded queue.** `submit()` refuses a request with `QueueFull` when `max_queue` requests are
+  already waiting, so overload turns into fast 429s instead of an ever longer queue. At the start of
+  each step, requests that have waited longer than `queue_timeout_ms` without being admitted are
+  `REJECTED` with `QueueTimeout` (preempted requests, which already started, are exempt).
 - **Failure isolation.** A prefill error fails one request; a decode error fails that step's
   batch; the loop keeps serving. Sequences and their pages are always released.
 - **Clean shutdown.** `stop()` cancels queued and running requests with `EngineStopped`, so no
