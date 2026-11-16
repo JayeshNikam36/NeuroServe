@@ -8,10 +8,16 @@ Every error response uses OpenAI's format and carries an `X-Request-ID` header:
 
 Search the server log for the request id to find the full context (and traceback, for 500s).
 
+With `"stream": true`, errors found before the stream starts (invalid request, prompt too long)
+are normal HTTP errors as below. An error after the stream has started cannot
+change the status (200 is already sent): the stream ends with one event
+`data: {"error": {...}}` in the same format, and no `data: [DONE]`.
+
 | Status | `type` | `code` | When |
 | --- | --- | --- | --- |
 | 400 | `invalid_request_error` | `null` | Invalid body: missing or wrong-typed field, empty messages/prompt, bad role, token id outside the vocabulary, `max_tokens` above the limit (`param` names the field) |
-| 400 | `invalid_request_error` | `unsupported_parameter` | `stream=true`, `n>1`, or `temperature>0` (not supported yet) |
+| 400 | `invalid_request_error` | `null` | `stream_options` without `stream=true` |
+| 400 | `invalid_request_error` | `unsupported_parameter` | `n>1`, or `temperature>0` (not supported yet) |
 | 404 | `invalid_request_error` | `model_not_found` | `model` is not the served model |
 | 404 | `invalid_request_error` | `null` | Unknown URL |
 | 413 | `invalid_request_error` | `context_length_exceeded` | Prompt longer than `engine.max_prompt_tokens` |

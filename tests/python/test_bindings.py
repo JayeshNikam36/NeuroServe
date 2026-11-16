@@ -85,6 +85,21 @@ def test_bad_requests_raise_python_exceptions(engine):
 
 
 @needs_model
+def test_stream_returns_the_tokens_of_generate_as_they_are_made(engine):
+    for i in range(8):
+        prompt, expected = reference(i)
+        stream = engine.stream(prompt, max_new_tokens=len(expected))
+        tokens, reads = [], 0
+        while (batch := stream.read()) is not None:
+            tokens += batch
+            reads += 1
+        assert tokens == expected == stream.result().tokens, f"prompt {i}"
+        assert reads > 1, "all tokens arrived in one read: nothing was streamed"
+    kv = engine.kv_stats()
+    assert kv["free_pages"] == kv["total_pages"], "KV pages leaked"
+
+
+@needs_model
 def test_generate_releases_the_gil(engine):
     """A Python thread must keep running while generate() works in C++."""
     prompt, expected = reference(0)

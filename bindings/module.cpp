@@ -1,8 +1,11 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <atomic>
+#include <chrono>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +40,46 @@ py::dict device_info(int index) {
     return out;
 }
 
+// One streaming request, as Python sees it. read() and result() block with the GIL released.
+// The engine thread never calls into Python: it appends tokens to the request's buffer in C++,
+// and a Python thread reads them from there.
+class TokenStream {
+public:
+    explicit TokenStream(core::RequestHandle handle) : handle_(std::move(handle)) {}
+
+    const std::string& request_id() const { return handle_.id(); }
+
+    // New tokens, oldest first; [] if `timeout_s` passed first; None once the request has
+    // finished and every token has been read (then call result()).
+    std::optional<std::vector<ns::TokenId>> read(std::optional<double> timeout_s) {
+        if (finished_) {
+            return std::nullopt;
+        }
+        const auto wait = timeout_s ? std::chrono::milliseconds(static_cast<long long>(*timeout_s * 1000.0))
+                                    : std::chrono::milliseconds(1000);
+        for (;;) {
+            auto batch = handle_.read_tokens(wait);
+            finished_ = batch.finished;
+            if (!batch.tokens.empty()) {
+                return std::move(batch.tokens);  // the next read() returns None if this was the end
+            }
+            if (finished_) {
+                return std::nullopt;
+            }
+            if (timeout_s) {
+                return std::vector<ns::TokenId>{};
+            }
+        }
+    }
+
+    // Blocks until the request finishes; returns its result or raises its error.
+    core::GenerationResult result() const { return handle_.wait(); }
+
+private:
+    core::RequestHandle handle_;
+    std::atomic<bool> finished_{false};
+};
+
 // Python-facing engine. Owns one backend and the engine loop that drives it: every call from
 // Python is submitted to the loop's engine thread, so any number of Python threads can generate
 // at the same time and their requests are batched together. Heavy calls run with the GIL released.
@@ -60,6 +103,18 @@ public:
         params.client_request_id = std::move(client_request_id);
         params.priority = priority;
         return loop_->submit(std::move(params)).wait();
+    }
+
+    std::unique_ptr<TokenStream> stream(std::vector<ns::TokenId> prompt_ids, int max_new_tokens,
+                       std::vector<ns::TokenId> stop_token_ids, std::string client_request_id, int priority) {
+        core::GenerationParams params;
+        params.prompt = std::move(prompt_ids);
+        params.max_new_tokens = max_new_tokens;
+        params.stop_token_ids = std::move(stop_token_ids);
+        params.client_request_id = std::move(client_request_id);
+        params.priority = priority;
+        params.stream = true;
+        return std::make_unique<TokenStream>(loop_->submit(std::move(params)));  // a bad request raises here
     }
 
     std::vector<ns::TokenId> generate(std::vector<ns::TokenId> prompt_ids, int max_new_tokens) {
@@ -161,6 +216,14 @@ PYBIND11_MODULE(_core, m) {
                    " finish_reason=" + std::string(core::to_string(r.finish_reason)) + ">";
         });
 
+    py::class_<TokenStream>(m, "TokenStream", "A streaming request: read() its tokens as they are generated.")
+        .def_property_readonly("request_id", &TokenStream::request_id)
+        .def("read", &TokenStream::read, py::arg("timeout") = py::none(), py::call_guard<py::gil_scoped_release>(),
+             "New token ids, oldest first. Waits up to `timeout` seconds (forever if None); returns [] if "
+             "nothing arrived in time, and None once the request has finished and every token was read.")
+        .def("result", &TokenStream::result, py::call_guard<py::gil_scoped_release>(),
+             "Waits for the request to finish; returns its GenerationResult or raises its error.");
+
     m.def("device_info", &device_info, py::arg("index") = 0,
           "Properties of a CUDA device, as a dict.");
 
@@ -195,6 +258,12 @@ PYBIND11_MODULE(_core, m) {
              "Submits one request to the engine loop and waits for it. Stops on (and includes) the first "
              "stop token. priority: 0 low, 1 normal, 2 high (used by the 'priority' policy). "
              "Thread-safe: concurrent calls are batched.")
+        .def("stream", &Engine::stream,
+             py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
+             py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",
+             py::arg("priority") = core::kNormalPriority,
+             "Submits one request and returns a TokenStream at once; read its tokens while it runs. "
+             "Same arguments and validation as run().")
         .def("generate", &Engine::generate,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32,
              py::call_guard<py::gil_scoped_release>(),

@@ -9,12 +9,15 @@
 namespace neuroserve::core {
 
 struct RequestHandle::State {
-    std::string id;  // set before the handle is shared; never changes
+    std::string id;       // set before the handle is shared; never changes
+    bool stream = false;  // set before the handle is shared; never changes
     std::mutex mu;
     std::condition_variable cv;
     bool done = false;
     GenerationResult result;
     std::exception_ptr error;
+    std::vector<TokenId> streamed;  // stream only: every token generated so far, in order
+    std::size_t read = 0;           // stream only: how many of them read_tokens() has returned
 };
 
 struct EngineLoop::Entry {
@@ -23,6 +26,7 @@ struct EngineLoop::Entry {
           params(std::move(generation_params)),
           state(std::make_shared<RequestHandle::State>()) {
         state->id = request.id();
+        state->stream = params.stream;
     }
 
     Request request;
@@ -102,6 +106,19 @@ GenerationResult RequestHandle::wait() const {
         std::rethrow_exception(state_->error);
     }
     return state_->result;
+}
+
+RequestHandle::TokenBatch RequestHandle::read_tokens(std::chrono::milliseconds timeout) const {
+    std::unique_lock lock(state_->mu);
+    if (!state_->stream) {
+        throw std::logic_error("read_tokens: request " + state_->id + " was not submitted with stream = true");
+    }
+    state_->cv.wait_for(lock, timeout, [this] { return state_->read < state_->streamed.size() || state_->done; });
+    TokenBatch batch;
+    batch.tokens.assign(state_->streamed.begin() + static_cast<std::ptrdiff_t>(state_->read), state_->streamed.end());
+    state_->read = state_->streamed.size();
+    batch.finished = state_->done;  // every token is published before the request finishes
+    return batch;
 }
 
 // ---- EngineLoop: caller side -----------------------------------------------------------------
@@ -474,6 +491,9 @@ void EngineLoop::decode_active() {
 
 bool EngineLoop::append_token(Entry& entry, TokenId token) {
     entry.tokens.push_back(token);
+    if (entry.params.stream) {
+        publish_token(entry, token);
+    }
     const auto& stops = entry.params.stop_token_ids;
     if (std::find(stops.begin(), stops.end(), token) != stops.end()) {
         entry.finish = FinishReason::kStop;
@@ -484,6 +504,27 @@ bool EngineLoop::append_token(Entry& entry, TokenId token) {
         return true;
     }
     return false;
+}
+
+void EngineLoop::publish_token(Entry& entry, TokenId token) {
+    const std::size_t index = entry.tokens.size() - 1;
+    bool regenerated_differently = false;
+    {
+        std::lock_guard lock(entry.state->mu);
+        auto& streamed = entry.state->streamed;
+        if (index == streamed.size()) {
+            streamed.push_back(token);
+        } else {
+            // A preempted request is generating again from its prompt. Its reader already has
+            // this token; greedy decoding must reproduce it exactly.
+            regenerated_differently = streamed[index] != token;
+        }
+    }
+    entry.state->cv.notify_all();
+    if (regenerated_differently) {
+        log::write(log::Level::kError, kLogger, "restarted request generated a different token than it streamed",
+                   {{"engine_request_id", entry.request.id()}, {"index", index}});
+    }
 }
 
 void EngineLoop::release(Entry& entry) noexcept {

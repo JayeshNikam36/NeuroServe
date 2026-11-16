@@ -19,6 +19,10 @@ generation for many requests on one dedicated engine thread.
   cached. Each step the scheduling policy sees how many new pages the running batch needs; if they
   are not free, it preempts the most recently admitted requests, which free their pages, go back
   to the front of the queue and restart from their prompt (see docs/scheduling.md and ADR-0004).
+- **Streaming without Python on the engine thread.** A request submitted with `stream = true`
+  publishes each new token to its own buffer (mutex + condition variable); a reader takes them with
+  `RequestHandle::read_tokens`. Tokens regenerated after a preemption are not published twice
+  (see docs/streaming.md).
 - **Failure isolation.** A prefill error fails one request; a decode error fails that step's
   batch; the loop keeps serving. Sequences and their pages are always released.
 - **Clean shutdown.** `stop()` cancels queued and running requests with `EngineStopped`, so no
