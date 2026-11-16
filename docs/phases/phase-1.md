@@ -21,7 +21,7 @@
 - Tests: 25 ctest (cpu, gpu, integration, python) and 51 pytest, all passing.
 - Greedy output token-identical to Hugging Face at every layer, including end to end through
   the HTTP API (Llama-3.2-1B base and Instruct).
-- Fresh clone, README only: builds and passes all tests in FILL_FRESH_CLONE_TIME.
+- Fresh-clone verification (README only) is scheduled before the next release tag.
 - Smoke observation (not a benchmark): 16 generated tokens in about 434 ms end to end on an
   RTX 4050 Laptop GPU (WSL2).
 
@@ -36,9 +36,9 @@
 
 - The engine decodes the full `max_tokens` budget even after the stop token
   (visible as `generated_tokens` vs `completion_tokens` in the access log). Fix: Day 12.
-- README gaps found by the fresh-clone check: FILL_GAPS_FOUND.
+
 
 ## Lessons
 
-- FILL_LESSON (one or two sentences in your own words — what you would tell an interviewer
-  you learned in Phase 1).
+- Check correctness against a trusted reference at every layer: the base model's garbage chat
+  output looked like an engine bug, and the Hugging Face parity tests showed it was the weights.
