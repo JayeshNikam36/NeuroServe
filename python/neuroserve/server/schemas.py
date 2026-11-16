@@ -17,6 +17,11 @@ class NeuroServeOptions(BaseModel):
     priority: int = Field(default=1, ge=0, le=2)  # 0 low, 1 normal, 2 high (used by the "priority" policy)
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    include_usage: bool = False  # send a last chunk with usage (and the neuroserve block)
+
+
 class _GenerationRequest(BaseModel):
     # OpenAI clients may send fields NeuroServe does not use; ignore them.
     model_config = ConfigDict(extra="ignore")
@@ -27,6 +32,7 @@ class _GenerationRequest(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     n: int = Field(default=1, ge=1)
     stream: bool = False
+    stream_options: StreamOptions | None = None
     user: str | None = None
     neuroserve: NeuroServeOptions = Field(default_factory=NeuroServeOptions)
 

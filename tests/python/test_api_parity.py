@@ -3,6 +3,7 @@
 1. Base model: the 8 reference prompts sent as token ids to /v1/completions (ignore_eos).
 2. Instruct model: the 5 chat cases sent as messages to /v1/chat/completions, with the template
    date pinned so the server builds exactly the prompt Hugging Face saw.
+3. The same chat cases streamed through the official openai client.
 """
 
 import gc
@@ -101,3 +102,32 @@ def test_chat_completions_match_hugging_face():
             choice = body["choices"][0]
             assert choice["finish_reason"] == ("stop" if stopped else "length"), name
             assert choice["message"]["content"] == tok.decode(expected[:-1] if stopped else expected), name
+
+
+@needs_instruct
+def test_streamed_chat_matches_hugging_face_through_the_openai_client():
+    from openai import OpenAI
+
+    chat_ref = json.loads((REF_DIR / "chat_reference.json").read_text(encoding="utf-8"))
+    greedy = json.loads((REF_DIR / "instruct_greedy.json").read_text(encoding="utf-8"))
+    messages_by_name = {case["name"]: case["messages"] for case in chat_ref["chat"]}
+
+    config = make_config("llama-3.2-1b-instruct", INSTRUCT_DIR, chat_ref["date_string"])
+    with serve(config) as http:
+        tok = http.app.state.service.tokenizer
+        client = OpenAI(base_url="http://testserver/v1", api_key="unused", http_client=http)
+        for case in greedy["cases"]:
+            name, expected = case["name"], case["greedy_ids"]
+            chunks = list(client.chat.completions.create(
+                model="llama-3.2-1b-instruct", messages=messages_by_name[name],
+                max_tokens=greedy["max_new_tokens"], stream=True, stream_options={"include_usage": True},
+                extra_body={"neuroserve": {"return_token_ids": True}}))
+            stopped = expected[-1] in tok.stop_token_ids
+            text = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+            assert text == tok.decode(expected[:-1] if stopped else expected), f"{name}: text differs"
+            finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+            assert finish == ["stop" if stopped else "length"], name
+            last = chunks[-1]
+            assert last.neuroserve["completion_token_ids"] == expected, f"{name}: tokens differ"
+            assert last.usage.prompt_tokens == len(case["prompt_ids"]), f"{name}: prompt differs"
+            assert last.usage.completion_tokens == len(expected), name

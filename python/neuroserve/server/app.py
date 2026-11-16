@@ -4,22 +4,23 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import json
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import CudaError, EngineStopped, KvCacheExhausted, __version__
 from .config import ServerConfig
-from .engine_service import ContextLengthExceeded, EngineService, GenerationResult
+from .engine_service import ContextLengthExceeded, EngineService, GenerationResult, StreamingGeneration
 from .logging_setup import request_id_var
 from .middleware import RequestContextMiddleware
 from .schemas import (
@@ -32,8 +33,11 @@ from .schemas import (
     NeuroServeInfo,
     NeuroServeOptions,
     ResponseMessage,
+    StreamOptions,
     Usage,
 )
+
+T = TypeVar("T")
 
 logger = logging.getLogger("neuroserve.server")
 
@@ -59,14 +63,14 @@ def _error(status_code: int, message: str, type_: str, param: str | None = None,
     )
 
 
-def _check_request(config: ServerConfig, *, model: str, stream: bool, n: int, temperature: float | None,
-                   max_tokens: int | None) -> int:
+def _check_request(config: ServerConfig, *, model: str, stream: bool, stream_options: StreamOptions | None,
+                   n: int, temperature: float | None, max_tokens: int | None) -> int:
     """Rejects options NeuroServe does not support yet; returns the max_tokens to use."""
     if model != config.model.name:
         raise ApiError(404, f"The model '{model}' does not exist; this server serves '{config.model.name}'",
                        param="model", code="model_not_found")
-    if stream:
-        raise ApiError(400, "stream=true is not supported yet", param="stream", code="unsupported_parameter")
+    if stream_options is not None and not stream:
+        raise ApiError(400, "stream_options is only allowed with stream=true", param="stream_options")
     if n != 1:
         raise ApiError(400, "only n=1 is supported", param="n", code="unsupported_parameter")
     if temperature not in (None, 0):
@@ -78,8 +82,27 @@ def _check_request(config: ServerConfig, *, model: str, stream: bool, n: int, te
     return max_tokens or config.limits.default_max_tokens
 
 
-async def _run(request: Request, call: Callable[[], GenerationResult], param: str) -> GenerationResult:
-    """Runs generation in a worker thread (the C++ engine releases the GIL) and maps errors."""
+def _api_error(request: Request, exc: Exception, param: str) -> ApiError | None:
+    """The client-facing error for an exception from the service or engine (None: a bug)."""
+    if isinstance(exc, ContextLengthExceeded):
+        return ApiError(413, str(exc), param=param, code="context_length_exceeded")
+    if isinstance(exc, EngineStopped):
+        return ApiError(503, "the engine is shutting down", type_="server_error", code="service_unavailable")
+    if isinstance(exc, KvCacheExhausted):
+        return ApiError(503, f"KV cache exhausted: {exc}", type_="server_error", code="kv_cache_exhausted")
+    if isinstance(exc, CudaError):
+        # A CUDA failure can leave the GPU context broken: stop serving instead of returning garbage.
+        request.app.state.failure = str(exc)
+        logger.error("GPU error; server marked unhealthy", extra={"error": str(exc)})
+        return ApiError(500, f"GPU error while generating (request id {request_id_var.get()})",
+                        type_="server_error", code="gpu_error")
+    if isinstance(exc, ValueError):  # invalid messages (ChatTemplateError), bad token ids, other bad input
+        return ApiError(400, str(exc), param=param)
+    return None
+
+
+async def _run(request: Request, call: Callable[[], T], param: str) -> T:
+    """Runs a service call in a worker thread (the C++ engine releases the GIL) and maps errors."""
     failure = request.app.state.failure
     if failure is not None:
         raise ApiError(503, f"service unavailable after a GPU error ({failure}); restart the server",
@@ -88,21 +111,11 @@ async def _run(request: Request, call: Callable[[], GenerationResult], param: st
     context = contextvars.copy_context()  # carries the request id into the worker thread's log records
     try:
         return await run_in_threadpool(context.run, call)
-    except ContextLengthExceeded as exc:
-        raise ApiError(413, str(exc), param=param, code="context_length_exceeded") from exc
-    except EngineStopped as exc:
-        raise ApiError(503, "the engine is shutting down", type_="server_error",
-                       code="service_unavailable") from exc
-    except KvCacheExhausted as exc:
-        raise ApiError(503, f"KV cache exhausted: {exc}", type_="server_error", code="kv_cache_exhausted") from exc
-    except CudaError as exc:
-        # A CUDA failure can leave the GPU context broken: stop serving instead of returning garbage.
-        request.app.state.failure = str(exc)
-        logger.error("GPU error; server marked unhealthy", extra={"error": str(exc)})
-        raise ApiError(500, f"GPU error while generating (request id {request_id_var.get()})",
-                       type_="server_error", code="gpu_error") from exc
-    except ValueError as exc:  # invalid messages (ChatTemplateError), bad token ids, other bad input
-        raise ApiError(400, str(exc), param=param) from exc
+    except Exception as exc:
+        error = _api_error(request, exc, param)
+        if error is None:
+            raise
+        raise error from exc
 
 
 def _usage(result: GenerationResult) -> Usage:
@@ -120,17 +133,87 @@ def _info(result: GenerationResult, options: NeuroServeOptions) -> NeuroServeInf
     )
 
 
-def _record(request: Request, config: ServerConfig, prompt: Any, result: GenerationResult) -> None:
+def _record(request: Request, config: ServerConfig, prompt: Any, result: GenerationResult, *,
+            streamed: bool = False) -> None:
     """Adds usage numbers to the access log line; logs content only when explicitly enabled."""
-    request.state.log_fields.update(
+    fields = dict(
         prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
         generated_tokens=result.generated_tokens, finish_reason=result.finish_reason,
         e2e_ms=round(result.e2e_ms, 2), ttft_ms=round(result.ttft_ms, 2),
         queue_ms=round(result.queue_ms, 2), engine_request_id=result.engine_request_id,
     )
+    if streamed:
+        # The access line was written when the stream started; this line closes it.
+        logger.info("stream completed", extra={"path": request.url.path, **fields})
+    else:
+        request.state.log_fields.update(fields)
     if config.logging.log_prompts:
         logger.info("prompt and completion", extra={"prompt_logging": True, "prompt": prompt,
                                                     "completion": result.text})
+
+
+def _sse(data: dict[str, Any] | str) -> str:
+    """One server-sent event."""
+    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"data: {payload}\n\n"
+
+
+def _stream(request: Request, config: ServerConfig, generation: StreamingGeneration, *, chat: bool,
+            options: NeuroServeOptions, stream_options: StreamOptions | None, prompt: Any) -> StreamingResponse:
+    """Streams a generation as OpenAI chunks over server-sent events, ending with `data: [DONE]`.
+
+    Chat: a first chunk with the role, one chunk per piece of text, then a chunk with the
+    finish_reason. With stream_options.include_usage, a last chunk with empty choices and the usage.
+    The last chunk before [DONE] carries the neuroserve block (timings, token ids on request).
+    """
+    request_id = request.state.request_id
+    response_id = f"chatcmpl-{uuid.uuid4().hex}" if chat else f"cmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    include_usage = stream_options is not None and stream_options.include_usage
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        return {"id": response_id, "object": "chat.completion.chunk" if chat else "text_completion",
+                "created": created, "model": config.model.name, "system_fingerprint": None,
+                "choices": choices, **extra}
+
+    def choice(text: str | None = None, finish_reason: str | None = None, role: bool = False) -> dict[str, Any]:
+        if not chat:
+            return {"index": 0, "text": text or "", "logprobs": None, "finish_reason": finish_reason}
+        delta: dict[str, Any] = {"role": "assistant"} if role else {}
+        if text is not None:
+            delta["content"] = text
+        return {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish_reason}
+
+    async def events() -> AsyncIterator[str]:
+        token = request_id_var.set(request_id)  # the stream outlives the middleware's context
+        try:
+            if chat:
+                yield _sse(chunk([choice("", role=True)]))
+            # deltas() blocks on the engine: each next() runs in a worker thread (GIL released).
+            async for text in iterate_in_threadpool(generation.deltas()):
+                yield _sse(chunk([choice(text)]))
+            result = await run_in_threadpool(generation.result)
+            info = _info(result, options).model_dump()
+            if include_usage:
+                yield _sse(chunk([choice(finish_reason=result.finish_reason)]))
+                yield _sse(chunk([], usage=_usage(result).model_dump(), neuroserve=info))
+            else:
+                yield _sse(chunk([choice(finish_reason=result.finish_reason)], neuroserve=info))
+            yield _sse("[DONE]")
+            _record(request, config, prompt, result, streamed=True)
+        except Exception as exc:
+            # The 200 status is already sent: report the error in the stream, as OpenAI does.
+            error = _api_error(request, exc, "messages" if chat else "prompt")
+            if error is None:
+                logger.exception("unhandled error while streaming %s", request.url.path)
+                error = ApiError(500, f"internal server error (request id {request_id})",
+                                 type_="server_error", code="internal_error")
+            yield _sse({"error": {"message": error.message, "type": error.type, "param": error.param,
+                                  "code": error.code}})
+        finally:
+            request_id_var.reset(token)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 def create_app(config: ServerConfig, service: EngineService | None = None) -> FastAPI:
@@ -186,12 +269,20 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         }
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-    async def chat_completions(body: ChatCompletionRequest, request: Request) -> ChatCompletionResponse:
+    async def chat_completions(body: ChatCompletionRequest,
+                               request: Request) -> ChatCompletionResponse | StreamingResponse:
         svc: EngineService = request.app.state.service
-        max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
-                                    temperature=body.temperature,
+        max_tokens = _check_request(config, model=body.model, stream=body.stream, stream_options=body.stream_options,
+                                    n=body.n, temperature=body.temperature,
                                     max_tokens=body.max_completion_tokens or body.max_tokens)
         messages = [m.model_dump() for m in body.messages]
+        if body.stream:
+            # Bad requests fail here, with a normal HTTP error, before the stream starts.
+            generation = await _run(request, functools.partial(svc.start_chat, messages, max_tokens,
+                                                               ignore_eos=body.neuroserve.ignore_eos,
+                                                               priority=body.neuroserve.priority), param="messages")
+            return _stream(request, config, generation, chat=True, options=body.neuroserve,
+                           stream_options=body.stream_options, prompt=messages)
         result = await _run(request, functools.partial(svc.chat, messages, max_tokens,
                                                        ignore_eos=body.neuroserve.ignore_eos,
                                                        priority=body.neuroserve.priority), param="messages")
@@ -207,10 +298,16 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         )
 
     @app.post("/v1/completions", response_model=CompletionResponse)
-    async def completions(body: CompletionRequest, request: Request) -> CompletionResponse:
+    async def completions(body: CompletionRequest, request: Request) -> CompletionResponse | StreamingResponse:
         svc: EngineService = request.app.state.service
-        max_tokens = _check_request(config, model=body.model, stream=body.stream, n=body.n,
-                                    temperature=body.temperature, max_tokens=body.max_tokens)
+        max_tokens = _check_request(config, model=body.model, stream=body.stream, stream_options=body.stream_options,
+                                    n=body.n, temperature=body.temperature, max_tokens=body.max_tokens)
+        if body.stream:
+            generation = await _run(request, functools.partial(svc.start_completion, body.prompt, max_tokens,
+                                                               ignore_eos=body.neuroserve.ignore_eos,
+                                                               priority=body.neuroserve.priority), param="prompt")
+            return _stream(request, config, generation, chat=False, options=body.neuroserve,
+                           stream_options=body.stream_options, prompt=body.prompt)
         result = await _run(request, functools.partial(svc.complete, body.prompt, max_tokens,
                                                        ignore_eos=body.neuroserve.ignore_eos,
                                                        priority=body.neuroserve.priority), param="prompt")

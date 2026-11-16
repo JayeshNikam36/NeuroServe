@@ -28,6 +28,7 @@ struct GenerationParams {
     std::vector<TokenId> stop_token_ids;  // generation ends on (and includes) the first of these
     std::string client_request_id;        // caller's id (e.g. HTTP X-Request-ID), only for logs
     int priority = kNormalPriority;       // 0 low, 1 normal, 2 high; used by the "priority" policy
+    bool stream = false;                  // tokens can be read while it runs (RequestHandle::read_tokens)
 };
 
 enum class FinishReason : std::uint8_t { kStop, kLength };
@@ -65,6 +66,17 @@ public:
     // Blocks until the request finishes. Returns the result, or rethrows the request's error
     // (the backend's exception for FAILED, EngineStopped for CANCELLED).
     GenerationResult wait() const;
+
+    // Streaming (GenerationParams::stream). Waits up to `timeout` for tokens not read yet and
+    // returns them in order (none if the timeout passed first). `finished` is true once the request
+    // has finished and every token has been read; wait() then returns the result or rethrows the
+    // error. Each token is returned once, even if a preemption makes the engine generate it again.
+    // Meant for one reader per request. Throws std::logic_error for a request without stream.
+    struct TokenBatch {
+        std::vector<TokenId> tokens;
+        bool finished = false;
+    };
+    TokenBatch read_tokens(std::chrono::milliseconds timeout) const;
 
 private:
     std::shared_ptr<State> state_;
@@ -167,6 +179,7 @@ private:
     void start(EntryPtr entry, std::vector<EntryPtr>& joining);
     void decode_active();
     bool append_token(Entry& entry, TokenId token);
+    void publish_token(Entry& entry, TokenId token);  // stream: hand a new token to the reader
     void complete(EntryPtr entry) noexcept;
     void fail(EntryPtr entry, std::exception_ptr error) noexcept;
     void cancel(Entry& entry, std::exception_ptr error) noexcept;

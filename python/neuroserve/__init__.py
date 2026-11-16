@@ -1,7 +1,7 @@
 """NeuroServe: GPU-aware LLM inference runtime."""
 
-from ._core import (CudaError, Engine, EngineStopped, GenerationResult, KvCacheExhausted, __version__,
-                    device_info, scheduling_policies, set_log_level)
+from ._core import (CudaError, Engine, EngineStopped, GenerationResult, KvCacheExhausted, TokenStream,
+                    __version__, device_info, scheduling_policies, set_log_level)
 from .tokenizer import ChatTemplateError, ChatTokenizer, IncrementalDetokenizer
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "GenerationResult",
     "IncrementalDetokenizer",
     "KvCacheExhausted",
+    "TokenStream",
     "__version__",
     "device_info",
     "scheduling_policies",

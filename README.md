@@ -58,11 +58,11 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
   -d '{"model": "llama-3.2-1b-instruct", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 32}'
 ```
 
-Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (greedy, non-streaming for now).
-The server listens on localhost only; the port is published to 127.0.0.1.
-
 Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`
-(prompt as text or token ids). Greedy, non-streaming for now.
+(prompt as text or token ids). Greedy decoding. `"stream": true` streams the tokens as they are
+generated (server-sent events in OpenAI's chunk format, so the official `openai` client works; see
+[docs/streaming.md](docs/streaming.md)). The server listens on localhost only; the port is published
+to 127.0.0.1.
 
 NeuroServe request options (optional `neuroserve` object): `return_token_ids` adds the generated
 token ids to the response; `ignore_eos` generates exactly `max_tokens` (benchmarks, parity tests);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -21,6 +22,17 @@ class EngineOutput(Protocol):
     e2e_ms: float
 
 
+class EngineStream(Protocol):
+    """One streaming request (neuroserve.TokenStream or a test fake)."""
+
+    request_id: str
+
+    def read(self, timeout: float | None = None) -> list[int] | None:
+        """New token ids; None once the request has finished and every token was read."""
+
+    def result(self) -> EngineOutput: ...
+
+
 class GenerationEngine(Protocol):
     """What the service needs from an engine (the real neuroserve.Engine, or a test fake).
 
@@ -29,6 +41,9 @@ class GenerationEngine(Protocol):
 
     def run(self, prompt_ids: list[int], max_new_tokens: int, *, stop_token_ids: list[int],
             client_request_id: str, priority: int) -> EngineOutput: ...
+
+    def stream(self, prompt_ids: list[int], max_new_tokens: int, *, stop_token_ids: list[int],
+               client_request_id: str, priority: int) -> EngineStream: ...
 
     def kv_stats(self) -> dict[str, Any]: ...
 
@@ -54,6 +69,37 @@ class GenerationResult:
     @property
     def completion_tokens(self) -> int:
         return len(self.token_ids)
+
+
+class StreamingGeneration:
+    """A request whose text is read while it is generated.
+
+    Iterate deltas() (it blocks on the engine, so run it in a worker thread), then call result().
+    """
+
+    def __init__(self, service: "EngineService", prompt_ids: list[int], stream: EngineStream) -> None:
+        self._service = service
+        self._prompt_ids = prompt_ids
+        self._stream = stream
+
+    @property
+    def engine_request_id(self) -> str:
+        return self._stream.request_id
+
+    def deltas(self) -> Iterator[str]:
+        """Text as it is generated: one piece per batch of new tokens (never half a character)."""
+        detokenizer = self._service.tokenizer.detokenizer()  # skips special tokens such as the stop token
+        while (tokens := self._stream.read()) is not None:
+            text = "".join(detokenizer.push(token) for token in tokens)
+            if text:
+                yield text
+        tail = detokenizer.flush()
+        if tail:
+            yield tail
+
+    def result(self) -> GenerationResult:
+        """The finished request (raises the engine's error if it failed)."""
+        return self._service._result(self._prompt_ids, self._stream.result())
 
 
 class EngineService:
@@ -106,11 +152,26 @@ class EngineService:
 
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
              ignore_eos: bool = False, priority: int = 1) -> GenerationResult:
-        prompt_ids = self._tokenizer.encode_chat(messages, date_string=self._config.model.chat_date_string)
-        return self._run(prompt_ids, max_new_tokens, ignore_eos, priority)
+        return self._run(self._chat_prompt(messages), max_new_tokens, ignore_eos, priority)
 
     def complete(self, prompt: str | list[int], max_new_tokens: int, *,
                  ignore_eos: bool = False, priority: int = 1) -> GenerationResult:
+        return self._run(self._completion_prompt(prompt), max_new_tokens, ignore_eos, priority)
+
+    def start_chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
+                   ignore_eos: bool = False, priority: int = 1) -> StreamingGeneration:
+        """Like chat(), but returns as soon as the request is queued (bad requests raise here)."""
+        return self._start(self._chat_prompt(messages), max_new_tokens, ignore_eos, priority)
+
+    def start_completion(self, prompt: str | list[int], max_new_tokens: int, *,
+                         ignore_eos: bool = False, priority: int = 1) -> StreamingGeneration:
+        """Like complete(), but returns as soon as the request is queued (bad requests raise here)."""
+        return self._start(self._completion_prompt(prompt), max_new_tokens, ignore_eos, priority)
+
+    def _chat_prompt(self, messages: list[dict[str, Any]]) -> list[int]:
+        return self._tokenizer.encode_chat(messages, date_string=self._config.model.chat_date_string)
+
+    def _completion_prompt(self, prompt: str | list[int]) -> list[int]:
         if isinstance(prompt, str):
             prompt_ids = self._tokenizer.encode(prompt)  # adds <|begin_of_text|>
         else:
@@ -119,20 +180,29 @@ class EngineService:
             if bad is not None:
                 raise ValueError(f"token id {bad} is outside the vocabulary (0..{vocab - 1})")
             prompt_ids = list(prompt)  # token ids are used verbatim
-        return self._run(prompt_ids, max_new_tokens, ignore_eos, priority)
+        return prompt_ids
 
-    def _run(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool, priority: int) -> GenerationResult:
+    def _engine_args(self, prompt_ids: list[int], ignore_eos: bool, priority: int) -> dict[str, Any]:
         limit = self._config.engine.max_prompt_tokens
         if len(prompt_ids) > limit:
             raise ContextLengthExceeded(f"the prompt has {len(prompt_ids)} tokens; the limit is {limit}")
-
         # The engine stops on the step that produces a stop token (and includes it in the output).
-        out = self._engine.run(
-            prompt_ids, max_new_tokens,
-            stop_token_ids=[] if ignore_eos else self._stop_token_ids,
-            client_request_id=request_id_var.get() or "",  # links the engine's log line to this request
-            priority=priority,
-        )
+        return {
+            "stop_token_ids": [] if ignore_eos else self._stop_token_ids,
+            "client_request_id": request_id_var.get() or "",  # links the engine's log line to this request
+            "priority": priority,
+        }
+
+    def _run(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool, priority: int) -> GenerationResult:
+        args = self._engine_args(prompt_ids, ignore_eos, priority)
+        return self._result(prompt_ids, self._engine.run(prompt_ids, max_new_tokens, **args))
+
+    def _start(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool,
+               priority: int) -> StreamingGeneration:
+        args = self._engine_args(prompt_ids, ignore_eos, priority)
+        return StreamingGeneration(self, prompt_ids, self._engine.stream(prompt_ids, max_new_tokens, **args))
+
+    def _result(self, prompt_ids: list[int], out: EngineOutput) -> GenerationResult:
         tokens = list(out.tokens)
         stopped = out.finish_reason == "stop"
         return GenerationResult(

@@ -1,6 +1,10 @@
 """API tests: OpenAI format, validation, errors (fake engine) and one real end-to-end run."""
 
+import json
 import os
+import socket
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,13 +39,45 @@ def test_prompt_limit_must_fit_the_token_budget():
         make_config(max_prompt_tokens=600, max_batch_tokens=512)
 
 
+class FakeStream:
+    """Like neuroserve.TokenStream: hands out the tokens one per read(), then the result.
+
+    `gate`: when set, the stream waits for it after the first token (to prove the first token
+    reaches the client before generation ends). `error`: raised by result(), after the tokens.
+    """
+
+    def __init__(self, out, gate: threading.Event | None = None, error: Exception | None = None) -> None:
+        self.request_id = out.request_id
+        self._out = out
+        self._pending = list(out.tokens)
+        self._gate = gate
+        self._error = error
+        self._sent = 0
+
+    def read(self, timeout=None):
+        if not self._pending:
+            return None
+        if self._sent == 1 and self._gate is not None:
+            assert self._gate.wait(timeout=10), "the client never received the first token"
+        self._sent += 1
+        return [self._pending.pop(0)]
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._out
+
+
 class FakeEngine:
     """Like the real engine's run(): a fixed reply, then filler, ending at the first stop token."""
 
-    def __init__(self, reply_ids: list[int], filler: int, error: Exception | None = None) -> None:
+    def __init__(self, reply_ids: list[int], filler: int, error: Exception | None = None,
+                 stream_error: Exception | None = None, gate: threading.Event | None = None) -> None:
         self.reply_ids = reply_ids
         self.filler = filler
         self.error = error
+        self.stream_error = stream_error  # streaming: raised after the tokens, when the result is read
+        self.gate = gate
         self.calls: list[tuple[list[int], int]] = []
         self.stop_token_ids: list[list[int]] = []
         self.client_request_ids: list[str] = []
@@ -63,6 +99,11 @@ class FakeEngine:
         return SimpleNamespace(request_id=f"ns-{len(self.calls):06d}", tokens=out, finish_reason=finish,
                                queue_ms=0.1, ttft_ms=0.5, e2e_ms=1.0)
 
+    def stream(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
+        out = self.run(prompt_ids, max_new_tokens, stop_token_ids=stop_token_ids,
+                       client_request_id=client_request_id, priority=priority)
+        return FakeStream(out, gate=self.gate, error=self.stream_error)
+
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64}
 
@@ -75,11 +116,11 @@ def tok() -> ChatTokenizer:
     return ChatTokenizer(TOKENIZER_DIR)
 
 
-def make_app(tok, *, stop=True, error=None):
+def make_app(tok, *, stop=True, error=None, stream_error=None, gate=None):
     eot = tok.tokenizer.token_to_id("<|eot_id|>")
     reply_ids = tok.encode(REPLY, add_special_tokens=False) + ([eot] if stop else [])
     filler = tok.encode(" filler", add_special_tokens=False)[0]
-    engine = FakeEngine(reply_ids, filler, error)
+    engine = FakeEngine(reply_ids, filler, error, stream_error, gate)
     config = make_config()
     return create_app(config, EngineService(config, engine, tok, device_name="fake-gpu")), engine, reply_ids
 
@@ -139,7 +180,7 @@ def test_temperature_zero_is_accepted(tok):
 
 @pytest.mark.parametrize("overrides, status, param", [
     ({"model": "gpt-4"}, 404, "model"),
-    ({"stream": True}, 400, "stream"),
+    ({"stream_options": {"include_usage": True}}, 400, "stream_options"),  # only with stream=true
     ({"temperature": 0.7}, 400, "temperature"),
     ({"n": 2}, 400, "n"),
     ({"max_tokens": 1000}, 400, "max_tokens"),
@@ -268,3 +309,130 @@ def test_bad_completion_requests_are_400(tok, payload, param):
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["param"] == param
     assert engine.calls == []
+
+
+# ---- Day 18: streaming over server-sent events ---------------------------------------------------
+
+def sse_events(resp) -> list:
+    """The data of each server-sent event: parsed JSON, or the final "[DONE]"."""
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = []
+    for line in resp.text.split("\n"):
+        if line.startswith("data: "):
+            data = line[len("data: "):]
+            events.append(data if data == "[DONE]" else json.loads(data))
+    return events
+
+
+def test_chat_stream_sends_openai_chunks(tok):
+    app, _, reply_ids = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=chat_body(stream=True))
+    assert resp.status_code == 200, resp.text
+    events = sse_events(resp)
+    assert events[-1] == "[DONE]"
+    chunks = events[:-1]
+    assert all(c["object"] == "chat.completion.chunk" and c["id"] == chunks[0]["id"] for c in chunks)
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert text == REPLY                                       # the same text as without streaming
+    assert len(chunks) >= 4                                    # role, several pieces of text, finish
+    last = chunks[-1]
+    assert last["choices"][0] == {"index": 0, "delta": {}, "logprobs": None, "finish_reason": "stop"}
+    assert last["neuroserve"]["generated_tokens"] == len(reply_ids)
+    assert "usage" not in last                                 # only with stream_options.include_usage
+
+
+def test_stream_with_include_usage_ends_with_a_usage_chunk(tok):
+    app, _, reply_ids = make_app(tok)
+    with TestClient(app) as client:
+        body = chat_body(stream=True, stream_options={"include_usage": True}, neuroserve={"return_token_ids": True})
+        events = sse_events(client.post("/v1/chat/completions", json=body))
+        plain = client.post("/v1/chat/completions", json=chat_body()).json()
+    usage_chunk = events[-2]
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"] == plain["usage"]              # the same numbers as without streaming
+    assert usage_chunk["neuroserve"]["completion_token_ids"] == reply_ids
+    assert events[-3]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_completions_stream(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        events = sse_events(client.post("/v1/completions",
+                                        json={"model": MODEL_NAME, "prompt": "The capital of France is",
+                                              "stream": True}))
+    chunks = events[:-1]
+    assert all(c["object"] == "text_completion" for c in chunks)
+    assert "".join(c["choices"][0]["text"] for c in chunks) == REPLY
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop" and events[-1] == "[DONE]"
+
+
+def test_stream_errors_before_the_first_token_are_http_errors(tok):
+    app, engine, _ = make_app(tok)
+    long_body = chat_body(stream=True, messages=[{"role": "user", "content": "word " * 400}])
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=long_body)
+    assert resp.status_code == 413 and resp.json()["error"]["code"] == "context_length_exceeded"
+    assert engine.calls == []
+
+
+def test_an_error_during_the_stream_is_sent_as_an_error_event(tok):
+    app, _, _ = make_app(tok, stream_error=neuroserve.EngineStopped("engine stopping"))
+    with TestClient(app) as client:
+        resp = client.post("/v1/chat/completions", json=chat_body(stream=True))
+    assert resp.status_code == 200  # already sent when the error happened
+    events = sse_events(resp)
+    assert events[-1]["error"]["code"] == "service_unavailable"
+    assert "[DONE]" not in events
+
+
+def test_the_official_openai_client_streams(tok):
+    from openai import OpenAI
+
+    app, _, reply_ids = make_app(tok)
+    with TestClient(app) as http:
+        client = OpenAI(base_url="http://testserver/v1", api_key="unused", http_client=http)
+        chunks = list(client.chat.completions.create(
+            model=MODEL_NAME, messages=[{"role": "user", "content": "What is the capital of France?"}],
+            max_tokens=16, stream=True, stream_options={"include_usage": True}))
+    text = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+    assert text == REPLY
+    assert chunks[-1].usage.completion_tokens == len(reply_ids)
+    assert chunks[-1].neuroserve["generated_tokens"] == len(reply_ids)  # NeuroServe's extension field
+
+
+def test_tokens_reach_the_client_before_generation_ends(tok):
+    """Through a real HTTP server: the first token must arrive while the engine is still
+    generating (nothing on the way, such as a middleware, may buffer the stream)."""
+    import uvicorn
+    from openai import OpenAI
+
+    gate = threading.Event()  # the fake engine produces nothing after the first token until this is set
+    app, _, _ = make_app(tok, gate=gate)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started:
+            assert time.monotonic() < deadline, "server did not start"
+            time.sleep(0.01)
+        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="unused", timeout=10)
+        stream = client.chat.completions.create(
+            model=MODEL_NAME, messages=[{"role": "user", "content": "hi"}], max_tokens=16, stream=True)
+        pieces = []
+        for chunk in stream:
+            content = chunk.choices[0].delta.content if chunk.choices else None
+            if content:
+                pieces.append(content)
+                assert gate.is_set() or len(pieces) == 1  # the first piece came while generation was paused
+                gate.set()
+        assert "".join(pieces) == REPLY
+    finally:
+        gate.set()
+        server.should_exit = True
+        thread.join(timeout=10)

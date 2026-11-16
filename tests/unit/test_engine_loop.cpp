@@ -227,6 +227,47 @@ TEST_P(EveryPolicy, KvPressurePreemptsAndEveryRequestStillCompletesCorrectly) {
     EXPECT_EQ(backend.live_sequences(), 0);
 }
 
+// Reads a streaming request until it finishes; returns every token it streamed.
+std::vector<TokenId> read_all(const RequestHandle& handle) {
+    std::vector<TokenId> out;
+    for (int reads = 0; reads < 10'000; ++reads) {
+        auto batch = handle.read_tokens(10s);
+        out.insert(out.end(), batch.tokens.begin(), batch.tokens.end());
+        if (batch.finished) {
+            return out;
+        }
+    }
+    throw TimedOut{};
+}
+
+GenerationParams streaming(GenerationParams p) {
+    p.stream = true;
+    return p;
+}
+
+TEST_P(EveryPolicy, StreamedRequestsReturnEachTokenOnceDespitePreemption) {
+    // The KV-pressure workload above, streamed: preempted requests generate their tokens again
+    // from the prompt, but each reader sees every token exactly once, in order.
+    FakeBackend backend(1000, /*total_pages=*/8);
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 8, .policy = GetParam()});
+
+    std::vector<RequestHandle> handles;
+    for (TokenId i = 0; i < 6; ++i) {
+        handles.push_back(loop.submit(streaming(params({i}, 63))));
+    }
+    gate.open();
+    for (TokenId i = 0; i < 6; ++i) {
+        const auto& handle = handles[static_cast<std::size_t>(i)];
+        const auto expected = expected_tokens(params({i}, 63));
+        EXPECT_EQ(read_all(handle), expected);
+        EXPECT_EQ(handle.wait().tokens, expected);
+    }
+    loop.stop();
+    EXPECT_GT(loop.stats().preemptions, 0u) << "the cache was never short: the test does not exercise preemption";
+}
+
 TEST_P(EveryPolicy, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
     // The plan's acceptance test: 24 requests of different lengths all complete correctly,
     // requests join a batch that is already running and leave it when done (continuous
@@ -302,6 +343,40 @@ std::vector<TokenId> admission_order(const std::string& policy) {
 TEST(EngineLoop, HigherPriorityRequestsAreAdmittedFirstUnderThePriorityPolicy) {
     EXPECT_EQ(admission_order("priority"), (std::vector<TokenId>{100, 300, 200}));
     EXPECT_EQ(admission_order("fcfs"), (std::vector<TokenId>{100, 200, 300}));  // arrival order
+}
+
+TEST(EngineLoop, StreamedTokensCanBeReadBeforeTheRequestFinishes) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend);
+    const auto handle = loop.submit(streaming(params({5}, 4)));
+    ASSERT_TRUE(gate.wait_entered());  // prefilled (first token out), paused in the first decode
+
+    const auto first = handle.read_tokens(10s);
+    EXPECT_EQ(first.tokens, (std::vector<TokenId>{6}));
+    EXPECT_FALSE(first.finished);
+    EXPECT_TRUE(handle.read_tokens(1ms).tokens.empty());  // nothing new yet: the timeout passes
+    gate.open();
+    EXPECT_EQ(read_all(handle), (std::vector<TokenId>{7, 8, 9}));
+    EXPECT_EQ(handle.wait().tokens, (std::vector<TokenId>{6, 7, 8, 9}));
+}
+
+TEST(EngineLoop, AStreamEndsWithTheErrorWhenTheRequestFails) {
+    FakeBackend backend;
+    backend.fail_decode_after(1);  // the first decode works, the second fails
+    EngineLoop loop(backend);
+    const auto handle = loop.submit(streaming(params({1}, 10)));
+    EXPECT_EQ(read_all(handle), (std::vector<TokenId>{2, 3}));  // what was generated before the error
+    EXPECT_THROW(handle.wait(), std::runtime_error);
+}
+
+TEST(EngineLoop, OnlyStreamingRequestsCanBeRead) {
+    FakeBackend backend;
+    EngineLoop loop(backend);
+    const auto handle = loop.submit(params({1}, 2));
+    EXPECT_THROW(handle.read_tokens(1ms), std::logic_error);
+    EXPECT_EQ(finish(handle).tokens, (std::vector<TokenId>{2, 3}));
 }
 
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {
