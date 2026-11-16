@@ -45,7 +45,7 @@ def test_config_offers_exactly_the_engine_policies():
     from neuroserve.server.config import EngineSection
 
     allowed = typing.get_args(EngineSection.model_fields["scheduling_policy"].annotation)
-    assert set(allowed) == set(neuroserve.scheduling_policies) == {"fcfs", "token-budget", "decode-first"}
+    assert set(allowed) == set(neuroserve.scheduling_policies) == {"fcfs", "token-budget", "decode-first", "priority"}
 
 
 def test_unknown_scheduling_policy_is_rejected_before_loading():
@@ -78,6 +78,8 @@ def test_bad_requests_raise_python_exceptions(engine):
         engine.generate([1000] * 600, max_new_tokens=4)  # longer than max_prompt_tokens
     with pytest.raises(ValueError):
         engine.generate(prompt, max_new_tokens=0)        # nothing to generate
+    with pytest.raises(ValueError):
+        engine.run(prompt, 4, priority=3)                # priority is 0, 1 or 2
     kv = engine.kv_stats()
     assert kv["free_pages"] == kv["total_pages"], "KV pages leaked after errors"
 

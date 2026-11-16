@@ -1,0 +1,18 @@
+# The priority policy (aging off for this short trace). a and b fill both slots; then a low-, a
+# normal- and a high-priority request arrive in that order. As slots free up, h goes first, then n,
+# then l: by priority, not by arrival (FCFS would admit l, n, h).
+policy priority aging_ms=100000
+limits max_batch=2 total_pages=64 page_size=16 max_batch_tokens=64
+arrive step=0 id=a prompt=4 max_new=3
+arrive step=0 id=b prompt=4 max_new=5
+arrive step=1 id=l prompt=4 max_new=2 priority=0
+arrive step=1 id=n prompt=4 max_new=2 priority=1
+arrive step=1 id=h prompt=4 max_new=2 priority=2
+--- expected
+step 0 queued=[a b] running=[] preempt=[] admit=[a b] finished=[] tokens=8+0 free_pages=62
+step 1 queued=[l n h] running=[a b] preempt=[] admit=[] finished=[] tokens=0+2 free_pages=62
+step 2 queued=[l n h] running=[a b] preempt=[] admit=[] finished=[a] tokens=0+2 free_pages=63
+step 3 queued=[l n h] running=[b] preempt=[] admit=[h] finished=[] tokens=4+1 free_pages=62
+step 4 queued=[l n] running=[b h] preempt=[] admit=[] finished=[b h] tokens=0+2 free_pages=64
+step 5 queued=[l n] running=[] preempt=[] admit=[n l] finished=[] tokens=8+0 free_pages=62
+step 6 queued=[] running=[n l] preempt=[] admit=[] finished=[n l] tokens=0+2 free_pages=64

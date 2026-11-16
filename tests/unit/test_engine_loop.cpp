@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <future>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,7 @@ namespace {
 
 using neuroserve::TokenId;
 using neuroserve::core::EngineLoop;
+using neuroserve::core::EngineLoopOptions;
 using neuroserve::core::EngineStopped;
 using neuroserve::core::FinishReason;
 using neuroserve::core::GenerationParams;
@@ -133,8 +135,11 @@ TEST(EngineLoop, InvalidRequestsAreRejectedSynchronously) {
     EXPECT_THROW(loop.submit(params(std::vector<TokenId>(513, 1), 4)), std::invalid_argument);  // prompt too long
     EXPECT_THROW(loop.submit(params({1, 1000}, 4)), std::invalid_argument);              // outside vocabulary
     EXPECT_THROW(loop.submit(params(std::vector<TokenId>(500, 1), 600)), std::invalid_argument);  // > 1024 tokens
+    auto urgent = params({1}, 4);
+    urgent.priority = 3;
+    EXPECT_THROW(loop.submit(urgent), std::invalid_argument);                            // priority is 0..2
     const auto stats = loop.stats();
-    EXPECT_EQ(stats.rejected, 5u);
+    EXPECT_EQ(stats.rejected, 6u);
     EXPECT_EQ(stats.submitted, 0u);
     EXPECT_EQ(stats.pending, 0u);
 }
@@ -186,8 +191,11 @@ TEST(EngineLoop, HundredConcurrentSubmittersAllCompleteCorrectly) {
 // the same tokens; only the order and timing of the work may differ.
 class EveryPolicy : public ::testing::TestWithParam<std::string> {};
 
-INSTANTIATE_TEST_SUITE_P(Policies, EveryPolicy,
-                         ::testing::Values("fcfs", "token-budget", "decode-first"),
+std::vector<std::string> all_policies() {
+    return {std::begin(neuroserve::core::kPolicyNames), std::end(neuroserve::core::kPolicyNames)};
+}
+
+INSTANTIATE_TEST_SUITE_P(Policies, EveryPolicy, ::testing::ValuesIn(all_policies()),
                          [](const ::testing::TestParamInfo<std::string>& param_info) {
                              std::string name = param_info.param;
                              std::replace(name.begin(), name.end(), '-', '_');  // test names: no '-'
@@ -263,6 +271,37 @@ TEST_P(EveryPolicy, TwentyFourRequestsJoinAndLeaveTheRunningBatch) {
     EXPECT_EQ(loop.stats().completed, 24u);
     EXPECT_EQ(backend.live_sequences(), 0);
     EXPECT_EQ(loop.kv_stats().free_pages, loop.kv_stats().total_pages) << "KV pages leaked";
+}
+
+// Runs one request, queues a low- and then a high-priority request behind it (one slot), and
+// returns the order in which the three were prefilled, by the first token of their prompts.
+std::vector<TokenId> admission_order(const std::string& policy) {
+    FakeBackend backend;
+    backend.record_batches = true;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoopOptions options{.max_batch = 1, .policy = policy, .policy_options = {.priority_aging_ms = 3'600'000}};
+    EngineLoop loop(backend, options);
+    const auto request = [](TokenId first, int priority) {
+        auto p = params({first}, 3);
+        p.priority = priority;
+        return p;
+    };
+    auto running = loop.submit(request(100, neuroserve::core::kNormalPriority));
+    EXPECT_TRUE(gate.wait_entered());  // 100 is running; the engine is paused in its first decode
+    auto low = loop.submit(request(200, neuroserve::core::kLowPriority));
+    auto high = loop.submit(request(300, neuroserve::core::kHighPriority));
+    gate.open();
+    for (const auto* handle : {&running, &low, &high}) {
+        EXPECT_TRUE(handle->wait_for(10s));
+    }
+    loop.stop();
+    return backend.prefill_first_tokens;
+}
+
+TEST(EngineLoop, HigherPriorityRequestsAreAdmittedFirstUnderThePriorityPolicy) {
+    EXPECT_EQ(admission_order("priority"), (std::vector<TokenId>{100, 300, 200}));
+    EXPECT_EQ(admission_order("fcfs"), (std::vector<TokenId>{100, 200, 300}));  // arrival order
 }
 
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {

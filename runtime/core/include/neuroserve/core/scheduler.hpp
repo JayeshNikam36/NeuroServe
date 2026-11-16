@@ -24,12 +24,19 @@
 // prompt cannot stall every running request; decode tokens are counted first.
 namespace neuroserve::core {
 
+// Request priorities: a higher number is more urgent. Only the "priority" policy uses them.
+inline constexpr int kLowPriority = 0;
+inline constexpr int kNormalPriority = 1;
+inline constexpr int kHighPriority = 2;
+
 struct QueuedRequest {
     std::string id;
     int prompt_tokens = 0;
     int max_new_tokens = 0;
     int pages = 0;         // pages its prefill needs if admitted now
     int waited_steps = 0;  // engine steps it has waited since it was (re)queued
+    int priority = kNormalPriority;
+    long long age_ms = 0;  // time since the request arrived (not reset by preemption)
 };
 
 struct RunningRequest {
@@ -38,6 +45,8 @@ struct RunningRequest {
     int next_step_pages = 0;  // new pages its decode in this step needs (0 or 1)
     int generated_tokens = 0;
     int max_new_tokens = 0;
+    int priority = kNormalPriority;
+    long long age_ms = 0;  // time since the request arrived
 };
 
 struct SchedulerInput {
@@ -110,11 +119,37 @@ public:
     ScheduleDecision schedule(const SchedulerInput& input) override;
 };
 
-// The policies make_policy knows, by config name.
-inline constexpr std::string_view kPolicyNames[] = {"fcfs", "token-budget", "decode-first"};
+// Serves urgent requests first without starving the rest. Each request has a priority (0 low,
+// 1 normal, 2 high); its effective priority rises one level for every aging_ms since it arrived,
+// up to high. Admission goes by effective priority, then queue order, and stops at the first
+// request that does not fit. So once a request has aged to high, nothing that arrives later can
+// overtake it: a request of priority p waits at most (2 - p) x aging_ms, plus the time the
+// requests ahead of it need to make room. Under memory pressure it preempts the lowest effective
+// priority first (the most recently admitted among equals), and never the oldest running request.
+// Trade-off vs FCFS: lower queueing for urgent work; low-priority work waits longer, bounded by aging.
+class PriorityPolicy final : public SchedulingPolicy {
+public:
+    explicit PriorityPolicy(int aging_ms = 1000);  // std::invalid_argument if aging_ms < 1
+    std::string_view name() const noexcept override { return "priority"; }
+    ScheduleDecision schedule(const SchedulerInput& input) override;
+    int aging_ms() const noexcept { return aging_ms_; }
+    // priority + one level per aging_ms of age, capped at kHighPriority.
+    int effective_priority(int priority, long long age_ms) const noexcept;
 
-// Creates a policy by its config name ("fcfs", "token-budget" or "decode-first") with default
-// settings. Throws std::invalid_argument for an unknown name.
-std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name);
+private:
+    int aging_ms_;
+};
+
+// The policies make_policy knows, by config name.
+inline constexpr std::string_view kPolicyNames[] = {"fcfs", "token-budget", "decode-first", "priority"};
+
+// Settings for the policies make_policy creates.
+struct PolicyOptions {
+    int priority_aging_ms = 1000;  // "priority": one level up per this many ms since arrival
+};
+
+// Creates a policy by its config name ("fcfs", "token-budget", "decode-first" or "priority").
+// Throws std::invalid_argument for an unknown name or a bad option.
+std::unique_ptr<SchedulingPolicy> make_policy(std::string_view name, const PolicyOptions& options = {});
 
 }  // namespace neuroserve::core

@@ -26,9 +26,10 @@ def small_engine(refs):
 
 
 @needs_model
-@pytest.mark.parametrize("policy", ["fcfs", "token-budget", "decode-first"])
+@pytest.mark.parametrize("policy", neuroserve.scheduling_policies)
 def test_preempted_requests_restart_and_still_match_hugging_face(small_engine, refs, policy):
     # Every policy must produce exactly the Hugging Face tokens; only the order of the work differs.
+    # Mixed priorities: the priority policy reorders and preempts by them; the others ignore them.
     small_engine.set_scheduling_policy(policy)
     before = small_engine.stats()
     jobs = [refs[i % 8] for i in range(24)]
@@ -38,7 +39,7 @@ def test_preempted_requests_restart_and_still_match_hugging_face(small_engine, r
     def worker(k: int) -> None:
         try:
             prompt, expected = jobs[k]
-            results[k] = small_engine.generate(prompt, max_new_tokens=len(expected))
+            results[k] = small_engine.run(prompt, len(expected), priority=k % 3).tokens
         except Exception as exc:  # collected and reported below
             errors.append(exc)
 

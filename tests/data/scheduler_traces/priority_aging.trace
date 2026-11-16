@@ -1,0 +1,35 @@
+# Starvation bound of the priority policy (aging_ms=40; one simulated step is 10 ms). The low-
+# priority request arrives together with a stream of urgent ones that keeps the single slot busy.
+# Every 40 ms of waiting raises it one level: at step 8 (80 ms) it is high priority too, and ahead
+# of every urgent request still queued, because it arrived first. Without aging it would wait for
+# the whole stream.
+policy priority aging_ms=40
+limits max_batch=1 total_pages=64 page_size=16 max_batch_tokens=64
+arrive step=0 id=low prompt=4 max_new=2 priority=0
+arrive step=0 id=h0 prompt=4 max_new=2 priority=2
+arrive step=1 id=h1 prompt=4 max_new=2 priority=2
+arrive step=2 id=h2 prompt=4 max_new=2 priority=2
+arrive step=3 id=h3 prompt=4 max_new=2 priority=2
+arrive step=4 id=h4 prompt=4 max_new=2 priority=2
+arrive step=5 id=h5 prompt=4 max_new=2 priority=2
+arrive step=6 id=h6 prompt=4 max_new=2 priority=2
+arrive step=7 id=h7 prompt=4 max_new=2 priority=2
+--- expected
+step 0 queued=[low h0] running=[] preempt=[] admit=[h0] finished=[] tokens=4+0 free_pages=63
+step 1 queued=[low h1] running=[h0] preempt=[] admit=[] finished=[h0] tokens=0+1 free_pages=64
+step 2 queued=[low h1 h2] running=[] preempt=[] admit=[h1] finished=[] tokens=4+0 free_pages=63
+step 3 queued=[low h2 h3] running=[h1] preempt=[] admit=[] finished=[h1] tokens=0+1 free_pages=64
+step 4 queued=[low h2 h3 h4] running=[] preempt=[] admit=[h2] finished=[] tokens=4+0 free_pages=63
+step 5 queued=[low h3 h4 h5] running=[h2] preempt=[] admit=[] finished=[h2] tokens=0+1 free_pages=64
+step 6 queued=[low h3 h4 h5 h6] running=[] preempt=[] admit=[h3] finished=[] tokens=4+0 free_pages=63
+step 7 queued=[low h4 h5 h6 h7] running=[h3] preempt=[] admit=[] finished=[h3] tokens=0+1 free_pages=64
+step 8 queued=[low h4 h5 h6 h7] running=[] preempt=[] admit=[low] finished=[] tokens=4+0 free_pages=63
+step 9 queued=[h4 h5 h6 h7] running=[low] preempt=[] admit=[] finished=[low] tokens=0+1 free_pages=64
+step 10 queued=[h4 h5 h6 h7] running=[] preempt=[] admit=[h4] finished=[] tokens=4+0 free_pages=63
+step 11 queued=[h5 h6 h7] running=[h4] preempt=[] admit=[] finished=[h4] tokens=0+1 free_pages=64
+step 12 queued=[h5 h6 h7] running=[] preempt=[] admit=[h5] finished=[] tokens=4+0 free_pages=63
+step 13 queued=[h6 h7] running=[h5] preempt=[] admit=[] finished=[h5] tokens=0+1 free_pages=64
+step 14 queued=[h6 h7] running=[] preempt=[] admit=[h6] finished=[] tokens=4+0 free_pages=63
+step 15 queued=[h7] running=[h6] preempt=[] admit=[] finished=[h6] tokens=0+1 free_pages=64
+step 16 queued=[h7] running=[] preempt=[] admit=[h7] finished=[] tokens=4+0 free_pages=63
+step 17 queued=[] running=[h7] preempt=[] admit=[] finished=[h7] tokens=0+1 free_pages=64

@@ -12,7 +12,8 @@ engine:
   max_batch_tokens: 512                     # tokens per engine step (prefill + decode); >= max_prompt_tokens
   max_pages_per_sequence: 64                # 1024 tokens per sequence (prompt + output)
   device_index: 0
-  scheduling_policy: fcfs                  # fcfs | token-budget | decode-first; see docs/scheduling.md
+  scheduling_policy: fcfs                  # fcfs | token-budget | decode-first | priority; see docs/scheduling.md
+  priority_aging_ms: 1000                  # priority policy: +1 level per second of waiting
 
 limits:
   default_max_tokens: 128                   # used when a request sets no max_tokens

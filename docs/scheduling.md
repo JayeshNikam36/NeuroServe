@@ -42,10 +42,33 @@ this engine, so it regenerates exactly the same tokens (tested on the GPU agains
 | `fcfs` | Most recently admitted first, never the oldest, only when the batch cannot grow | In arrival order while slots, pages and the token budget last; stops at the first that does not fit | No starvation or livelock; head-of-line blocking leaves capacity idle |
 | `token-budget` | As `fcfs` | In arrival order, skipping requests that do not fit so smaller ones can use the room; a request that has waited `max_wait_steps` (16) steps can no longer be overtaken | Higher utilisation and less queueing for short prompts; long prompts wait longer, bounded by the aging rule |
 | `decode-first` | As `fcfs` | In strict arrival order, but while requests are decoding a step's prefills are capped at a quarter of the token budget | Smoother time between tokens for running requests; new requests start later |
+| `priority` | Lowest effective priority first (newest among equals), never the oldest | By effective priority, then queue order; stops at the first that does not fit | Less queueing for urgent requests; low-priority work waits longer, bounded by aging |
 
 Every policy must produce exactly the same tokens for every request; only the order and timing of
 the work differ. The engine-loop correctness tests run once per policy, and so does the GPU
 preemption test (token-exact against Hugging Face).
+
+## Priorities and aging
+
+A request has a priority: 0 (low), 1 (normal, the default) or 2 (high). Over HTTP it is
+`"neuroserve": {"priority": 2}`; in Python, `Engine.run(..., priority=2)`. Only the `priority`
+policy uses it; the other policies ignore it.
+
+The policy works with an **effective priority**: the request's priority plus one level for every
+`engine.priority_aging_ms` (default 1000 ms) since it arrived, capped at 2. Age counts from
+arrival, so preemption does not reset it. Admission goes by effective priority and then queue
+order, and stops at the first request that does not fit. Once a request has aged to 2, every
+request that arrives later is behind it in the queue, so nothing can overtake it any more:
+a request of priority `p` waits at most `(2 - p) × priority_aging_ms`, plus the time the requests
+ahead of it need to make room. `tests/data/scheduler_traces/priority_aging.trace` shows the bound
+against a stream of urgent requests, and `Priority.ALowPriorityRequestIsNotStarvedByAStreamOfUrgentOnes`
+checks it with and without aging.
+
+Under memory pressure the policy preempts the lowest effective priority first, so an urgent
+request is not the one restarted (`priority_preemption.trace`). A low-priority request can be
+preempted more than once; it still finishes, because the oldest running request is never preempted
+and its own priority rises while it waits. Aging uses wall-clock time in the engine and simulated
+time in the traces (10 ms per step), so the policy stays a pure function of its input. See ADR-0005.
 
 The policy can be switched on a running engine (`Engine.set_scheduling_policy(name)` in Python,
 `EngineLoop::set_policy` in C++); the switch takes effect at the next step, which allows A/B

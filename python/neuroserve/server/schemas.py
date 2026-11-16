@@ -14,6 +14,7 @@ class NeuroServeOptions(BaseModel):
 
     return_token_ids: bool = False  # include the completion token ids in the response
     ignore_eos: bool = False        # generate exactly max_tokens; do not stop at stop tokens
+    priority: int = Field(default=1, ge=0, le=2)  # 0 low, 1 normal, 2 high (used by the "priority" policy)
 
 
 class _GenerationRequest(BaseModel):

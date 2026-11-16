@@ -45,13 +45,15 @@ class FakeEngine:
         self.calls: list[tuple[list[int], int]] = []
         self.stop_token_ids: list[list[int]] = []
         self.client_request_ids: list[str] = []
+        self.priorities: list[int] = []
 
-    def run(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id=""):
+    def run(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
         if self.error is not None:
             raise self.error
         self.calls.append((list(prompt_ids), max_new_tokens))
         self.stop_token_ids.append(list(stop_token_ids))
         self.client_request_ids.append(client_request_id)
+        self.priorities.append(priority)
         out = []
         for token in (self.reply_ids + [self.filler] * max_new_tokens)[:max_new_tokens]:
             out.append(token)
@@ -144,6 +146,8 @@ def test_temperature_zero_is_accepted(tok):
     ({"max_tokens": 0}, 400, "max_tokens"),
     ({"messages": []}, 400, "messages"),
     ({"messages": [{"role": "robot", "content": "hi"}]}, 400, "messages.0.role"),
+    ({"neuroserve": {"priority": 3}}, 400, "neuroserve.priority"),
+    ({"neuroserve": {"priority": -1}}, 400, "neuroserve.priority"),
 ])
 def test_bad_requests_get_openai_errors(tok, overrides, status, param):
     app, engine, _ = make_app(tok)
@@ -240,6 +244,15 @@ def test_stop_tokens_and_request_id_are_passed_to_the_engine(tok):
     assert set(engine.stop_token_ids[0]) == set(tok.stop_token_ids)  # the engine stops, not Python
     assert engine.stop_token_ids[1] == []                             # ignore_eos: no stop tokens
     assert engine.client_request_ids[0] == "trace-42"                 # links engine logs to the request
+
+
+def test_priority_is_passed_to_the_engine(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        client.post("/v1/chat/completions", json=chat_body())
+        client.post("/v1/chat/completions", json=chat_body(neuroserve={"priority": 2}))
+        client.post("/v1/completions", json={"model": MODEL_NAME, "prompt": "hi", "neuroserve": {"priority": 0}})
+    assert engine.priorities == [1, 2, 0]  # normal by default
 
 
 @pytest.mark.parametrize("payload, param", [

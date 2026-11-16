@@ -33,7 +33,9 @@ class EngineSection(_Strict):
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
     # which requests are admitted and preempted each step; see docs/scheduling.md
-    scheduling_policy: Literal["fcfs", "token-budget", "decode-first"] = "fcfs"
+    scheduling_policy: Literal["fcfs", "token-budget", "decode-first", "priority"] = "fcfs"
+    # "priority" policy: a waiting request rises one priority level per this many ms (no starvation)
+    priority_aging_ms: int = Field(default=1000, ge=1)
 
 
 class LimitsSection(_Strict):
