@@ -583,6 +583,140 @@ TEST(EngineLoop, TokensRegeneratedAfterPreemptionAreNotTimedTwice) {
     EXPECT_EQ(loop.latency().ttft_ms.count, 6u);
 }
 
+// ---- Decision log ------------------------------------------------------------------------------
+
+using neuroserve::core::DecisionAction;
+using neuroserve::core::Explanation;
+
+std::vector<Explanation> decisions_for(const EngineLoop& loop, const std::string& request_id) {
+    std::vector<Explanation> out;
+    for (const auto& e : loop.decisions(0, 100'000).decisions) {
+        if (e.request_id == request_id) {
+            out.push_back(e);
+        }
+    }
+    return out;
+}
+
+std::int64_t number(const Explanation& e, const std::string& key) {
+    for (const auto& [name, value] : e.numbers) {
+        if (name == key) {
+            return value;
+        }
+    }
+    ADD_FAILURE() << "explanation " << e.seq << " has no number '" << key << "'";
+    return -1;
+}
+
+TEST(EngineLoop, ExplainsWhyAQueuedRequestWaitsAndWhenItIsAdmitted) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 1});
+    const auto running = loop.submit(params({1}, 10));  // holds the only slot for several more steps
+    ASSERT_TRUE(gate.wait_entered());
+    const auto waiting = loop.submit(params({10}, 3));
+    gate.open();
+    finish(running);
+    finish(waiting);
+
+    const auto log = decisions_for(loop, waiting.id());
+    ASSERT_EQ(log.size(), 2u);                  // deferred once (not once per step), then admitted
+    EXPECT_EQ(log[0].action, DecisionAction::kDefer);
+    EXPECT_EQ(log[0].reason, "batch_full");
+    EXPECT_EQ(number(log[0], "slots_free"), 0);
+    EXPECT_EQ(log[1].action, DecisionAction::kAdmit);
+    EXPECT_EQ(number(log[1], "slots_free"), 1);
+    EXPECT_EQ(log[1].policy, "fcfs");
+    EXPECT_LT(log[0].step, log[1].step);
+}
+
+TEST(EngineLoop, ExplainsHeadOfLineBlockingWithItsNumbers) {
+    FakeBackend backend(1000, /*total_pages=*/8);  // 16 tokens per page
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 8});
+    const auto running = loop.submit(params({1}, 63));
+    ASSERT_TRUE(gate.wait_entered());
+    const auto big = loop.submit(params(std::vector<TokenId>(120, 7), 1));  // needs all 8 pages
+    const auto small = loop.submit(params({50}, 2));                         // needs 1 page
+    gate.open();
+    for (const auto* handle : {&running, &big, &small}) {
+        finish(*handle);
+    }
+
+    const auto big_first = decisions_for(loop, big.id()).front();
+    EXPECT_EQ(big_first.reason, "kv_pages");     // short of pages: 8 needed, fewer free
+    EXPECT_GT(number(big_first, "pages_needed"), number(big_first, "free_pages"));
+
+    const auto small_first = decisions_for(loop, small.id()).front();
+    EXPECT_EQ(small_first.reason, "held_by_policy");  // it would fit, but FCFS keeps arrival order
+    EXPECT_LE(number(small_first, "pages_needed"), number(small_first, "free_pages"));
+}
+
+TEST(EngineLoop, EveryPreemptionAndAdmissionIsExplained) {
+    FakeBackend backend(1000, /*total_pages=*/8);
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 8});
+    std::vector<RequestHandle> handles;
+    for (TokenId i = 0; i < 6; ++i) {
+        handles.push_back(loop.submit(params({i}, 63)));
+    }
+    gate.open();
+    for (const auto& handle : handles) {
+        finish(handle);
+    }
+    loop.stop();
+    const auto stats = loop.stats();
+    ASSERT_GT(stats.preemptions, 0u);
+    std::uint64_t admits = 0;
+    std::uint64_t preempts = 0;
+    for (const auto& e : loop.decisions(0, 100'000).decisions) {
+        if (e.action == DecisionAction::kAdmit) {
+            ++admits;
+        } else if (e.action == DecisionAction::kPreempt) {
+            ++preempts;
+            EXPECT_EQ(e.reason, "kv_pressure");
+            EXPECT_GT(number(e, "pages_needed_to_grow"), number(e, "free_pages"));  // why it had to happen
+        }
+    }
+    EXPECT_EQ(preempts, stats.preemptions);
+    EXPECT_EQ(admits, 6u + stats.preemptions);  // every (re)admission
+}
+
+TEST(EngineLoop, RejectionsAreExplained) {
+    FakeBackend backend;
+    FirstDecodeGate gate;
+    gate.install(backend);
+    EngineLoop loop(backend, {.max_batch = 1, .max_queue = 1, .queue_timeout_ms = 50});
+    const auto running = loop.submit(params({1}, 3));
+    ASSERT_TRUE(gate.wait_entered());
+    const auto waiting = loop.submit(params({10}, 3));
+    EXPECT_THROW(loop.submit(params({20}, 3)), neuroserve::core::QueueFull);
+    EXPECT_THROW(loop.submit(params({}, 3)), std::invalid_argument);
+    std::this_thread::sleep_for(100ms);
+    gate.open();
+    EXPECT_THROW(finish(waiting), neuroserve::core::QueueTimeout);
+    finish(running);
+
+    std::vector<std::string> reasons;
+    for (const auto& e : loop.decisions(0, 100'000).decisions) {
+        if (e.action == DecisionAction::kReject) {
+            reasons.push_back(e.reason);
+            if (e.reason == "queue_full") {
+                EXPECT_EQ(number(e, "queued"), 1);
+                EXPECT_EQ(number(e, "max_queue"), 1);
+            }
+            if (e.reason == "queue_timeout") {
+                EXPECT_EQ(e.request_id, waiting.id());
+                EXPECT_GE(number(e, "waited_ms"), 50);
+            }
+        }
+    }
+    EXPECT_EQ(reasons, (std::vector<std::string>{"queue_full", "invalid", "queue_timeout"}));
+}
+
 TEST(EngineLoop, NoStepExceedsTheTokenBudget) {
     // Prompts of 40-100 tokens against a 128-token budget: at most one or two prefills fit next to
     // the running decodes in any step. Every step stays within the budget, and every request still

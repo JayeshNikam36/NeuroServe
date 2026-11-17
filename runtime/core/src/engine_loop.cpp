@@ -46,6 +46,7 @@ struct EngineLoop::Entry {
     Request::Clock::time_point last_token_at{};
     double itl_sum_ms = 0.0;
     double itl_max_ms = 0.0;
+    std::string last_defer_reason;  // a deferral is logged when its reason changes, not every step
 };
 
 namespace {
@@ -134,7 +135,8 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     : backend_(backend),
       options_(std::move(options)),
       model_info_(backend.model_info()),
-      policy_(policy ? std::move(policy) : make_policy(options_.policy, options_.policy_options)) {
+      policy_(policy ? std::move(policy) : make_policy(options_.policy, options_.policy_options)),
+      decision_log_(static_cast<std::size_t>(std::max(options_.decision_log_capacity, 0))) {
     if (options_.max_batch < 1) {
         throw std::invalid_argument("max_batch must be at least 1");
     }
@@ -221,6 +223,9 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
                     {"request_id", entry->params.client_request_id}, {"error", std::string(e.what())}});
         std::lock_guard lock(mu_);
         ++stats_.rejected;
+        record_locked(*entry, DecisionAction::kReject, "invalid",
+                      {{"prompt_tokens", static_cast<std::int64_t>(entry->params.prompt.size())},
+                       {"max_new_tokens", entry->params.max_new_tokens}});
         throw;
     }
     entry->request.transition_to(RequestState::kValidated);
@@ -230,11 +235,14 @@ RequestHandle EngineLoop::submit(GenerationParams params) {
         if (stop_) {
             entry->request.transition_to(RequestState::kRejected);
             ++stats_.rejected;
+            record_locked(*entry, DecisionAction::kReject, "engine_stopped", {});
             throw EngineStopped("the engine is stopped");
         }
         if (pending_.size() >= static_cast<std::size_t>(options_.max_queue)) {
             entry->request.transition_to(RequestState::kRejected);
             ++stats_.rejected;
+            record_locked(*entry, DecisionAction::kReject, "queue_full",
+                          {{"queued", static_cast<std::int64_t>(pending_.size())}, {"max_queue", options_.max_queue}});
             log::write(log::Level::kInfo, kLogger, "request rejected",
                        {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
                         {"reason", "queue full"}, {"max_queue", options_.max_queue}});
@@ -421,6 +429,9 @@ void EngineLoop::expire_queued() {
             // restarted as soon as there is room, so it is not rejected halfway.
             const auto queued = entry->request.entered_at(RequestState::kQueued);
             if (entry->request.preemption_count() == 0 && queued && now - *queued >= limit) {
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - *queued);
+                record_locked(*entry, DecisionAction::kReject, "queue_timeout",
+                              {{"waited_ms", waited.count()}, {"queue_timeout_ms", options_.queue_timeout_ms}});
                 expired.push_back(std::move(entry));
             }
         }
@@ -443,6 +454,86 @@ void EngineLoop::expire_queued() {
     }
 }
 
+void EngineLoop::record_locked(const Entry& entry, DecisionAction action, std::string reason,
+                               std::vector<std::pair<std::string, std::int64_t>> numbers) {
+    Explanation e;
+    e.step = step_;
+    e.unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+    e.request_id = entry.request.id();
+    e.client_request_id = entry.params.client_request_id;
+    e.action = action;
+    e.reason = std::move(reason);
+    e.policy = policy_name_;
+    e.numbers = std::move(numbers);
+    decision_log_.add(std::move(e));
+}
+
+// Explains one scheduling decision with the numbers it was made on. The reasons are derived by the
+// engine, the same way for every policy: replay the decision against the step's resources and,
+// for each request the policy did not admit, name the first resource that was short. If none was,
+// the policy itself held the request back (its ordering rule or its prefill cap).
+void EngineLoop::explain_locked(const SchedulerInput& input, const ScheduleDecision& decision) {
+    using N = std::int64_t;
+    N growth = 0;
+    for (const auto& r : input.running) {
+        growth += r.next_step_pages;
+    }
+    N pages_left = input.free_pages;
+    N kept = static_cast<N>(input.running.size());
+    for (const std::size_t i : decision.preempt) {
+        const auto& r = input.running[i];
+        record_locked(*active_[i], DecisionAction::kPreempt, "kv_pressure",
+                      {{"free_pages", input.free_pages}, {"pages_needed_to_grow", growth},
+                       {"pages_held", r.pages}, {"generated_tokens", r.generated_tokens}, {"priority", r.priority}});
+        pages_left += r.pages;
+        growth -= r.next_step_pages;
+        --kept;
+    }
+    pages_left -= growth;
+    N slots_left = input.max_batch - kept;
+    N budget_left = input.max_step_tokens - kept;  // every running request decodes one token
+
+    std::vector<bool> admitted(input.queued.size(), false);
+    for (const std::size_t i : decision.admit) {
+        const auto& q = input.queued[i];
+        record_locked(*pending_[i], DecisionAction::kAdmit, "admitted",
+                      {{"prompt_tokens", q.prompt_tokens}, {"pages_needed", q.pages}, {"free_pages", pages_left},
+                       {"slots_free", slots_left}, {"token_budget_left", budget_left},
+                       {"waited_steps", q.waited_steps}, {"queue_position", static_cast<N>(i)}, {"priority", q.priority}});
+        pending_[i]->last_defer_reason.clear();
+        admitted[i] = true;
+        pages_left -= q.pages;
+        budget_left -= q.prompt_tokens;
+        --slots_left;
+    }
+    for (std::size_t i = 0; i < input.queued.size(); ++i) {
+        if (admitted[i]) {
+            continue;
+        }
+        const auto& q = input.queued[i];
+        std::string reason = !decision.preempt.empty() ? "kv_pressure"      // no admissions while memory is short
+                           : slots_left <= 0           ? "batch_full"
+                           : q.pages > pages_left      ? "kv_pages"
+                           : q.prompt_tokens > budget_left ? "token_budget"
+                                                           : "held_by_policy";
+        Entry& entry = *pending_[i];
+        if (reason == entry.last_defer_reason) {
+            continue;  // already explained; logging it every step would flood the log
+        }
+        entry.last_defer_reason = reason;
+        record_locked(entry, DecisionAction::kDefer, std::move(reason),
+                      {{"prompt_tokens", q.prompt_tokens}, {"pages_needed", q.pages}, {"free_pages", pages_left},
+                       {"slots_free", slots_left}, {"token_budget_left", budget_left},
+                       {"waited_steps", q.waited_steps}, {"queue_position", static_cast<N>(i)}, {"priority", q.priority}});
+    }
+}
+
+DecisionPage EngineLoop::decisions(std::uint64_t since, std::size_t limit) const {
+    std::lock_guard lock(mu_);
+    return decision_log_.since(since, limit);
+}
+
 void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted,
                                  std::vector<EntryPtr>& preempted) {
     if (next_policy_) {  // set_policy() was called: switch between steps
@@ -454,6 +545,7 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     if (pending_.empty() && active_.empty()) {
         return;
     }
+    ++step_;
     // The policy decides; the loop checks the decision and applies it.
     SchedulerInput input;
     input.max_batch = options_.max_batch;
@@ -480,6 +572,7 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     }
     const ScheduleDecision decision = policy_->schedule(input);
     check_decision(input, decision);  // a faulty policy stops the engine loudly (see run())
+    explain_locked(input, decision);
 
     for (const std::size_t index : decision.preempt) {
         preempted.push_back(std::move(active_[index]));  // leaves an empty slot, removed below
@@ -507,6 +600,7 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
         entry->tokens.clear();  // restart from the prompt: greedy decoding regenerates the same tokens
         entry->cached = 0;
         entry->waited_steps = 0;
+        entry->last_defer_reason.clear();  // back in the queue: its next deferral is news again
         entry->request.transition_to(RequestState::kPreempted);
         entry->request.transition_to(RequestState::kQueued);
         log::write(log::Level::kInfo, kLogger, "request preempted",

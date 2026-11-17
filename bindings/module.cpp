@@ -149,6 +149,33 @@ public:
         loop_->set_policy(core::make_policy(name, policy_options_));  // unknown name: ValueError; next step on
     }
 
+    py::dict decisions(std::uint64_t since, std::size_t limit) const {
+        const core::DecisionPage page = loop_->decisions(since, limit);
+        py::list data;
+        for (const auto& e : page.decisions) {
+            py::dict numbers;
+            for (const auto& [name, value] : e.numbers) {
+                numbers[py::str(name)] = value;
+            }
+            py::dict d;
+            d["seq"] = e.seq;
+            d["step"] = e.step;
+            d["time_ms"] = e.unix_ms;
+            d["request_id"] = e.request_id;
+            d["client_request_id"] = e.client_request_id;
+            d["action"] = std::string(core::to_string(e.action));
+            d["reason"] = e.reason;
+            d["policy"] = e.policy;
+            d["numbers"] = numbers;
+            data.append(d);
+        }
+        py::dict out;
+        out["data"] = data;
+        out["next_since"] = page.next_since;
+        out["dropped"] = page.dropped;
+        return out;
+    }
+
     py::dict latency() const {
         const core::LatencyStats l = loop_->latency();
         const auto summary = [](const core::LatencySummary& s) {
@@ -251,19 +278,23 @@ PYBIND11_MODULE(_core, m) {
         .def(py::init([](const std::string& model_dir, int max_prompt_tokens, int num_pages,
                          int max_batch, int max_batch_tokens, int max_pages_per_sequence, int device_index,
                          const std::string& scheduling_policy, int priority_aging_ms, int max_queue,
-                         int queue_timeout_ms) {
+                         int queue_timeout_ms, int decision_log_capacity) {
                  core::EngineLoopOptions loop_options;
                  loop_options.max_batch = max_batch;
                  loop_options.max_batch_tokens = max_batch_tokens;
                  loop_options.policy_options.priority_aging_ms = priority_aging_ms;
                  loop_options.max_queue = max_queue;
                  loop_options.queue_timeout_ms = queue_timeout_ms;
+                 loop_options.decision_log_capacity = decision_log_capacity;
                  // Bad options raise ValueError here, before the weights are loaded.
                  if (max_queue < 1) {
                      throw std::invalid_argument("max_queue must be at least 1");
                  }
                  if (queue_timeout_ms < 0) {
                      throw std::invalid_argument("queue_timeout_ms must be 0 (no timeout) or more");
+                 }
+                 if (decision_log_capacity < 1) {
+                     throw std::invalid_argument("decision_log_capacity must be at least 1");
                  }
                  auto policy = core::make_policy(scheduling_policy, loop_options.policy_options);
                  ns::CudaLlmEngineConfig config;
@@ -280,7 +311,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("max_prompt_tokens") = 512, py::arg("num_pages") = 2048,
              py::arg("max_batch") = 8, py::arg("max_batch_tokens") = 512, py::arg("max_pages_per_sequence") = 64,
              py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs",
-             py::arg("priority_aging_ms") = 1000, py::arg("max_queue") = 1024, py::arg("queue_timeout_ms") = 0)
+             py::arg("priority_aging_ms") = 1000, py::arg("max_queue") = 1024, py::arg("queue_timeout_ms") = 0,
+             py::arg("decision_log_capacity") = 4096)
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",
@@ -305,6 +337,9 @@ PYBIND11_MODULE(_core, m) {
         .def("model_info", &Engine::model_info)
         .def("kv_stats", &Engine::kv_stats)
         .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.")
+        .def("decisions", &Engine::decisions, py::arg("since") = 0, py::arg("limit") = 100,
+             "Why requests were admitted, deferred, rejected or preempted, with the numbers each decision was "
+             "made on: {'data': [...], 'next_since': cursor, 'dropped': missed}. Pass next_since back as since.")
         .def("latency", &Engine::latency,
              "Latency since start, per metric (queue_ms, ttft_ms, itl_ms, e2e_ms): count, mean, p50, p95, p99, "
              "max. Fixed-bucket histograms: percentiles are within one bucket (about 9%) of the exact value.")

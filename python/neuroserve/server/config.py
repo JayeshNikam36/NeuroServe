@@ -40,6 +40,8 @@ class EngineSection(_Strict):
     # admitted within queue_timeout_ms is rejected with 503 (0 = wait as long as it takes).
     max_queue: int = Field(default=256, ge=1)
     queue_timeout_ms: int = Field(default=30000, ge=0)
+    # Scheduling explanations kept for GET /v1/runtime/decisions (the newest; older ones are dropped).
+    decision_log_capacity: int = Field(default=4096, ge=1)
 
 
 class LimitsSection(_Strict):

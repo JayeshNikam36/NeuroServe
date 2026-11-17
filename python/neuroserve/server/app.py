@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
@@ -331,6 +331,15 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
             "data": [{"id": config.model.name, "object": "model",
                       "created": request.app.state.created, "owned_by": "neuroserve"}],
         }
+
+    @app.get("/v1/runtime/decisions")
+    async def decisions(request: Request, since: int = Query(default=0, ge=0),
+                        limit: int = Query(default=100, ge=1, le=1000)) -> dict:
+        """The scheduler's explanations newer than `since`, oldest first (see docs/scheduling.md)."""
+        svc: EngineService = request.app.state.service
+        page = svc.decisions(since, limit)
+        return {"object": "list", "data": page["data"], "next_since": page["next_since"],
+                "dropped": page["dropped"]}
 
     @app.delete("/v1/requests/{request_id}")
     async def cancel_request(request_id: str, request: Request) -> dict:

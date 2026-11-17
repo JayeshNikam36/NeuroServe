@@ -147,6 +147,13 @@ class FakeEngine:
         summary = {"count": len(self.calls), "mean": 1.0, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0}
         return {name: dict(summary) for name in ("queue_ms", "ttft_ms", "itl_ms", "e2e_ms")}
 
+    def decisions(self, since=0, limit=100):
+        log = [{"seq": i, "step": i, "time_ms": 0, "request_id": f"ns-{i:06d}", "client_request_id": "",
+                "action": "admit", "reason": "admitted", "policy": "fcfs", "numbers": {"free_pages": 64}}
+               for i in range(1, 6)]
+        page = [d for d in log if d["seq"] > since][:limit]
+        return {"data": page, "next_since": page[-1]["seq"] if page else since, "dropped": 0}
+
 
 @pytest.fixture(scope="module")
 def tok() -> ChatTokenizer:
@@ -612,7 +619,8 @@ def test_a_queue_timeout_ends_a_stream_with_an_error_event(tok):
     assert events[-1]["error"]["code"] == "queue_timeout"
 
 
-@pytest.mark.parametrize("engine_overrides", [{"max_queue": 0}, {"queue_timeout_ms": -1}])
+@pytest.mark.parametrize("engine_overrides", [{"max_queue": 0}, {"queue_timeout_ms": -1},
+                                              {"decision_log_capacity": 0}])
 def test_bad_queue_limits_in_the_config_are_refused(engine_overrides):
     with pytest.raises(ValueError):
         make_config(**engine_overrides)
@@ -629,3 +637,24 @@ def test_every_response_carries_its_timings(tok):
     for info in (plain, streamed):
         assert info["queue_ms"] == 0.1 and info["ttft_ms"] == 0.5 and info["e2e_ms"] == 1.0
         assert info["itl_ms"] == 0.05 and info["max_itl_ms"] == 0.08
+
+
+# ---- Day 22: explainable scheduling decisions ----------------------------------------------------
+
+def test_decisions_endpoint_pages_with_a_cursor(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        first = client.get("/v1/runtime/decisions", params={"limit": 2}).json()
+        rest = client.get("/v1/runtime/decisions", params={"since": first["next_since"]}).json()
+    assert first["object"] == "list" and [d["seq"] for d in first["data"]] == [1, 2]
+    assert first["data"][0]["numbers"] == {"free_pages": 64}
+    assert [d["seq"] for d in rest["data"]] == [3, 4, 5] and rest["next_since"] == 5 and rest["dropped"] == 0
+
+
+@pytest.mark.parametrize("params, param", [({"limit": 0}, "query.limit"), ({"limit": 5000}, "query.limit"),
+                                           ({"since": -1}, "query.since")])
+def test_decisions_endpoint_validates_its_parameters(tok, params, param):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.get("/v1/runtime/decisions", params=params)
+    assert resp.status_code == 400 and resp.json()["error"]["param"] == param
