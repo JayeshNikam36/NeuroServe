@@ -134,7 +134,7 @@ One YAML file (`configs/dev.yaml`), validated at startup; unknown keys are error
 | Limitation | Plan |
 | --- | --- |
 | A prompt is prefilled in one step, so it must fit the token budget, and `decode-first` starves long prompts under load ([benchmarking.md](benchmarking.md)) | Chunked prefill and mixed prefill/decode steps (Days 52–53) |
-| No prefix caching: identical prompt prefixes are recomputed | Reference-counted blocks, prefix hashing, copy-on-write (Days 31–36) |
+| No prefix caching: identical prompt prefixes are recomputed | Reference-counted blocks, prefix hashing, copy-on-write (Days 31–36; design in [kv-cache.md](kv-cache.md)) |
 | Measured on one laptop GPU; no baseline against another server yet | vLLM baseline and comparison (Days 94–95) |
 | Compute Sanitizer unavailable on WSL | Run on native Linux or a cloud GPU (Day 41) |
 | No authentication; the runtime policy endpoint is an operator control | Security defaults review (Day 115) |

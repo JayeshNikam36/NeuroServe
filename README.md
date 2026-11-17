@@ -61,7 +61,7 @@ Analysis: [docs/benchmarking.md](docs/benchmarking.md). Full report:
 | `configs/` | Server configuration (YAML) |
 | `python/neuroserve/bench/` | Load generator, policy comparison, GPU sampler |
 | `benchmarks/results/` | Committed benchmark results (`raw/` is local only) |
-| `docs/` | Architecture, engine loop, scheduling, streaming, latency, benchmarking, errors |
+| `docs/` | Architecture, engine loop, scheduling, KV cache, streaming, latency, benchmarking, errors |
 
 ## Build
 
