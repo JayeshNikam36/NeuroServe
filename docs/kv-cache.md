@@ -6,6 +6,14 @@ per-step checker enforces. Each later Phase 3 day implements one part, against t
 
 Requirements: KV-001 to KV-010 in the technical specification.
 
+## Status
+
+| Day | Part | State |
+| --- | --- | --- |
+| 26 | This design | done |
+| 27 | `KvBlockManager` contract and `ReferenceBlockManager`, the CPU oracle | done |
+| 28 | `KVCacheManager` (ordered free set, running counts, `allocated_by`), with the backend taking every block from it and the engine's allocator emptied | done |
+
 ## Today (v0.1)
 
 ### Physical memory

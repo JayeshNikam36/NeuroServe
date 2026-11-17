@@ -1,6 +1,6 @@
 // The contract every KV block manager must meet (docs/kv-cache.md). The tests run once per
-// implementation: today the CPU reference; from Day 28 also the KVCacheManager. Breaking the state
-// on purpose (fault injection) to test check_invariants() comes with the checker on Day 30.
+// implementation: the CPU reference (the oracle) and the KVCacheManager the engine uses. Breaking the
+// state on purpose (fault injection) to test check_invariants() comes with the checker on Day 30.
 #include <gtest/gtest.h>
 
 #include <functional>
@@ -11,10 +11,12 @@
 #include <string>
 #include <vector>
 
+#include "neuroserve/core/kv_cache_manager.hpp"
 #include "neuroserve/core/kv_reference.hpp"
 
 using neuroserve::KvCacheExhausted;
 using neuroserve::core::BlockId;
+using neuroserve::core::KVCacheManager;
 using neuroserve::core::KvBlockConfig;
 using neuroserve::core::KvBlockManager;
 using neuroserve::core::KvInvariantViolation;
@@ -277,7 +279,59 @@ TEST_P(KvBlockContract, InvariantsHoldThroughARandomWorkload) {
 INSTANTIATE_TEST_SUITE_P(
     Implementations, KvBlockContract,
     ::testing::Values(Implementation{"Reference",
-                                     [](KvBlockConfig c) { return std::make_unique<ReferenceBlockManager>(c); }}),
+                                     [](KvBlockConfig c) { return std::make_unique<ReferenceBlockManager>(c); }},
+                      Implementation{"KVCacheManager",
+                                     [](KvBlockConfig c) { return std::make_unique<KVCacheManager>(c); }}),
     [](const ::testing::TestParamInfo<Implementation>& p) { return p.param.name; });
+
+TEST(KVCacheManager, EveryUsedBlockNamesTheSequenceThatTookIt) {
+    KVCacheManager kv(KvBlockConfig{8, 16, 4});
+    kv.create(10);
+    kv.append(10, 40);  // blocks 0, 1, 2
+    kv.create(20);
+    kv.share_prefix(20, 10, 2);
+    kv.append(20, 1);   // block 3
+    EXPECT_EQ(kv.allocated_by(0), 10u);
+    EXPECT_EQ(kv.allocated_by(1), 10u) << "sharing does not change who took the block";
+    EXPECT_EQ(kv.allocated_by(3), 20u);
+    kv.release(10);     // blocks 0 and 1 live on in 20's table: still traced to 10, which wrote them
+    EXPECT_EQ(kv.allocated_by(0), 10u);
+    EXPECT_THROW(kv.allocated_by(2), std::invalid_argument) << "block 2 is free";
+    EXPECT_THROW(kv.allocated_by(8), std::invalid_argument);
+    kv.release(20);
+    kv.create(30);
+    kv.append(30, 1);   // block 0 again, now taken by 30
+    EXPECT_EQ(kv.allocated_by(0), 30u);
+    kv.check_invariants();
+}
+
+TEST(KVCacheManager, MatchesTheReferenceOnTheSameOperations) {
+    // A first differential check (Day 29 runs 10,000 seeded operations): same calls, same tables.
+    const KvBlockConfig config{24, 16, 6};
+    ReferenceBlockManager ref(config);
+    KVCacheManager kv(config);
+    const auto both = [&](auto&& op) {
+        op(static_cast<KvBlockManager&>(ref));
+        op(static_cast<KvBlockManager&>(kv));
+    };
+    both([](KvBlockManager& m) { m.create(1); m.append(1, 50); });
+    both([](KvBlockManager& m) { m.create(2); m.share_prefix(2, 1, 3); m.append(2, 9); });
+    both([](KvBlockManager& m) { m.create(3); m.append(3, 33); });
+    both([](KvBlockManager& m) { m.release(1); });
+    both([](KvBlockManager& m) { m.create(4); m.append(4, 70); });
+    for (neuroserve::SeqId s : {2u, 3u, 4u}) {
+        EXPECT_EQ(kv.table(s), ref.table(s)) << "sequence " << s;
+        EXPECT_EQ(kv.length(s), ref.length(s));
+    }
+    for (BlockId b = 0; b < 24; ++b) {
+        EXPECT_EQ(kv.ref_count(b), ref.ref_count(b)) << "block " << b;
+    }
+    const auto a = kv.stats();
+    const auto r = ref.stats();
+    EXPECT_EQ(a.free_blocks, r.free_blocks);
+    EXPECT_EQ(a.shared_blocks, r.shared_blocks);
+    EXPECT_EQ(a.cached_tokens, r.cached_tokens);
+    kv.check_invariants();
+}
 
 }  // namespace

@@ -7,7 +7,8 @@ add_library(neuroserve_core
     core/src/scheduler.cpp
     core/src/latency_histogram.cpp
     core/src/decision_log.cpp
-    core/src/kv_reference.cpp)
+    core/src/kv_reference.cpp
+    core/src/kv_cache_manager.cpp)
 add_library(neuroserve::core ALIAS neuroserve_core)
 
 target_include_directories(neuroserve_core
