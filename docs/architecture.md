@@ -118,7 +118,8 @@ one request and a decode error fails that step's batch; the loop keeps serving.
 Correctness is checked against Hugging Face at every layer: token-for-token greedy parity for
 the engine, the backend, the bindings, the chat tokenizer, and end to end through the HTTP API,
 streaming included. 24 concurrent requests with a KV cache small enough to force preemption match
-Hugging Face under every policy. CI builds with warnings as errors and runs the CPU tests, plain
+Hugging Face under every policy. Outputs are deterministic but not batch-invariant: what is and is
+not guaranteed is in [ADR-0006](adr/0006-determinism-not-batch-invariance.md). CI builds with warnings as errors and runs the CPU tests, plain
 and under ThreadSanitizer, on every pull request. `scripts/release_check.sh` is the release gate:
 every test, then the live server through the official openai client.
 
@@ -137,6 +138,7 @@ One YAML file (`configs/dev.yaml`), validated at startup; unknown keys are error
 | Measured on one laptop GPU; no baseline against another server yet | vLLM baseline and comparison (Days 94–95) |
 | Compute Sanitizer unavailable on WSL | Run on native Linux or a cloud GPU (Day 41) |
 | No authentication; the runtime policy endpoint is an operator control | Security defaults review (Day 115) |
+| Deterministic but not batch-invariant: at a near-tie the batch can change a greedy choice, and a request restarted after preemption can diverge from what it streamed ([ADR-0006](adr/0006-determinism-not-batch-invariance.md)) | Recompute from prompt + generated tokens (Day 38); cause in profiling (Day 46) |
 | Greedy decoding only, `n=1` | Not scheduled |
 
 Design decisions are recorded in [adr/](adr/).

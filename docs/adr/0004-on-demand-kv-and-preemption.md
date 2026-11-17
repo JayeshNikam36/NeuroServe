@@ -28,7 +28,8 @@ recently admitted requests first and never the oldest. Every request must fit in
 ## Consequences
 - More concurrent requests per GB of KV memory; preemption is counted (`stats.preemptions`) and
   logged per request.
-- Restarted requests regenerate identical tokens only because decoding is greedy and
-  batch-invariant. With sampling (later), a restart must replay the generated tokens instead
-  (option 4), with its own parity tests.
+- Restarted requests regenerate identical tokens only if decoding is greedy and batch-invariant.
+  Day 25 showed it is not batch-invariant (ADR-0006): at a near-tie a restart in another batch can
+  diverge from what was already streamed (logged as an error). Recompute from the prompt plus the
+  generated tokens (option 4) removes the problem; planned for Day 38, with its own parity tests.
 - The work done before a preemption is lost; swap or prefix reuse (Phase 3) can recover it.

@@ -37,7 +37,7 @@ server-sent events (`text/event-stream`) in OpenAI's chunk format, ending with `
 
 A preempted request generates its tokens again from the prompt; the buffer hands each token out
 only once, and the engine logs an error if a regenerated token ever differed from the one already
-streamed (greedy decoding makes them identical; see ADR-0004).
+streamed (possible at a near-tie: decoding is deterministic, not batch-invariant; see ADR-0006).
 
 ## Limits
 

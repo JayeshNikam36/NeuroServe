@@ -597,7 +597,7 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
     for (auto& entry : victims) {
         const auto discarded = entry->tokens.size();
         release(*entry);  // frees the sequence and its KV pages
-        entry->tokens.clear();  // restart from the prompt: greedy decoding regenerates the same tokens
+        entry->tokens.clear();  // restart from the prompt (usually the same tokens again; see ADR-0006)
         entry->cached = 0;
         entry->waited_steps = 0;
         entry->last_defer_reason.clear();  // back in the queue: its next deferral is news again
@@ -728,7 +728,8 @@ void EngineLoop::publish_token(Entry& entry, TokenId token) {
             streamed.push_back(token);
         } else {
             // A preempted request is generating again from its prompt. Its reader already has
-            // this token; greedy decoding must reproduce it exactly.
+            // this token. Decoding is deterministic but not batch-invariant (ADR-0006): in another
+            // batch a near-tie can flip, which is logged below.
             regenerated_differently = streamed[index] != token;
         }
     }

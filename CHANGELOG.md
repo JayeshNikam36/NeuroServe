@@ -35,6 +35,8 @@ before 1.0, minor versions may change the API.
 - A prompt is prefilled in one step (at most `engine.max_batch_tokens` tokens); `decode-first`
   starves long prompts under load until chunked prefill (Phase 4).
 - No prefix caching yet (Phase 3).
+- Deterministic, not batch-invariant: at a near-tie the batch can change a greedy choice
+  ([ADR-0006](docs/adr/0006-determinism-not-batch-invariance.md)).
 
 ## [0.0.1] — Phase 1: Foundation
 

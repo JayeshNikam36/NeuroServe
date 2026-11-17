@@ -32,8 +32,9 @@ applying it, and
 a decision that breaks a limit stops the engine with an error.
 
 A preempted request frees its sequence and pages, goes back to the front of the queue in arrival
-order, and later restarts from its prompt. Greedy decoding is deterministic and batch-invariant on
-this engine, so it regenerates exactly the same tokens (tested on the GPU against Hugging Face).
+order, and later restarts from its prompt. It usually regenerates exactly the same tokens, but not
+always: decoding is deterministic, not batch-invariant, so in another batch a near-tie can flip
+(ADR-0006). The engine logs it if a restarted request diverges from what it already streamed.
 
 ## Policies
 
@@ -44,9 +45,10 @@ this engine, so it regenerates exactly the same tokens (tested on the GPU agains
 | `decode-first` | As `fcfs` | In strict arrival order, but while requests are decoding a step's prefills are capped at a quarter of the token budget | Smoother time between tokens for running requests; new requests start later |
 | `priority` | Lowest effective priority first (newest among equals), never the oldest | By effective priority, then queue order; stops at the first that does not fit | Less queueing for urgent requests; low-priority work waits longer, bounded by aging |
 
-Every policy must produce exactly the same tokens for every request; only the order and timing of
-the work differ. The engine-loop correctness tests run once per policy, and so does the GPU
-preemption test (token-exact against Hugging Face).
+On the reference workloads every policy produces exactly the Hugging Face tokens; only the order
+and timing of the work differ. The engine-loop correctness tests run once per policy, and so does
+the GPU preemption test (token-exact against Hugging Face). On other inputs a policy can change a
+response at a near-tie, because it changes which requests share a batch (ADR-0006).
 
 The policy can be switched while the server runs. The change applies from the next engine step:
 requests in progress keep their state, only later decisions change. An idle engine takes no steps,

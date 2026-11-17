@@ -31,10 +31,10 @@
 ## Verified
 
 - **Release check.** `scripts/release_check.sh` passed from a fresh clone that followed the
-  README. It covers the build, every ctest suite (CPU, GPU, integration, and Python with 129
+  README. It covers the build, every ctest suite (CPU, GPU, integration, and Python with 130
   pytest tests), and the live server on the real model. In that last part the official openai
-  client streams, and under every policy 24 concurrent streamed requests each return exactly the
-  text of the same request sent alone. This also closes the fresh-clone check deferred from
+  client streams, streaming changes no response, and under every policy 24 concurrent streams
+  complete and identical requests agree. This also closes the fresh-clone check deferred from
   Phase 1.
 - **24-request workload.** 24 concurrent requests, with a KV cache small enough to force
   preemption, match Hugging Face token for token under every policy on the GPU
@@ -58,6 +58,13 @@
 
 ## Found and carried forward
 
+- **Decoding is deterministic, not batch-invariant** (found by the release gate; ADR-0006). One of
+  8 chat prompts takes another token at position 14 of 48 in a batch of 8 than alone. The run is
+  deterministic: 8 identical copies sent at once agree with each other. The docs had claimed
+  batch invariance on the strength of 8 reference prompts. Consequence: a request restarted after
+  a preemption can diverge from what it already streamed. Fix: recompute from the prompt plus the
+  generated tokens (Day 38). Cause: Phase 4 profiling (Day 46).
+
 - **`decode-first` is unstable on mixed prompt lengths at 2 requests/s.** TTFT P50 was 22.3 s, 35
   of 720 requests hit the 30 s queue timeout, and throughput fell by 34%. While anything decodes,
   a 480-token prompt cannot be admitted under its prefill cap, and strict order holds every request
@@ -72,6 +79,10 @@
   Disconnects are tested through a real uvicorn server in the test suite.
 
 ## Lessons
+
+- **A property needs a test that could break it.** Batch invariance was "tested" on the same 8
+  reference prompts the kernels had always been checked on. Eight new prompts at a batch size of 8
+  broke it at once. The release gate tested a new input, which is what made it worth having.
 
 - **A fake must model the real component's timing, not only its interface.** The test fake
   switched policy at once; the real engine switches at its next step, and an idle engine takes

@@ -220,3 +220,22 @@ def test_100_concurrent_requests_are_batched_and_match_hugging_face(engine):
     assert after["max_batch_seen"] > 1, "concurrent requests were not batched"
     kv = engine.kv_stats()
     assert kv["free_pages"] == kv["total_pages"], "KV pages leaked"
+
+
+@needs_model
+def test_identical_requests_in_one_batch_produce_identical_tokens(engine):
+    # Guaranteed (ADR-0006): determinism. The same work in the same batch gives the same tokens.
+    # Not guaranteed: the same tokens in every batch (a near-tie can depend on the batch size).
+    prompt, expected = reference(3)
+    results: list[list[int] | None] = [None] * 8
+
+    def worker(k: int) -> None:
+        results[k] = engine.generate(prompt, max_new_tokens=len(expected))
+
+    threads = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=300)
+    assert all(r is not None for r in results)
+    assert len({tuple(r) for r in results}) == 1, "identical concurrent requests returned different tokens"
