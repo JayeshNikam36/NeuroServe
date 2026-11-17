@@ -32,8 +32,9 @@ applying it, and
 a decision that breaks a limit stops the engine with an error.
 
 A preempted request frees its sequence and pages, goes back to the front of the queue in arrival
-order, and later restarts from its prompt. Greedy decoding is deterministic and batch-invariant on
-this engine, so it regenerates exactly the same tokens (tested on the GPU against Hugging Face).
+order, and later restarts from its prompt. It usually regenerates exactly the same tokens, but not
+always: decoding is deterministic, not batch-invariant, so in another batch a near-tie can flip
+(ADR-0006). The engine logs it if a restarted request diverges from what it already streamed.
 
 ## Policies
 
@@ -44,9 +45,10 @@ this engine, so it regenerates exactly the same tokens (tested on the GPU agains
 | `decode-first` | As `fcfs` | In strict arrival order, but while requests are decoding a step's prefills are capped at a quarter of the token budget | Smoother time between tokens for running requests; new requests start later |
 | `priority` | Lowest effective priority first (newest among equals), never the oldest | By effective priority, then queue order; stops at the first that does not fit | Less queueing for urgent requests; low-priority work waits longer, bounded by aging |
 
-Every policy must produce exactly the same tokens for every request; only the order and timing of
-the work differ. The engine-loop correctness tests run once per policy, and so does the GPU
-preemption test (token-exact against Hugging Face).
+On the reference workloads every policy produces exactly the Hugging Face tokens; only the order
+and timing of the work differ. The engine-loop correctness tests run once per policy, and so does
+the GPU preemption test (token-exact against Hugging Face). On other inputs a policy can change a
+response at a near-tie, because it changes which requests share a batch (ADR-0006).
 
 The policy can be switched while the server runs. The change applies from the next engine step:
 requests in progress keep their state, only later decisions change. An idle engine takes no steps,
@@ -136,3 +138,16 @@ The reasons are derived by the engine the same way for every policy: it replays 
 decision against the step's resources and, for each request not admitted, names the first resource
 that was short. A deferral is recorded when its reason changes, not on every step it keeps waiting:
 a request deferred for 500 steps with `batch_full` produces one record, not 500.
+
+## Measured
+
+The first comparison of `fcfs`, `token-budget` and `decode-first` (Day 24; method and full
+analysis in [benchmarking.md](benchmarking.md)):
+
+- With short, uniform prompts the policy makes no practical difference.
+- With mixed prompt lengths, `token-budget` matches `fcfs`: the batch limit binds before the
+  token budget.
+- `decode-first` lowers the worst gap between tokens by 44%, but its prefill cap holds a long
+  prompt until the batch drains, and strict order holds everyone behind it: at 2 requests/s the
+  queue grows until requests time out. Chunked prefill (Phase 4) removes the cap's reason to
+  exist: a long prompt's prefill can then share steps with decodes.

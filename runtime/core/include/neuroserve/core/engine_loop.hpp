@@ -167,7 +167,7 @@ struct EngineLoopStats {
 // (scheduler.hpp) decides which running requests to preempt when the batch cannot grow, and which
 // queued requests to admit; the loop checks each decision and applies it. A preempted request
 // frees its pages, goes back to the front of the queue and later restarts from its prompt
-// (greedy decoding regenerates the same tokens).
+// (usually regenerating the same tokens: decoding is deterministic, not batch-invariant; ADR-0006).
 class EngineLoop {
 public:
     // Starts the engine thread. The backend must outlive the loop. Without an explicit `policy`,

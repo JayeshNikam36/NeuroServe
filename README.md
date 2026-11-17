@@ -6,7 +6,8 @@ An experimental GPU-aware LLM inference runtime featuring continuous batching,
 paged KV-cache management, CUDA execution optimization and real-time
 performance observability, measured against vLLM on an NVIDIA RTX 4050 Laptop GPU.
 
-> **Status:** Phase 1 — foundation. Not yet usable. See the roadmap below.
+> **Status:** v0.1 — OpenAI-compatible streaming server with continuous batching, four scheduling
+> policies and published latency percentiles. Next: KV-cache depth (Phase 3). See the roadmap below.
 
 ## What this is
 
@@ -14,6 +15,32 @@ NeuroServe is the serving, scheduling, memory-governance and observability layer
 built on top of [cuda-llm-engine](https://github.com/JayeshNikam36/cuda-llm-engine),
 a from-scratch C++/CUDA inference engine for Llama-3.2-1B with a paged KV cache
 and split-KV decode attention.
+
+## Results (v0.1)
+
+First policy comparison on an RTX 4050 Laptop GPU (Llama 3.2 1B, FP16, `max_batch` 8): medians
+over 6 measured rounds of 120 requests, paired and order-balanced, with GPU clocks recorded.
+
+| Profile | Policy | TTFT P50 | TTFT P95 | ITL P50 | max ITL P95 | e2e P95 | output tok/s | failed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `short` | `fcfs` | 29.8 ms | 149 ms | 16.5 ms | 49.9 ms | 1.25 s | 234 | 0 |
+| `short` | `token-budget` | 29.8 ms | 164 ms | 16.6 ms | 49.1 ms | 1.30 s | 234 | 0 |
+| `short` | `decode-first` | 30.0 ms | 157 ms | 16.5 ms | 49.5 ms | 1.29 s | 234 | 0 |
+| `mixed` | `fcfs` | 51.9 ms | 888 ms | 16.8 ms | 147 ms | 6.75 s | 255 | 0 |
+| `mixed` | `token-budget` | 52.1 ms | 890 ms | 16.8 ms | 147 ms | 6.73 s | 255 | 0 |
+| `mixed` | `decode-first` | 22.3 s | 29.5 s | 16.1 ms | 82.7 ms | 32.8 s | 180 | 35 of 720 |
+
+`short`: ~40-token chat prompts, 64 output tokens, 4 requests/s. `mixed`: 32/128/480-token
+prompts, 32/128/384 output tokens, 2 requests/s.
+
+- **On `short` the policy makes no practical difference** (every paired change within ±2.1%),
+  and on `mixed` `token-budget` matches `fcfs`: at this load the batch limit binds first.
+- **`decode-first` cuts the worst gaps between tokens by 44%** (max ITL P95, better in 6 of 6
+  rounds), but without chunked prefill it starves long prompts: at 2 requests/s its queue grows
+  until requests time out.
+
+Analysis: [docs/benchmarking.md](docs/benchmarking.md). Full report:
+[benchmarks/results/day24-policy-comparison.md](benchmarks/results/day24-policy-comparison.md).
 
 ## Repository layout
 
@@ -32,6 +59,9 @@ and split-KV decode attention.
 | `python/neuroserve/` | Python package |
 | `python/neuroserve/server/` | OpenAI-compatible API server (FastAPI) |
 | `configs/` | Server configuration (YAML) |
+| `python/neuroserve/bench/` | Load generator, policy comparison, GPU sampler |
+| `benchmarks/results/` | Committed benchmark results (`raw/` is local only) |
+| `docs/` | Architecture, engine loop, scheduling, streaming, latency, benchmarking, errors |
 
 ## Build
 
@@ -112,11 +142,17 @@ bash scripts/dev.sh ./build/dev-cuda/tools/ns_device_info --json   # machine-rea
 git clone --recurse-submodules git@github.com:JayeshNikam36/NeuroServe.git
 ```
 
+Release check (every test, then the live server through the official openai client):
+
+```bash
+bash scripts/dev.sh --build bash scripts/release_check.sh
+```
+
 ## Roadmap
 
 | Release | Scope |
 | --- | --- |
-| v0.1 | OpenAI-compatible streaming server, pluggable scheduling policies, latency percentiles |
+| v0.1 (released) | OpenAI-compatible streaming server, pluggable scheduling policies, latency percentiles |
 | v0.2 | Varlen and chunked prefill, CUDA Graphs, GPU memory pools — each A/B measured |
 | v0.3 | Live observability dashboard |
 | v1.0 | Benchmarks vs vLLM / TensorRT-LLM, technical report, Docker release |
