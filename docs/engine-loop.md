@@ -35,6 +35,10 @@ generation for many requests on one dedicated engine thread.
   batch; the loop keeps serving. Sequences and their pages are always released.
 - **Clean shutdown.** `stop()` cancels queued and running requests with `EngineStopped`, so no
   caller waits forever.
+- **Invariant checks after every step** (`check_invariants`, on unless the build turns
+  `NS_CHECK_INVARIANTS` off). The loop asks the backend to check its KV bookkeeping, then checks its
+  own view against it (docs/kv-cache.md, "Invariants"). A violation stops the loop like any other
+  bug: it is logged, and every request gets `EngineStopped`.
 
 ## Verification
 
@@ -42,6 +46,9 @@ generation for many requests on one dedicated engine thread.
   batch size, KV-limited admission, failure isolation and shutdown. A gate in the fake backend
   pauses the engine at a known point, so the tests do not depend on timing.
 - The `tsan-cpu` preset runs every CPU test under ThreadSanitizer, locally and in CI.
+- Every engine-loop test runs with the invariant checks on, and `tests/unit/test_kv_invariants.cpp`
+  breaks each check on purpose: a leaked sequence and a length the loop does not know about both
+  stop the engine with a message that names the invariant.
 
 ## Python and logs
 

@@ -100,12 +100,16 @@ public:
             ++length(ids[i]);
             out.push_back(next(tokens[i]));
         }
+        length(ids[0]) += drift_after_decode;
         return out;
     }
 
     void free_sequence(SeqId id) override {
-        if (lengths_.erase(id) == 0) {
+        if (lengths_.count(id) == 0) {
             throw std::invalid_argument("unknown sequence id " + std::to_string(id));
+        }
+        if (!leak_on_free) {
+            lengths_.erase(id);
         }
     }
 
@@ -117,8 +121,12 @@ public:
         return it->second;
     }
 
+    int live_sequences() const override { return static_cast<int>(lengths_.size()); }
+
     // ---- Test helpers ----
-    int live_sequences() const { return static_cast<int>(lengths_.size()); }
+    // Injected bookkeeping faults, for the engine loop's invariant checks:
+    bool leak_on_free = false;   // free_sequence() succeeds but keeps the sequence (a leak)
+    int drift_after_decode = 0;  // each decode_step adds this to its first sequence's length
     int decode_calls() const { return decode_calls_; }
     int prefill_calls() const { return prefill_calls_; }
     void fail_decode_after(int calls) { fail_after_ = calls; }          // every call from `calls` on fails

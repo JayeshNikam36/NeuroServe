@@ -8,6 +8,8 @@
 
 namespace neuroserve::core {
 
+struct KVCacheManagerTestPeer;  // defined only in tests: injects faults to test check_invariants()
+
 // The KV block manager the engine uses: the single owner of KV memory accounting
 // (docs/kv-cache.md). It meets the KvBlockManager contract exactly like the CPU reference, which is
 // its test oracle, but every operation is proportional to the blocks it touches: an ordered set of
@@ -38,6 +40,8 @@ public:
     SeqId allocated_by(BlockId block) const;
 
 private:
+    friend struct KVCacheManagerTestPeer;
+
     struct Block {
         int refs = 0;
         SeqId allocated_by = 0;

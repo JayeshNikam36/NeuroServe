@@ -297,4 +297,33 @@ void CudaLlmEngineBackend::free_sequence(SeqId id) {
 
 int CudaLlmEngineBackend::sequence_length(SeqId id) const { return impl_->get(id).len; }
 
+void CudaLlmEngineBackend::check_kv_invariants() const {
+    const Impl& im = *impl_;
+    im.kv->check_invariants();  // I1-I6 inside the manager
+    if (!im.cache->alloc.free_list.empty()) {
+        throw core::KvInvariantViolation("the engine's own allocator holds " +
+                                         std::to_string(im.cache->alloc.free_list.size()) +
+                                         " pages: blocks were returned to it instead of to the manager");
+    }
+    if (im.kv->stats().sequences != static_cast<int>(im.sequences.size())) {
+        throw core::KvInvariantViolation("I12: the manager holds " + std::to_string(im.kv->stats().sequences) +
+                                         " sequences, the engine " + std::to_string(im.sequences.size()));
+    }
+    for (const auto& [id, seq] : im.sequences) {
+        if (!im.kv->contains(id)) {
+            throw core::KvInvariantViolation("I12: the engine holds sequence " + std::to_string(id) +
+                                             ", the manager does not");
+        }
+        const std::vector<core::BlockId> table = im.kv->table(id);
+        if (seq.len != im.kv->length(id) || !std::equal(seq.pages.begin(), seq.pages.end(), table.begin(), table.end())) {
+            throw core::KvInvariantViolation("sequence " + std::to_string(id) + ": the engine has " +
+                                             std::to_string(seq.len) + " tokens in " + std::to_string(seq.pages.size()) +
+                                             " pages, the manager " + std::to_string(im.kv->length(id)) + " in " +
+                                             std::to_string(table.size()) + " (or other blocks)");
+        }
+    }
+}
+
+int CudaLlmEngineBackend::live_sequences() const { return static_cast<int>(impl_->sequences.size()); }
+
 }  // namespace neuroserve
