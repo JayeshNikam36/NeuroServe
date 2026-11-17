@@ -53,6 +53,8 @@ class GenerationEngine(Protocol):
 
     def latency(self) -> dict[str, Any]: ...
 
+    def decisions(self, since: int = 0, limit: int = 100) -> dict[str, Any]: ...
+
     def cancel(self, request_id: str) -> bool: ...
 
 
@@ -148,6 +150,7 @@ class EngineService:
             priority_aging_ms=e.priority_aging_ms,
             max_queue=e.max_queue,
             queue_timeout_ms=e.queue_timeout_ms,
+            decision_log_capacity=e.decision_log_capacity,
         )
         tokenizer = ChatTokenizer(config.model.tokenizer_dir)
         return cls(config, engine, tokenizer, device_info(e.device_index)["name"])
@@ -168,6 +171,9 @@ class EngineService:
 
     def latency(self) -> dict[str, Any]:
         return self._engine.latency()
+
+    def decisions(self, since: int, limit: int) -> dict[str, Any]:
+        return self._engine.decisions(since=since, limit=limit)
 
     def cancel(self, engine_request_id: str) -> bool:
         return self._engine.cancel(engine_request_id)

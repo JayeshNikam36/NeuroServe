@@ -88,3 +88,40 @@ review the diff in the PR:
 bash scripts/dev.sh bash -c "NS_UPDATE_GOLDEN=1 ./build/ci-cpu/tests/ns_unit_tests --gtest_filter='GoldenTrace.*'"
 git diff tests/data/scheduler_traces
 ```
+
+## Decision log
+
+Every scheduling decision about a request is recorded with the numbers it was made on, so a
+latency outlier can be explained instead of guessed at:
+
+    GET /v1/runtime/decisions?since=0&limit=100
+
+    {"object": "list", "next_since": 2, "dropped": 0, "data": [
+      {"seq": 1, "step": 41, "time_ms": 1794870851360, "request_id": "ns-000007", "client_request_id": "req_…",
+       "action": "defer", "reason": "kv_pages", "policy": "fcfs",
+       "numbers": {"prompt_tokens": 120, "pages_needed": 8, "free_pages": 7, "slots_free": 7,
+                   "token_budget_left": 511, "waited_steps": 0, "queue_position": 0, "priority": 1}},
+      {"seq": 2, …, "action": "admit", "reason": "admitted", …}]}
+
+Read it with a cursor: pass the `next_since` of one page as `since` of the next. The engine keeps
+the newest `engine.decision_log_capacity` explanations (default 4096) in a ring buffer, so memory
+stays bounded; `dropped` says how many a reader missed because it fell behind.
+
+| Action | Reason | Meaning |
+| --- | --- | --- |
+| `admit` | `admitted` | Admitted this step; the numbers show the room that was left for it |
+| `defer` | `batch_full` | No free slot in the running batch (`max_batch`) |
+| `defer` | `kv_pages` | Its prefill needs more KV pages than are free |
+| `defer` | `token_budget` | Its prompt does not fit in the step's remaining token budget |
+| `defer` | `kv_pressure` | The batch is preempting for memory this step: nothing is admitted |
+| `defer` | `held_by_policy` | Every resource was available: the policy held it back (FCFS arrival order, decode-first prefill cap, priority order) |
+| `preempt` | `kv_pressure` | The running batch could not grow (`pages_needed_to_grow` > `free_pages`); restarts later |
+| `reject` | `queue_full` | `engine.max_queue` requests were waiting (HTTP 429) |
+| `reject` | `queue_timeout` | Not admitted within `engine.queue_timeout_ms` (HTTP 503) |
+| `reject` | `invalid` | Failed validation at submit (HTTP 400) |
+| `reject` | `engine_stopped` | Submitted while the engine was stopping |
+
+The reasons are derived by the engine the same way for every policy: it replays the policy's
+decision against the step's resources and, for each request not admitted, names the first resource
+that was short. A deferral is recorded when its reason changes, not on every step it keeps waiting:
+a request deferred for 500 steps with `batch_full` produces one record, not 500.

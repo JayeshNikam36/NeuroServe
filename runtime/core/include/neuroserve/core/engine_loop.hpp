@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "neuroserve/core/decision_log.hpp"
 #include "neuroserve/core/inference_backend.hpp"
 #include "neuroserve/core/latency_histogram.hpp"
 #include "neuroserve/core/request.hpp"
@@ -119,6 +120,7 @@ struct EngineLoopOptions {
     PolicyOptions policy_options{};  // settings for the policy named in `policy`
     int max_queue = 1024;          // most requests waiting in the queue; submit() throws QueueFull beyond it
     int queue_timeout_ms = 0;      // a request not admitted within this time is REJECTED (QueueTimeout); 0 = never
+    int decision_log_capacity = 4096;  // explanations kept for decisions() (the newest; older ones are dropped)
     // Called on the engine thread after every step that did work. Must be fast and must not throw.
     std::function<void(const StepStats&)> on_step{};
 };
@@ -196,6 +198,10 @@ public:
     // Thread-safe. Latency percentiles since the engine started (fixed-bucket histograms).
     LatencyStats latency() const;
 
+    // Thread-safe. Why requests were admitted, deferred, rejected or preempted: up to `limit`
+    // explanations newer than `since` (0 = from the oldest kept), oldest first.
+    DecisionPage decisions(std::uint64_t since, std::size_t limit) const;
+
     // Thread-safe. Name of the policy currently deciding.
     std::string policy_name() const;
 
@@ -226,6 +232,10 @@ private:
     bool append_token(Entry& entry, TokenId token);
     void publish_token(Entry& entry, TokenId token);  // stream: hand a new token to the reader
     void flush_itl_samples_locked();  // itl_samples_ -> itl_hist_; caller holds mu_
+    // Decision log; caller holds mu_.
+    void explain_locked(const SchedulerInput& input, const ScheduleDecision& decision);
+    void record_locked(const Entry& entry, DecisionAction action, std::string reason,
+                       std::vector<std::pair<std::string, std::int64_t>> numbers);
     void complete(EntryPtr entry) noexcept;
     void fail(EntryPtr entry, std::exception_ptr error) noexcept;
     void cancel(Entry& entry, std::exception_ptr error) noexcept;
@@ -250,6 +260,8 @@ private:
     std::unique_ptr<SchedulingPolicy> next_policy_;  // set_policy(): taken at the next step
     std::string policy_name_;
     std::unordered_set<std::string> unfinished_;      // ids of submitted requests not finished yet
+    DecisionLog decision_log_;  // guarded by mu_
+    std::uint64_t step_ = 0;    // scheduling passes so far (the "step" of an explanation)
     LatencyHistogram queue_hist_;  // guarded by mu_, like the stats
     LatencyHistogram ttft_hist_;
     LatencyHistogram itl_hist_;

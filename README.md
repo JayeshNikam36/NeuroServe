@@ -60,7 +60,8 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 
 Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`
 (prompt as text or token ids), `DELETE /v1/requests/{X-Request-ID}` (cancel a request in progress;
-a client disconnect cancels too). Greedy decoding. `"stream": true` streams the tokens as they are
+a client disconnect cancels too), `GET /v1/runtime/decisions` (why the scheduler admitted, deferred,
+rejected or preempted each request; see [docs/scheduling.md](docs/scheduling.md)). Greedy decoding. `"stream": true` streams the tokens as they are
 generated (server-sent events in OpenAI's chunk format, so the official `openai` client works; see
 [docs/streaming.md](docs/streaming.md)). The server listens on localhost only; the port is published
 to 127.0.0.1.

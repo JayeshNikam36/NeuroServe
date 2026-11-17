@@ -48,7 +48,7 @@ def test_config_offers_exactly_the_engine_policies():
     assert set(allowed) == set(neuroserve.scheduling_policies) == {"fcfs", "token-budget", "decode-first", "priority"}
 
 
-@pytest.mark.parametrize("options", [{"max_queue": 0}, {"queue_timeout_ms": -1}])
+@pytest.mark.parametrize("options", [{"max_queue": 0}, {"queue_timeout_ms": -1}, {"decision_log_capacity": 0}])
 def test_bad_queue_limits_are_rejected_before_loading(options):
     with pytest.raises(ValueError):
         neuroserve.Engine("/no/such/model", **options)
@@ -139,6 +139,21 @@ def test_latency_is_recorded_per_request_and_as_percentiles(engine):
     for metric in ("queue_ms", "ttft_ms", "itl_ms", "e2e_ms"):
         s = after[metric]
         assert 0 <= s["p50"] <= s["p95"] <= s["p99"] <= s["max"], metric
+
+
+@needs_model
+def test_every_admission_is_explained(engine):
+    cursor = 0
+    while (page := engine.decisions(since=cursor, limit=1000))["data"]:  # skip what earlier tests logged
+        cursor = page["next_since"]
+    ids = [engine.run(prompt, len(expected)).request_id for prompt, expected in map(reference, range(2))]
+    admits = {d["request_id"]: d for d in engine.decisions(since=cursor, limit=1000)["data"]
+              if d["action"] == "admit"}
+    for request_id in ids:
+        d = admits[request_id]
+        assert d["reason"] == "admitted" and d["policy"] == engine.stats()["policy"]
+        assert d["numbers"]["pages_needed"] <= d["numbers"]["free_pages"]
+    assert engine.decisions(since=10**18)["data"] == []  # nothing newer than a cursor far ahead
 
 
 @needs_model
