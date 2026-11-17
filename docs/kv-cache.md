@@ -13,6 +13,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 26 | This design | done |
 | 27 | `KvBlockManager` contract and `ReferenceBlockManager`, the CPU oracle | done |
 | 28 | `KVCacheManager` (ordered free set, running counts, `allocated_by`), with the backend taking every block from it and the engine's allocator emptied | done |
+| 29 | Property-based tests (`tests/unit/test_kv_property.cpp`, harness in `tests/support/kv_ops.hpp`): 10,000 seeded random programs, about 600,000 operations, manager vs reference after every operation; a divergence is shrunk to a short reproduction. `NS_KV_PROPERTY_PROGRAMS` / `NS_KV_PROPERTY_SEED` run more or other programs | done |
 
 ## Today (v0.1)
 
