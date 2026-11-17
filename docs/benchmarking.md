@@ -73,5 +73,38 @@ been made by the requested policy, or the comparison stops.
 percentiles, with their range across rounds; then the paired comparison with the baseline: the
 median per-round change, and in how many rounds the policy was better. `summary.json` holds all of
 it, and `runs/` has one file per run with every request and every GPU sample.
+`--rerender DIR` recomputes `summary.json` and `summary.md` from those saved runs after a change to
+the analysis, without repeating a run.
 
-Committed results: [benchmarks/results/day24-policy-comparison.md](../benchmarks/results/day24-policy-comparison.md).
+## First results: scheduling policies (Day 24)
+
+Full report: [benchmarks/results/day24-policy-comparison.md](../benchmarks/results/day24-policy-comparison.md).
+RTX 4050 Laptop GPU, Llama 3.2 1B (FP16), `max_batch` 8, 512-token step budget; 6 measured rounds
+of 120 requests per profile and policy.
+
+- **`short`: the policy makes no practical difference.** Every paired change is within ±2.1%. The
+  only change in a consistent direction is `token-budget`'s TTFT P50, lower in 5 of 6 rounds, by
+  0.6% (about 0.2 ms). With ~40-token prompts the token budget never binds, and the batch limit
+  applies to every policy alike. The round-to-round spread (TTFT P95 from about 45 to 300 ms under
+  every policy) comes from the schedules themselves: some seeds produce bursts. Without pairing,
+  that spread would swamp any policy effect.
+- **`mixed`: `token-budget` behaves like `fcfs`** (all paired changes within ±1.2%). At this load a
+  waiting request is held back by the batch limit (8), not by the token budget, so letting smaller
+  prompts skip ahead never comes into play.
+- **`mixed`: `decode-first` is unstable at 2 requests/s.**
+  - **TTFT P50:** 22.3 s against 52 ms.
+  - **Timeouts:** 35 of 720 requests timed out after 30 s in the queue (all 480-token prompts).
+  - **Throughput:** 34% lower.
+  - **The mechanism:** while anything decodes, a step's prefill is capped at 128 tokens (a quarter
+    of the budget), so a 480-token prompt at the head of the queue waits until the batch has fully
+    drained. Strict arrival order then holds every request behind it.
+  - **Why the queue grows:** every long prompt forces a drain, so capacity falls below the offered
+    load and the queue grows until requests time out. Short prompts wait as long as long ones (TTFT
+    P50 about 20 s for 32-token prompts).
+- **`decode-first` still does what it is for.** Max ITL P95 is 44% lower (147 → 83 ms) and ITL P50
+  3.8% lower, in 6 of 6 rounds: running requests are no longer stalled by steps that also run large
+  prefills. Keeping that benefit without starving long prompts needs chunked prefill (a long
+  prompt's prefill split across steps).
+- **The GPU was stable:** the median SM clock under load was 2730–2745 MHz in every run, the
+  temperature stayed at or below 71 °C, there was no power capping, and thermal slowdown appeared in
+  a single sample of one run.

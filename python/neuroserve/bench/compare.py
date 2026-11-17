@@ -27,7 +27,7 @@ from typing import Any
 import httpx
 
 from . import loadgen
-from .gpu_monitor import GpuSampler
+from .gpu_monitor import GpuSampler, summarize_samples
 from .workload import DATASET_SHA256, DATASET_VERSION, PROFILES, build_schedule, schedule_digest
 
 DEFAULT_POLICIES = ("fcfs", "token-budget", "decode-first")
@@ -76,8 +76,13 @@ def run_metrics(results: list[loadgen.RequestResult], duration_s: float) -> dict
     max_itl = [r.server["max_itl_ms"] for r in ok if "max_itl_ms" in r.server]  # its longest gap
     queue = [r.server["queue_ms"] for r in ok if "queue_ms" in r.server]
     tokens = sum(r.completion_tokens or 0 for r in ok)
+    errors: dict[str, int] = {}
+    for r in results:
+        if not r.ok:
+            code = r.error or f"http_{r.status}"
+            errors[code] = errors.get(code, 0) + 1
     return {
-        "requests": len(results), "succeeded": len(ok), "failed": len(results) - len(ok),
+        "requests": len(results), "succeeded": len(ok), "failed": len(results) - len(ok), "errors": errors,
         "ttft_p50_ms": pct(ttft, 0.5), "ttft_p95_ms": pct(ttft, 0.95), "ttft_p99_ms": pct(ttft, 0.99),
         "itl_p50_ms": pct(itl, 0.5), "itl_p95_ms": pct(itl, 0.95), "max_itl_p95_ms": pct(max_itl, 0.95),
         "e2e_p50_ms": pct(e2e, 0.5), "e2e_p95_ms": pct(e2e, 0.95), "e2e_p99_ms": pct(e2e, 0.99),
@@ -98,7 +103,10 @@ def aggregate(runs: list[dict[str, Any]], baseline: str) -> dict[str, Any]:
             mine = [r for r in measured if r["profile"] == profile and r["policy"] == policy]
             entry: dict[str, Any] = {"rounds": len(mine), "failed": sum(r["metrics"]["failed"] for r in mine),
                                      "preemptions": sum(r["engine"].get("preemptions", 0) for r in mine),
-                                     "metrics": {}, "vs_baseline": {}}
+                                     "errors": {}, "metrics": {}, "vs_baseline": {}}
+            for r in mine:
+                for code, count in r["metrics"].get("errors", {}).items():
+                    entry["errors"][code] = entry["errors"].get(code, 0) + count
             for key, _, lower_is_better in METRICS:
                 values = [r["metrics"][key] for r in mine if r["metrics"][key] is not None]
                 entry["metrics"][key] = ({"median": round(statistics.median(values), 3), "min": min(values),
@@ -132,8 +140,9 @@ def gpu_warnings(runs: list[dict[str, Any]]) -> list[str]:
             if abs(g["sm_clock_mhz_median"] - typical) > CLOCK_TOLERANCE * typical:
                 warnings.append(f"{label}: median SM clock {g['sm_clock_mhz_median']:.0f} MHz vs typical "
                                 f"{typical:.0f} MHz")
-            if g["thermal_slowdown_frac"]:
-                warnings.append(f"{label}: thermal slowdown in {g['thermal_slowdown_frac']:.0%} of samples")
+            if g.get("thermal_slowdown_samples"):
+                warnings.append(f"{label}: thermal slowdown in {g['thermal_slowdown_samples']} of "
+                                f"{g['samples']} samples")
     return warnings
 
 
@@ -143,6 +152,15 @@ def _fmt(value: float | None) -> str:
     if float(value).is_integer():
         return f"{value:.0f}"
     return f"{value:.0f}" if abs(value) >= 100 else f"{value:.1f}"
+
+
+def _change(v: dict[str, Any] | None) -> str:
+    """A paired change: -3.8% (6/6), or x33 (0/6) once a metric has at least doubled."""
+    if v is None:
+        return "–"
+    ratio = 1.0 + v["median_change"]
+    text = f"{v['median_change']:+.1%}" if ratio < 2 else f"×{ratio:.1f}" if ratio < 10 else f"×{ratio:.0f}"
+    return f"{text} ({v['better_in']}/{v['rounds']})"
 
 
 def render_markdown(summary: dict[str, Any]) -> str:
@@ -171,7 +189,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
             for key, _, _ in METRICS:
                 m = entry["metrics"][key]
                 cells.append(f"{_fmt(m['median'])} ({_fmt(m['min'])}–{_fmt(m['max'])})" if m else "–")
-            cells += [str(entry["failed"]), str(entry["preemptions"])]
+            errors = ", ".join(f"{code} {n}" for code, n in sorted(entry.get("errors", {}).items()))
+            cells += [f"{entry['failed']} ({errors})" if errors else str(entry["failed"]), str(entry["preemptions"])]
             lines.append("| " + " | ".join(cells) + " |")
         lines += ["", f"Paired with `{baseline}` (same round, same requests): median change, and in how many "
                       "rounds the policy was better.", ""]
@@ -184,8 +203,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 continue
             cells = [f"`{policy}`"]
             for k in keys:
-                v = entry["vs_baseline"].get(k)
-                cells.append(f"{v['median_change']:+.1%} ({v['better_in']}/{v['rounds']})" if v else "–")
+                cells.append(_change(entry["vs_baseline"].get(k)))
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
     lines += ["## GPU", ""]
@@ -194,7 +212,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         reason = next((r["gpu"]["reason"] for r in gpu_rows), None) or "no samples"
         lines += [f"Not sampled: {reason}.", ""]
     else:
-        lines += ["| Profile | Policy | SM clock median (MHz) | SM clock min | max temp (°C) | mean power (W) "
+        lines += ["Clock figures use the samples taken under load (GPU utilisation of 50% or more).", "",
+                  "| Profile | Policy | SM clock median (MHz) | SM clock P5 | max temp (°C) | mean power (W) "
                   "| power-capped | thermal slowdown |", "|" + " --- |" * 8]
         for profile, policies in agg.items():
             for policy in policies:
@@ -212,7 +231,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
                     return f"{value:.0%}" if value is not None else "–"
 
                 lines.append(f"| `{profile}` | `{policy}` | {_fmt(med('sm_clock_mhz_median'))} | "
-                             f"{_fmt(worst('sm_clock_mhz_min', min))} | {_fmt(worst('temp_c_max', max))} | "
+                             f"{_fmt(worst('sm_clock_mhz_p5', min))} | {_fmt(worst('temp_c_max', max))} | "
                              f"{_fmt(med('power_w_mean'))} | {share(med('power_cap_frac'))} | "
                              f"{share(worst('thermal_slowdown_frac', max))} |")
         lines.append("")
@@ -238,6 +257,31 @@ def _git_commit() -> str:
         return commit + ("-dirty" if dirty else "")
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+
+
+def write_summary(out_dir: Path, summary: dict[str, Any]) -> None:
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
+    print(f"wrote {out_dir / 'summary.md'} and summary.json")
+
+
+def rerender(out_dir: Path) -> dict[str, Any]:
+    """Recomputes summary.json and summary.md from the saved runs (every request and GPU sample),
+    after a change to the analysis: no run is repeated."""
+    old = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    runs = []
+    for record in old["runs"]:
+        saved = json.loads((out_dir / "runs" / f"r{record['round']:02d}-{record['profile']}-{record['policy']}.json")
+                           .read_text(encoding="utf-8"))
+        results = [loadgen.RequestResult(**r) for r in saved["requests"]]
+        gpu = {k: v for k, v in saved["gpu"].items() if k != "samples"}
+        gpu["summary"] = summarize_samples(saved["gpu"]["samples"])
+        runs.append({**record, "metrics": run_metrics(results, saved["duration_s"]), "gpu": gpu})
+    meta = {**old["meta"], "rerendered_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    summary = {"meta": meta, "aggregate": aggregate(runs, meta["policies"][0]), "warnings": gpu_warnings(runs),
+               "runs": runs}
+    write_summary(out_dir, summary)
+    return summary
 
 
 class Server:
@@ -301,8 +345,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cooldown-s", type=float, default=5.0, help="idle pause after every run")
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--sample-interval-s", type=float, default=0.2)
-    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, help="where to write the runs and the report")
+    parser.add_argument("--rerender", type=Path, metavar="DIR",
+                        help="recompute the report in DIR from its saved runs, without running anything")
     args = parser.parse_args(argv)
+    if args.rerender is not None:
+        rerender(args.rerender)
+        return 0
+    if args.out_dir is None:
+        parser.error("--out-dir is required (or --rerender DIR)")
 
     policies = [p.strip() for p in args.policies.split(",") if p.strip()]
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
@@ -388,9 +439,7 @@ def main(argv: list[str] | None = None) -> int:
 
     meta["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     summary = {"meta": meta, "aggregate": aggregate(runs, policies[0]), "warnings": gpu_warnings(runs), "runs": runs}
-    (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    (args.out_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
-    print(f"wrote {args.out_dir / 'summary.md'} and summary.json")
+    write_summary(args.out_dir, summary)
     return 0 if all(r["metrics"]["failed"] == 0 for r in runs if r["measured"]) else 1
 
 
