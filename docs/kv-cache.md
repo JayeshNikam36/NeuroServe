@@ -120,41 +120,42 @@ hold something useful.
 
 ### Operations
 
-The CPU reference allocator (Day 27) and the manager (Day 28) share one interface. The reference
-is the test oracle: the same calls must leave both in the same state (Day 29).
+The CPU reference allocator (Day 27) and the manager (Day 28) implement one interface,
+`KvBlockManager` (`runtime/core/include/neuroserve/core/kv_block_manager.hpp`). The reference is the
+test oracle: the same calls must leave both in the same state (Day 29). So the contract fixes
+everything an implementation could otherwise choose freely:
+
+- **New blocks are taken lowest id first.** The engine's free list is LIFO; the manager uses an
+  ordered set, so the same operations give the same tables in every implementation.
+- **A table has exactly `ceil(length / block_size)` entries:** blocks are taken at boundaries, never
+  ahead.
+- **Every operation succeeds or throws and changes nothing:**
+  - `KvCacheExhausted` when blocks are short;
+  - `std::length_error` past `max_blocks_per_sequence`;
+  - `std::invalid_argument` for bad calls.
 
 ```cpp
-// All calls happen on the engine thread. Block ids index the GPU pools; block_size is 16.
-class KvBlockManager {
+class KvBlockManager {  // all calls on the engine thread
 public:
-    // Capacity the scheduler may plan with: FREE + CACHED blocks.
-    int available_blocks() const;
-
-    // Blocks a sequence of `tokens` tokens needs, and how many of those it must newly obtain.
-    // Counts revived CACHED blocks as newly obtained (they leave the evictable pool);
-    // blocks already OWNED by another sequence cost nothing.
-    AdmissionCost admission_cost(std::span<const TokenId> prompt) const;
-
-    // A new sequence: looks up the prompt's full blocks in the prefix index, references the hits
-    // (reviving CACHED ones), allocates the rest, and returns how many tokens are already cached.
-    int admit(SeqId seq, std::span<const TokenId> prompt);
-
-    // Makes room for `n` more tokens at the end of the sequence (allocates a block at a boundary;
-    // copies the last block first if it is shared: copy-on-write).
-    void append(SeqId seq, int n);
-
-    // Records that the sequence's tokens up to `len` are written: full blocks get their hash and
-    // enter the prefix index.
-    void commit(SeqId seq, std::span<const TokenId> tokens);
-
-    // Drops the sequence's references. Blocks reaching 0 become CACHED if indexed, else FREE.
-    void release(SeqId seq);
-
-    std::span<const int> table(SeqId seq) const;  // physical block ids, in logical order
-    KvStats stats() const;
-    void check_invariants() const;                 // every invariant below; throws with details
+    void create(SeqId seq);                               // an empty sequence
+    int blocks_needed(SeqId seq, int tokens) const;       // new blocks `tokens` more would take
+    void append(SeqId seq, int tokens);                   // grow, taking blocks at boundaries
+    void share_prefix(SeqId dst, SeqId src, int blocks);  // empty dst starts with src's first
+                                                          // `blocks` blocks, which must be full
+    void release(SeqId seq);                              // drop references; count 0 -> free
+    std::vector<BlockId> table(SeqId seq) const;          // physical ids, in logical order
+    int length(SeqId seq) const;
+    int ref_count(BlockId block) const;
+    int free_blocks() const;
+    KvBlockStats stats() const;                           // free, used, shared, sequences, tokens
+    void check_invariants() const;                        // KvInvariantViolation names the broken one
 };
 ```
+
+`share_prefix` is the primitive under prefix caching: on Days 32–33 an `admit(seq, prompt)` call
+looks the prompt's full blocks up in the prefix index, shares the hits, and appends the rest. The
+`CACHED` state, the LRU queue and `commit` (indexing written blocks) are added with them (Days 33
+and 37), to the reference first and then to the manager.
 
 ## Reference counting (Day 31)
 
