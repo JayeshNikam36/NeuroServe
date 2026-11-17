@@ -12,6 +12,7 @@
 // cuda-llm-engine (global namespace). Kept out of every public NeuroServe header.
 #include "batched.h"
 
+#include "neuroserve/core/kv_cache_manager.hpp"
 #include "neuroserve/cuda/device_info.hpp"
 
 namespace neuroserve {
@@ -58,7 +59,8 @@ struct CudaLlmEngineBackend::Impl {
     CudaLlmEngineConfig config;
     ModelInfo info;
     Model model{};
-    std::optional<PagedKVCache> cache;
+    std::optional<PagedKVCache> cache;   // the GPU pools; its own allocator is emptied and never used
+    std::optional<core::KVCacheManager> kv;  // the single owner of KV block accounting (docs/kv-cache.md)
     BatchState batch{};
     bool model_loaded = false;
     bool batch_allocated = false;
@@ -70,10 +72,12 @@ struct CudaLlmEngineBackend::Impl {
     void release() noexcept {
         if (cache) {
             for (auto& entry : sequences) {
+                entry.second.pages.clear();  // the manager's blocks: never returned to the engine's allocator
                 ::free_sequence(*cache, entry.second);
             }
         }
         sequences.clear();
+        kv.reset();
         if (batch_allocated) {
             free_batch_state(batch);
             batch_allocated = false;
@@ -104,8 +108,21 @@ struct CudaLlmEngineBackend::Impl {
         return it->second;
     }
 
-    int pages_for(int tokens) const {
-        return (tokens + config.page_size_tokens - 1) / config.page_size_tokens;
+    // Gives the engine sequence exactly the manager's blocks, so the engine's own allocation step
+    // (reserve / ensure_pages: "take blocks until they cover the length") finds nothing to take.
+    void sync_pages(SeqId id, ::Sequence& seq) const {
+        const std::vector<core::BlockId> table = kv->table(id);
+        seq.pages.assign(table.begin(), table.end());
+    }
+
+    // The engine's and the manager's view of a sequence must agree after every call.
+    void check_in_sync(SeqId id, const ::Sequence& seq) const {
+        if (seq.len != kv->length(id) || seq.pages.size() != kv->table(id).size()) {
+            throw std::logic_error("KV state out of sync for sequence " + std::to_string(id) + ": engine has " +
+                                   std::to_string(seq.len) + " tokens in " + std::to_string(seq.pages.size()) +
+                                   " pages, the manager " + std::to_string(kv->length(id)) + " in " +
+                                   std::to_string(kv->table(id).size()));
+        }
     }
 
     void check_token(TokenId t) const {
@@ -139,6 +156,11 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->model = load_model(config.model_dir, config.max_prompt_tokens);
     impl_->model_loaded = true;
     impl_->cache.emplace(alloc_paged_cache(impl_->model, config.num_pages, config.page_size_tokens));
+    // KVCacheManager decides which block holds what. The engine's allocator is emptied, so a path
+    // that still asked it for a block would stop the process loudly instead of handing out a block
+    // the manager has already given to another sequence.
+    impl_->cache->alloc.free_list.clear();
+    impl_->kv.emplace(core::KvBlockConfig{config.num_pages, config.page_size_tokens, config.max_pages_per_sequence});
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
 
@@ -161,14 +183,15 @@ const ModelInfo& CudaLlmEngineBackend::model_info() const noexcept { return impl
 KvCacheStats CudaLlmEngineBackend::kv_stats() const {
     KvCacheStats s;
     s.page_size_tokens = impl_->config.page_size_tokens;
-    s.total_pages = impl_->cache->alloc.total;
-    s.free_pages = impl_->cache->alloc.num_free();
+    s.total_pages = impl_->kv->config().num_blocks;
+    s.free_pages = impl_->kv->free_blocks();
     s.max_pages_per_sequence = impl_->config.max_pages_per_sequence;
     return s;
 }
 
 SeqId CudaLlmEngineBackend::create_sequence() {
     const SeqId id = impl_->next_id++;
+    impl_->kv->create(id);
     impl_->sequences.emplace(id, ::new_sequence(impl_->config.max_pages_per_sequence));
     return id;
 }
@@ -190,15 +213,20 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
     for (const TokenId t : prompt) {
         im.check_token(t);
     }
-    const int pages = im.pages_for(n);
-    if (!im.cache->alloc.can_alloc(pages)) {
+    const int pages = im.kv->blocks_needed(id, n);
+    if (pages > im.kv->free_blocks()) {
         throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages, " +
-                               std::to_string(im.cache->alloc.num_free()) + " free");
+                               std::to_string(im.kv->free_blocks()) + " free");
     }
 
     const std::vector<int> ids(prompt.begin(), prompt.end());
+    im.kv->append(id, n);  // the blocks for the prompt, from the manager
+    im.sync_pages(id, seq);
+    // The engine reports GPU errors by exiting (CUDA_CHECK), never by throwing, so nothing below
+    // can leave the manager ahead of the engine.
     std::vector<float> logits;
     model_prefill_paged(im.model, *im.cache, seq, ids, logits);
+    im.check_in_sync(id, seq);
     return argmax_first(logits);
 }
 
@@ -230,21 +258,29 @@ std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> id
             throw std::logic_error("decode_step: sequence " + std::to_string(ids[i]) + " has not been prefilled");
         }
         im.check_token(tokens[i]);
-        const int needed = im.pages_for(s.len + 1);
-        if (needed > im.config.max_pages_per_sequence) {
+        const int needed = im.kv->blocks_needed(ids[i], 1);
+        if (static_cast<int>(s.pages.size()) + needed > im.config.max_pages_per_sequence) {
             throw std::length_error("decode_step: sequence " + std::to_string(ids[i]) + " reached its maximum length");
         }
-        new_pages += std::max(0, needed - static_cast<int>(s.pages.size()));
+        new_pages += needed;
         seqs.push_back(&s);
     }
-    if (!im.cache->alloc.can_alloc(new_pages)) {
+    if (new_pages > im.kv->free_blocks()) {
         throw KvCacheExhausted("decode_step: needs " + std::to_string(new_pages) + " new KV pages, " +
-                               std::to_string(im.cache->alloc.num_free()) + " free");
+                               std::to_string(im.kv->free_blocks()) + " free");
     }
 
+    // Every check has passed: take the new blocks (at most one per sequence) from the manager.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        im.kv->append(ids[i], 1);
+        im.sync_pages(ids[i], *seqs[i]);
+    }
     const std::vector<int> toks(tokens.begin(), tokens.end());
     std::vector<int> next;
     model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        im.check_in_sync(ids[i], *seqs[i]);
+    }
     return std::vector<TokenId>(next.begin(), next.end());
 }
 
@@ -253,7 +289,9 @@ void CudaLlmEngineBackend::free_sequence(SeqId id) {
     if (it == impl_->sequences.end()) {
         throw std::invalid_argument("unknown sequence id " + std::to_string(id));
     }
+    it->second.pages.clear();  // the blocks go back to the manager, not to the engine's allocator
     ::free_sequence(*impl_->cache, it->second);
+    impl_->kv->release(id);
     impl_->sequences.erase(it);
 }
 
