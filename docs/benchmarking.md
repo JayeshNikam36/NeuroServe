@@ -50,7 +50,8 @@ Runs every profile (`--profiles`, default `short,mixed`) under every policy (`--
 `fcfs,token-budget,decode-first`; the first is the baseline) for `--rounds` measured rounds
 (default 6), after `--warmup-rounds` (default 1) that are discarded. The server switches policy
 between runs (`PUT /v1/runtime/policy`), so one server process on one warm GPU serves the whole
-comparison.
+comparison. After every run the decision log is read back: every decision of the run must have
+been made by the requested policy, or the comparison stops.
 
 - **Paired.** Within a round every policy runs the same seeded schedule (round r uses seed + r - 1):
   the policies are compared on identical requests. Across rounds the requests change.

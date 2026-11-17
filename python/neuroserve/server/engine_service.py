@@ -134,6 +134,7 @@ class EngineService:
         self._tokenizer = tokenizer
         self._device_name = device_name
         self._stop_token_ids = sorted(tokenizer.stop_token_ids)
+        self._requested_policy: str | None = None  # the last set_scheduling_policy() name
 
     @classmethod
     def load(cls, config: ServerConfig) -> "EngineService":
@@ -181,14 +182,21 @@ class EngineService:
     def cancel(self, engine_request_id: str) -> bool:
         return self._engine.cancel(engine_request_id)
 
-    def scheduling_policy(self) -> str:
-        return self._engine.stats()["policy"]
+    def scheduling_policy(self) -> dict[str, Any]:
+        """The policy deciding now, and a requested one that is not applied yet ("pending").
 
-    def set_scheduling_policy(self, name: str) -> str:
-        """Switches the policy from the next engine step on; returns the previous one."""
-        previous = self.scheduling_policy()
+        The engine switches policy at its next step; an idle engine takes no steps, so a policy
+        requested while idle stays pending until the next request arrives.
+        """
+        current = self._engine.stats()["policy"]
+        pending = self._requested_policy if self._requested_policy not in (None, current) else None
+        return {"policy": current, "pending": pending}
+
+    def set_scheduling_policy(self, name: str) -> dict[str, Any]:
+        """Requests a policy for the next engine step on (unknown name: ValueError)."""
         self._engine.set_scheduling_policy(name)
-        return previous
+        self._requested_policy = name
+        return self.scheduling_policy()
 
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
              ignore_eos: bool = False, priority: int = 1) -> GenerationResult:

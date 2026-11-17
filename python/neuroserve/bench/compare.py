@@ -222,6 +222,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def check_policy(policy: str, decisions: list[dict[str, Any]]) -> None:
+    """Every decision records the policy that made it: a run's must all be the requested one."""
+    used = sorted({d["policy"] for d in decisions})
+    if used != [policy]:
+        raise RuntimeError(f"a run under {policy!r}: the decision log shows {used or 'no decisions'}")
+
+
 def _git_commit() -> str:
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
@@ -245,11 +252,25 @@ class Server:
         return resp.json()
 
     def set_policy(self, policy: str) -> None:
+        """Requests the policy. The engine applies it at its next step, which for an idle engine is
+        the next run's first request: whether the run really used it is checked afterwards, in the
+        decision log (check_policy)."""
         resp = self._http.put("/v1/runtime/policy", json={"policy": policy})
         resp.raise_for_status()
-        actual = self.get("/health")["engine"]["policy"]
-        if actual != policy:
-            raise RuntimeError(f"asked for policy {policy!r}, the server reports {actual!r}")
+        state = resp.json()
+        if policy not in (state["policy"], state["pending"]):
+            raise RuntimeError(f"asked for policy {policy!r}, the server reports {state}")
+
+    def read_decisions(self, since: int) -> tuple[list[dict[str, Any]], int, int]:
+        """Every scheduling decision after `since`: (records, next cursor, records missed)."""
+        records, dropped = [], 0
+        while True:
+            page = self.get(f"/v1/runtime/decisions?since={since}&limit=1000")
+            dropped += page["dropped"]
+            if not page["data"]:
+                return records, since, dropped
+            records += page["data"]
+            since = page["next_since"]
 
     def wait_idle(self, timeout_s: float = 120.0) -> dict[str, Any]:
         """Waits until nothing is queued or running; returns the engine's counters."""
@@ -316,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
           f"(round 1{'' if args.warmup_rounds == 1 else f'-{args.warmup_rounds}'} discarded)"
           if args.warmup_rounds else f"{total} runs")
     runs: list[dict[str, Any]] = []
+    cursor = 0
     started = time.monotonic()
     try:
         for round_index in range(total_rounds):
@@ -328,15 +350,19 @@ def main(argv: list[str] | None = None) -> int:
                 for position, policy in enumerate(order):
                     server.set_policy(policy)
                     before = server.wait_idle()
+                    _, cursor, _ = server.read_decisions(cursor)  # skip to the newest decision
                     with GpuSampler(args.gpu_index, args.sample_interval_s) as sampler:
                         results, duration = asyncio.run(loadgen.run_schedule(args.url, schedule))
                     after = server.wait_idle()
                     gpu = sampler.result()
+                    decisions, cursor, dropped = server.read_decisions(cursor)
+                    check_policy(policy, decisions)
                     record = {
                         "round": round_index + 1, "measured": measured, "profile": profile_name, "policy": policy,
                         "position": position, "seed": seed, "schedule_sha256": schedule_digest(schedule),
                         "duration_s": round(duration, 3), "metrics": run_metrics(results, duration),
                         "engine": {k: after.get(k, 0) - before.get(k, 0) for k in ENGINE_COUNTERS},
+                        "decisions": {"count": len(decisions), "dropped": dropped},
                         "gpu": {k: v for k, v in gpu.items() if k != "samples"},
                     }
                     runs.append(record)

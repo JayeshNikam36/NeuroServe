@@ -106,12 +106,22 @@ class FakeEngine:
         self.client_request_ids: list[str] = []
         self.priorities: list[int] = []
         self.policy = "fcfs"
+        self.next_policy: str | None = None  # like the real engine: applied at the next step
         self.policy_history: list[str] = []  # every set_scheduling_policy call, in order
+        self.decision_log = [{"seq": i, "step": i, "time_ms": 0, "request_id": f"ns-{i:06d}",
+                              "client_request_id": "", "action": "admit", "reason": "admitted", "policy": "fcfs",
+                              "numbers": {"free_pages": 64}} for i in range(1, 6)]
 
     def run(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
         if self.error is not None:
             raise self.error
+        if self.next_policy is not None:  # this request's step is the engine's next step
+            self.policy, self.next_policy = self.next_policy, None
         self.calls.append((list(prompt_ids), max_new_tokens))
+        seq = self.decision_log[-1]["seq"] + 1
+        self.decision_log.append({"seq": seq, "step": seq, "time_ms": 0, "request_id": f"ns-{len(self.calls):06d}",
+                                  "client_request_id": client_request_id, "action": "admit", "reason": "admitted",
+                                  "policy": self.policy, "numbers": {"free_pages": 64}})
         self.stop_token_ids.append(list(stop_token_ids))
         self.client_request_ids.append(client_request_id)
         self.priorities.append(priority)
@@ -149,7 +159,7 @@ class FakeEngine:
     def set_scheduling_policy(self, name):
         if name not in neuroserve.scheduling_policies:
             raise ValueError(f"unknown scheduling policy '{name}'")
-        self.policy = name
+        self.next_policy = name
         self.policy_history.append(name)
 
     def latency(self):
@@ -157,10 +167,7 @@ class FakeEngine:
         return {name: dict(summary) for name in ("queue_ms", "ttft_ms", "itl_ms", "e2e_ms")}
 
     def decisions(self, since=0, limit=100):
-        log = [{"seq": i, "step": i, "time_ms": 0, "request_id": f"ns-{i:06d}", "client_request_id": "",
-                "action": "admit", "reason": "admitted", "policy": "fcfs", "numbers": {"free_pages": 64}}
-               for i in range(1, 6)]
-        page = [d for d in log if d["seq"] > since][:limit]
+        page = [d for d in self.decision_log if d["seq"] > since][:limit]
         return {"data": page, "next_since": page[-1]["seq"] if page else since, "dropped": 0}
 
 
@@ -671,15 +678,20 @@ def test_decisions_endpoint_validates_its_parameters(tok, params, param):
 
 # ---- Day 24: switching the scheduling policy at runtime ------------------------------------------
 
-def test_the_policy_can_be_switched_at_runtime(tok):
+def test_the_policy_switches_at_the_next_engine_step(tok):
     app, engine, _ = make_app(tok)
     with TestClient(app) as client:
         before = client.get("/v1/runtime/policy").json()
-        changed = client.put("/v1/runtime/policy", json={"policy": "decode-first"}).json()
-        health = client.get("/health").json()
-    assert before == {"object": "runtime.policy", "policy": "fcfs", "available": list(neuroserve.scheduling_policies)}
-    assert changed["policy"] == "decode-first" and changed["previous"] == "fcfs"
-    assert health["engine"]["policy"] == "decode-first" and engine.policy_history == ["decode-first"]
+        requested = client.put("/v1/runtime/policy", json={"policy": "decode-first"}).json()
+        idle = client.get("/health").json()["engine"]["policy"]
+        client.post("/v1/chat/completions", json=chat_body(max_tokens=4))
+        after = client.get("/v1/runtime/policy").json()
+    assert before == {"object": "runtime.policy", "policy": "fcfs", "pending": None,
+                      "available": list(neuroserve.scheduling_policies)}
+    # An idle engine takes no steps: the new policy is pending until a request arrives.
+    assert (requested["policy"], requested["pending"]) == ("fcfs", "decode-first") and idle == "fcfs"
+    assert (after["policy"], after["pending"]) == ("decode-first", None)
+    assert engine.decision_log[-1]["policy"] == "decode-first" and engine.policy_history == ["decode-first"]
 
 
 @pytest.mark.parametrize("payload, code", [({"policy": "lifo"}, "unknown_policy"), ({}, None),
@@ -688,6 +700,7 @@ def test_a_bad_policy_change_is_400_and_changes_nothing(tok, payload, code):
     app, engine, _ = make_app(tok)
     with TestClient(app) as client:
         resp = client.put("/v1/runtime/policy", json=payload)
-        policy = client.get("/v1/runtime/policy").json()["policy"]
+        state = client.get("/v1/runtime/policy").json()
+        policy = {"policy": state["policy"], "pending": state["pending"]}
     assert resp.status_code == 400 and resp.json()["error"]["code"] == code
-    assert policy == "fcfs" and engine.policy_history == []
+    assert policy == {"policy": "fcfs", "pending": None} and engine.policy_history == []

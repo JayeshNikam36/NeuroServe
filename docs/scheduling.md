@@ -49,12 +49,14 @@ the work differ. The engine-loop correctness tests run once per policy, and so d
 preemption test (token-exact against Hugging Face).
 
 The policy can be switched while the server runs. The change applies from the next engine step:
-requests in progress keep their state, only later decisions change.
+requests in progress keep their state, only later decisions change. An idle engine takes no steps,
+so a policy requested while idle is `pending` until the next request arrives:
 
-    GET /v1/runtime/policy                              {"object": "runtime.policy", "policy": "fcfs", "available": [...]}
-    PUT /v1/runtime/policy  {"policy": "decode-first"}  {..., "policy": "decode-first", "previous": "fcfs"}
+    GET /v1/runtime/policy                              {"object": "runtime.policy", "policy": "fcfs", "pending": null, "available": [...]}
+    PUT /v1/runtime/policy  {"policy": "decode-first"}  {..., "policy": "fcfs", "pending": "decode-first"}
 
-An unknown name is a 400 (`unknown_policy`). This is an operator control for benchmarks and
+Every decision in the decision log records the policy that made it, so which policy handled a
+request can always be checked afterwards. An unknown name is a 400 (`unknown_policy`). This is an operator control for benchmarks and
 experiments; the server listens on localhost only by default.
 
 ## Priorities and aging

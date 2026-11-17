@@ -346,19 +346,18 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
     @app.get("/v1/runtime/policy")
     async def get_policy(request: Request) -> dict:
         svc: EngineService = request.app.state.service
-        return {"object": "runtime.policy", "policy": svc.scheduling_policy(), "available": list(scheduling_policies)}
+        return {"object": "runtime.policy", **svc.scheduling_policy(), "available": list(scheduling_policies)}
 
     @app.put("/v1/runtime/policy")
     async def set_policy(body: PolicyChange, request: Request) -> dict:
         """Switches the scheduling policy from the next engine step on (A/B benchmarks)."""
         svc: EngineService = request.app.state.service
         try:
-            previous = svc.set_scheduling_policy(body.policy)
+            state = svc.set_scheduling_policy(body.policy)
         except ValueError as exc:
             raise ApiError(400, str(exc), param="policy", code="unknown_policy") from exc
-        logger.info("scheduling policy changed", extra={"policy": body.policy, "previous_policy": previous})
-        return {"object": "runtime.policy", "policy": body.policy, "previous": previous,
-                "available": list(scheduling_policies)}
+        logger.info("scheduling policy requested", extra={"policy": body.policy, "current_policy": state["policy"]})
+        return {"object": "runtime.policy", **state, "available": list(scheduling_policies)}
 
     @app.delete("/v1/requests/{request_id}")
     async def cancel_request(request_id: str, request: Request) -> dict:

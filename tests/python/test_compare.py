@@ -160,6 +160,7 @@ def test_a_comparison_against_the_server(tok, tmp_path):
         assert pair[0]["seed"] == round_                                   # seed 1 + (round - 1)
     assert runs[0]["schedule_sha256"] != runs[2]["schedule_sha256"]        # new requests each round
     assert all(r["metrics"]["succeeded"] == 4 and r["engine"]["completed"] == 4 for r in runs)
+    assert all(r["decisions"] == {"count": 4, "dropped": 0} for r in runs)  # one admission per request
     agg = summary["aggregate"]["short"]
     assert agg["fcfs"]["rounds"] == 2 and agg["decode-first"]["vs_baseline"]["ttft_p95_ms"]["rounds"] == 2
     assert summary["meta"]["model"] == MODEL_NAME and summary["meta"]["orders"] == [
@@ -167,3 +168,13 @@ def test_a_comparison_against_the_server(tok, tmp_path):
     assert len(list((tmp_path / "runs").glob("r0*-short-*.json"))) == 6
     report = (tmp_path / "summary.md").read_text()
     assert report.startswith("# Scheduling policies compared") and "| `decode-first` |" in report
+
+
+def test_a_run_that_did_not_use_its_policy_stops_the_comparison(tok, tmp_path):
+    app, engine, _ = make_app(tok)
+    engine.set_scheduling_policy = lambda name: None  # accepts every policy, never switches
+    with live_server(app) as base_url:
+        with pytest.raises(RuntimeError, match=r"a run under 'decode-first': the decision log shows \['fcfs'\]"):
+            compare.main(["--url", base_url, "--policies", "fcfs,decode-first", "--profiles", "short",
+                          "--requests", "3", "--rate", "50", "--rounds", "1", "--warmup-rounds", "0",
+                          "--cooldown-s", "0", "--out-dir", str(tmp_path)])
