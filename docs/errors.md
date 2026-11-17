@@ -17,6 +17,7 @@ change the status (200 is already sent): the stream ends with one event
 | --- | --- | --- | --- |
 | 400 | `invalid_request_error` | `null` | Invalid body: malformed JSON, missing or wrong-typed field, unknown `neuroserve` option, empty messages/prompt, bad role, token id outside the vocabulary, out-of-range `max_tokens`/`temperature`/`top_p`/`priority` (`param` names the field) |
 | 400 | `invalid_request_error` | `null` | `stream_options` without `stream=true` |
+| 400 | `invalid_request_error` | `unknown_policy` | `PUT /v1/runtime/policy` with a policy the engine does not have |
 | 400 | `invalid_request_error` | `unsupported_parameter` | `n>1`, or `temperature>0` (not supported yet) |
 | 404 | `invalid_request_error` | `model_not_found` | `model` is not the served model |
 | 404 | `invalid_request_error` | `null` | Unknown URL |
