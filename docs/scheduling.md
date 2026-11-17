@@ -136,3 +136,16 @@ The reasons are derived by the engine the same way for every policy: it replays 
 decision against the step's resources and, for each request not admitted, names the first resource
 that was short. A deferral is recorded when its reason changes, not on every step it keeps waiting:
 a request deferred for 500 steps with `batch_full` produces one record, not 500.
+
+## Measured
+
+The first comparison of `fcfs`, `token-budget` and `decode-first` (Day 24; method and full
+analysis in [benchmarking.md](benchmarking.md)):
+
+- With short, uniform prompts the policy makes no practical difference.
+- With mixed prompt lengths, `token-budget` matches `fcfs`: the batch limit binds before the
+  token budget.
+- `decode-first` lowers the worst gap between tokens by 44%, but its prefill cap holds a long
+  prompt until the batch drains, and strict order holds everyone behind it: at 2 requests/s the
+  queue grows until requests time out. Chunked prefill (Phase 4) removes the cap's reason to
+  exist: a long prompt's prefill can then share steps with decodes.
