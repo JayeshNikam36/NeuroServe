@@ -103,16 +103,25 @@ def test_throttle_reasons_are_classified():
                {"sm_clock_mhz": 2100, "reasons": 0}, {"sm_clock_mhz": 2200, "reasons": 0x8 | 0x4}]
     summary = summarize_samples(samples)
     assert summary["thermal_slowdown_frac"] == 0.5 and summary["power_cap_frac"] == 0.5
-    assert summary["sm_clock_mhz_median"] == 2050 and summary["sm_clock_mhz_min"] == 1800
+    assert summary["thermal_slowdown_samples"] == 2
+    assert summary["sm_clock_mhz_median"] == 2050 and summary["sm_clock_mhz_p5"] == 1800  # no utilisation: all
+
+
+def test_clock_figures_ignore_the_idle_ramp_at_a_runs_start():
+    samples = [{"sm_clock_mhz": 585, "util_pct": 14}, {"sm_clock_mhz": 1155, "util_pct": 39},
+               {"sm_clock_mhz": 2730, "util_pct": 97}, {"sm_clock_mhz": 2745, "util_pct": 98}]
+    summary = summarize_samples(samples)
+    assert summary["busy_samples"] == 2 and summary["sm_clock_mhz_p5"] == 2730
+    assert summary["sm_clock_mhz_median"] == 2737.5
 
 
 def _run(round_, policy, ttft_p95, measured=True, clock=2000.0, thermal=0.0):
     metrics = {key: 10.0 for key, _, _ in compare.METRICS}
     metrics.update(ttft_p95_ms=ttft_p95, failed=0)
     gpu = {"available": True, "reason": None,
-           "summary": {"sm_clock_mhz_median": clock, "sm_clock_mhz_min": clock, "temp_c_max": 70,
+           "summary": {"sm_clock_mhz_median": clock, "sm_clock_mhz_p5": clock, "temp_c_max": 70,
                        "power_w_mean": 50.0, "util_pct_mean": 90.0, "thermal_slowdown_frac": thermal,
-                       "power_cap_frac": 0.5}}
+                       "thermal_slowdown_samples": round(thermal * 100), "samples": 100, "power_cap_frac": 0.5}}
     return {"round": round_, "measured": measured, "profile": "short", "policy": policy, "metrics": metrics,
             "engine": {"preemptions": 0}, "gpu": gpu}
 
@@ -136,7 +145,22 @@ def test_throttled_or_off_clock_runs_are_flagged():
     warnings = compare.gpu_warnings(runs)
     assert len(warnings) == 2
     assert "round 2 short decode-first: median SM clock 1700 MHz" in warnings[0]
-    assert "round 3 short fcfs: thermal slowdown in 25% of samples" == warnings[1]
+    assert "round 3 short fcfs: thermal slowdown in 25 of 100 samples" == warnings[1]
+
+
+def test_failures_are_reported_by_code_and_large_changes_as_factors():
+    runs = []
+    for round_ in (2, 3):
+        slow = _run(round_, "decode-first", 3300.0)
+        slow["metrics"].update(failed=2, errors={"queue_timeout": 2})
+        runs += [_run(round_, "fcfs", 100.0), slow]
+    summary = {"meta": {"policies": ["fcfs", "decode-first"], "started_at": "t", "git_commit": "c", "gpu": "g",
+                        "model": "m", "dataset": {"version": "v"}, "measured_rounds": 2, "warmup_rounds": 0,
+                        "seeds": [1, 2]},
+               "aggregate": compare.aggregate(runs, "fcfs"), "warnings": [], "runs": runs}
+    assert summary["aggregate"]["short"]["decode-first"]["errors"] == {"queue_timeout": 4}
+    report = compare.render_markdown(summary)
+    assert "| 4 (queue_timeout 4) |" in report and "×33 (0/2)" in report
 
 
 def test_a_comparison_against_the_server(tok, tmp_path):
@@ -168,6 +192,16 @@ def test_a_comparison_against_the_server(tok, tmp_path):
     assert len(list((tmp_path / "runs").glob("r0*-short-*.json"))) == 6
     report = (tmp_path / "summary.md").read_text()
     assert report.startswith("# Scheduling policies compared") and "| `decode-first` |" in report
+    # The report can be recomputed from the saved runs alone (every request, every GPU sample).
+    (tmp_path / "summary.md").unlink()
+    stripped = {**summary, "runs": [{**r, "metrics": {}, "gpu": {}} for r in runs]}
+    (tmp_path / "summary.json").write_text(json.dumps(stripped))
+    assert compare.main(["--rerender", str(tmp_path)]) == 0
+    again = json.loads((tmp_path / "summary.json").read_text())
+    latency = [key for key, _, _ in compare.METRICS if key != "output_tokens_per_s"]
+    for a, b in zip(summary["runs"], again["runs"]):
+        assert {k: a["metrics"][k] for k in latency} == {k: b["metrics"][k] for k in latency}
+    assert "rerendered_at" in again["meta"] and (tmp_path / "summary.md").exists()
 
 
 def test_a_run_that_did_not_use_its_policy_stops_the_comparison(tok, tmp_path):

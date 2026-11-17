@@ -12,6 +12,7 @@ instead of silently skewing a comparison.
 
 from __future__ import annotations
 
+import math
 import statistics
 import threading
 import time
@@ -25,6 +26,7 @@ HW_THERMAL_SLOWDOWN = 0x40
 HW_POWER_BRAKE_SLOWDOWN = 0x80
 THERMAL_REASONS = HW_SLOWDOWN | SW_THERMAL_SLOWDOWN | HW_THERMAL_SLOWDOWN
 POWER_REASONS = SW_POWER_CAP | HW_POWER_BRAKE_SLOWDOWN
+BUSY_UTIL_PCT = 50  # clock statistics use samples at least this busy: not the idle ramp at a run's start
 
 
 class GpuSampler:
@@ -134,14 +136,19 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         reasons = values("reasons")
         return round(sum(1 for r in reasons if r & mask) / len(reasons), 3) if reasons else None
 
-    sm, temp, power, util = values("sm_clock_mhz"), values("temp_c"), values("power_w"), values("util_pct")
+    busy = [s for s in samples if s.get("util_pct") is not None and s["util_pct"] >= BUSY_UTIL_PCT]
+    sm = [s["sm_clock_mhz"] for s in (busy or samples) if s.get("sm_clock_mhz") is not None]
+    temp, power, util = values("temp_c"), values("power_w"), values("util_pct")
     return {
         "samples": len(samples),
-        "sm_clock_mhz_median": statistics.median(sm) if sm else None,
-        "sm_clock_mhz_min": min(sm) if sm else None,
+        "busy_samples": len(busy),
+        "sm_clock_mhz_median": statistics.median(sm) if sm else None,   # under load (see BUSY_UTIL_PCT)
+        # 5th percentile, not the minimum: the clock needs a second or so to ramp up at a run's start
+        "sm_clock_mhz_p5": sorted(sm)[max(1, math.ceil(0.05 * len(sm))) - 1] if sm else None,
         "temp_c_max": max(temp) if temp else None,
         "power_w_mean": round(statistics.fmean(power), 2) if power else None,
         "util_pct_mean": round(statistics.fmean(util), 1) if util else None,
         "thermal_slowdown_frac": fraction(THERMAL_REASONS),  # share of samples with a thermal reason set
+        "thermal_slowdown_samples": sum(1 for r in values("reasons") if r & THERMAL_REASONS),
         "power_cap_frac": fraction(POWER_REASONS),
     }

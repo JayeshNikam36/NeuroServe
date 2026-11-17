@@ -1,0 +1,3248 @@
+{
+  "meta": {
+    "started_at": "2026-11-17T04:13:00+00:00",
+    "git_commit": "2be6a36",
+    "url": "http://127.0.0.1:8000",
+    "model": "llama-3.2-1b-instruct",
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "policies": [
+      "fcfs",
+      "token-budget",
+      "decode-first"
+    ],
+    "profiles": [
+      "short",
+      "mixed"
+    ],
+    "warmup_rounds": 1,
+    "measured_rounds": 6,
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "orders": [
+      [
+        "fcfs",
+        "token-budget",
+        "decode-first"
+      ],
+      [
+        "token-budget",
+        "decode-first",
+        "fcfs"
+      ],
+      [
+        "decode-first",
+        "fcfs",
+        "token-budget"
+      ],
+      [
+        "decode-first",
+        "token-budget",
+        "fcfs"
+      ],
+      [
+        "fcfs",
+        "decode-first",
+        "token-budget"
+      ],
+      [
+        "token-budget",
+        "fcfs",
+        "decode-first"
+      ]
+    ],
+    "requests_override": null,
+    "rate_override": null,
+    "cooldown_s": 5.0,
+    "dataset": {
+      "version": "prompts-v1",
+      "sha256": "5c6e9220c3b01251bba234f2a991e0e316e63bf7fb109a78f3dbf4a11e5178f9"
+    },
+    "server_at_start": {
+      "engine": {
+        "submitted": 0,
+        "rejected": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "timed_out": 0,
+        "preemptions": 0,
+        "decode_steps": 0,
+        "prefill_tokens": 0,
+        "decode_tokens": 0,
+        "max_step_tokens": 0,
+        "pending": 0,
+        "active": 0,
+        "max_batch_seen": 0,
+        "policy": "fcfs"
+      },
+      "kv_cache": {
+        "page_size_tokens": 16,
+        "total_pages": 2048,
+        "free_pages": 2048,
+        "max_pages_per_sequence": 64
+      }
+    },
+    "finished_at": "2026-11-17T04:53:43+00:00",
+    "rerendered_at": "2026-11-17T05:09:07+00:00"
+  },
+  "aggregate": {
+    "short": {
+      "fcfs": {
+        "rounds": 6,
+        "failed": 0,
+        "preemptions": 0,
+        "errors": {},
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 29.768,
+            "min": 28.953,
+            "max": 30.805
+          },
+          "ttft_p95_ms": {
+            "median": 148.825,
+            "min": 43.912,
+            "max": 293.165
+          },
+          "ttft_p99_ms": {
+            "median": 282.349,
+            "min": 92.966,
+            "max": 421.524
+          },
+          "itl_p50_ms": {
+            "median": 16.505,
+            "min": 16.45,
+            "max": 16.98
+          },
+          "itl_p95_ms": {
+            "median": 17.585,
+            "min": 17.45,
+            "max": 17.8
+          },
+          "max_itl_p95_ms": {
+            "median": 49.855,
+            "min": 47.97,
+            "max": 50.66
+          },
+          "e2e_p50_ms": {
+            "median": 1075.916,
+            "min": 1068.142,
+            "max": 1110.062
+          },
+          "e2e_p95_ms": {
+            "median": 1248.549,
+            "min": 1127.805,
+            "max": 1408.522
+          },
+          "e2e_p99_ms": {
+            "median": 1361.592,
+            "min": 1134.837,
+            "max": 1546.571
+          },
+          "queue_p95_ms": {
+            "median": 125.275,
+            "min": 18.08,
+            "max": 273.63
+          },
+          "output_tokens_per_s": {
+            "median": 234.2,
+            "min": 222.7,
+            "max": 277.5
+          }
+        },
+        "vs_baseline": {}
+      },
+      "token-budget": {
+        "rounds": 6,
+        "failed": 0,
+        "preemptions": 0,
+        "errors": {},
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 29.796,
+            "min": 28.714,
+            "max": 30.709
+          },
+          "ttft_p95_ms": {
+            "median": 164.104,
+            "min": 44.645,
+            "max": 300.733
+          },
+          "ttft_p99_ms": {
+            "median": 311.243,
+            "min": 50.494,
+            "max": 430.578
+          },
+          "itl_p50_ms": {
+            "median": 16.6,
+            "min": 16.39,
+            "max": 16.86
+          },
+          "itl_p95_ms": {
+            "median": 17.625,
+            "min": 17.45,
+            "max": 17.72
+          },
+          "max_itl_p95_ms": {
+            "median": 49.07,
+            "min": 47.63,
+            "max": 50.27
+          },
+          "e2e_p50_ms": {
+            "median": 1077.903,
+            "min": 1065.829,
+            "max": 1103.998
+          },
+          "e2e_p95_ms": {
+            "median": 1302.264,
+            "min": 1130.239,
+            "max": 1424.179
+          },
+          "e2e_p99_ms": {
+            "median": 1512.706,
+            "min": 1139.893,
+            "max": 1597.57
+          },
+          "queue_p95_ms": {
+            "median": 124.6,
+            "min": 22.82,
+            "max": 279.35
+          },
+          "output_tokens_per_s": {
+            "median": 234.2,
+            "min": 222.8,
+            "max": 277.5
+          }
+        },
+        "vs_baseline": {
+          "ttft_p50_ms": {
+            "median_change": -0.0057,
+            "better_in": 5,
+            "rounds": 6
+          },
+          "ttft_p95_ms": {
+            "median_change": 0.0213,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "ttft_p99_ms": {
+            "median_change": 0.0175,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "itl_p50_ms": {
+            "median_change": 0.003,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "itl_p95_ms": {
+            "median_change": 0.0003,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "max_itl_p95_ms": {
+            "median_change": -0.0055,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "e2e_p50_ms": {
+            "median_change": -0.0011,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "e2e_p95_ms": {
+            "median_change": -0.0006,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "e2e_p99_ms": {
+            "median_change": 0.0052,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "queue_p95_ms": {
+            "median_change": 0.0784,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "output_tokens_per_s": {
+            "median_change": 0.0,
+            "better_in": 1,
+            "rounds": 6
+          }
+        }
+      },
+      "decode-first": {
+        "rounds": 6,
+        "failed": 0,
+        "preemptions": 0,
+        "errors": {},
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 30.009,
+            "min": 27.886,
+            "max": 30.975
+          },
+          "ttft_p95_ms": {
+            "median": 156.559,
+            "min": 46.245,
+            "max": 300.515
+          },
+          "ttft_p99_ms": {
+            "median": 313.72,
+            "min": 168.704,
+            "max": 428.772
+          },
+          "itl_p50_ms": {
+            "median": 16.545,
+            "min": 16.46,
+            "max": 16.86
+          },
+          "itl_p95_ms": {
+            "median": 17.58,
+            "min": 17.45,
+            "max": 17.63
+          },
+          "max_itl_p95_ms": {
+            "median": 49.55,
+            "min": 48.14,
+            "max": 50.83
+          },
+          "e2e_p50_ms": {
+            "median": 1077.149,
+            "min": 1066.924,
+            "max": 1108.954
+          },
+          "e2e_p95_ms": {
+            "median": 1291.544,
+            "min": 1133.83,
+            "max": 1384.19
+          },
+          "e2e_p99_ms": {
+            "median": 1501.936,
+            "min": 1182.748,
+            "max": 1545.713
+          },
+          "queue_p95_ms": {
+            "median": 127.49,
+            "min": 25.33,
+            "max": 279.66
+          },
+          "output_tokens_per_s": {
+            "median": 234.2,
+            "min": 222.7,
+            "max": 277.6
+          }
+        },
+        "vs_baseline": {
+          "ttft_p50_ms": {
+            "median_change": -0.0183,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "ttft_p95_ms": {
+            "median_change": 0.0163,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "ttft_p99_ms": {
+            "median_change": 0.0183,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "itl_p50_ms": {
+            "median_change": 0.0006,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "itl_p95_ms": {
+            "median_change": -0.002,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "max_itl_p95_ms": {
+            "median_change": -0.0077,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "e2e_p50_ms": {
+            "median_change": -0.0011,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "e2e_p95_ms": {
+            "median_change": -0.0011,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "e2e_p99_ms": {
+            "median_change": 0.0005,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "queue_p95_ms": {
+            "median_change": 0.0734,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "output_tokens_per_s": {
+            "median_change": 0.0,
+            "better_in": 2,
+            "rounds": 6
+          }
+        }
+      }
+    },
+    "mixed": {
+      "fcfs": {
+        "rounds": 6,
+        "failed": 0,
+        "preemptions": 0,
+        "errors": {},
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 51.918,
+            "min": 48.541,
+            "max": 69.074
+          },
+          "ttft_p95_ms": {
+            "median": 887.767,
+            "min": 187.161,
+            "max": 1030.161
+          },
+          "ttft_p99_ms": {
+            "median": 1180.894,
+            "min": 300.699,
+            "max": 1868.201
+          },
+          "itl_p50_ms": {
+            "median": 16.815,
+            "min": 16.55,
+            "max": 17.08
+          },
+          "itl_p95_ms": {
+            "median": 20.63,
+            "min": 18.29,
+            "max": 21.48
+          },
+          "max_itl_p95_ms": {
+            "median": 146.96,
+            "min": 146.4,
+            "max": 147.6
+          },
+          "e2e_p50_ms": {
+            "median": 2154.709,
+            "min": 2064.484,
+            "max": 2250.872
+          },
+          "e2e_p95_ms": {
+            "median": 6744.823,
+            "min": 6505.021,
+            "max": 7025.014
+          },
+          "e2e_p99_ms": {
+            "median": 7045.35,
+            "min": 6740.308,
+            "max": 7480.922
+          },
+          "queue_p95_ms": {
+            "median": 766.37,
+            "min": 129.96,
+            "max": 989.54
+          },
+          "output_tokens_per_s": {
+            "median": 254.75,
+            "min": 215.8,
+            "max": 321.7
+          }
+        },
+        "vs_baseline": {}
+      },
+      "token-budget": {
+        "rounds": 6,
+        "failed": 0,
+        "preemptions": 0,
+        "errors": {},
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 52.067,
+            "min": 49.192,
+            "max": 65.187
+          },
+          "ttft_p95_ms": {
+            "median": 889.895,
+            "min": 201.216,
+            "max": 1019.718
+          },
+          "ttft_p99_ms": {
+            "median": 1185.171,
+            "min": 335.298,
+            "max": 1852.366
+          },
+          "itl_p50_ms": {
+            "median": 16.8,
+            "min": 16.61,
+            "max": 17.17
+          },
+          "itl_p95_ms": {
+            "median": 20.64,
+            "min": 18.25,
+            "max": 21.29
+          },
+          "max_itl_p95_ms": {
+            "median": 147.285,
+            "min": 145.97,
+            "max": 147.36
+          },
+          "e2e_p50_ms": {
+            "median": 2158.661,
+            "min": 2070.148,
+            "max": 2253.824
+          },
+          "e2e_p95_ms": {
+            "median": 6734.215,
+            "min": 6507.263,
+            "max": 7026.309
+          },
+          "e2e_p99_ms": {
+            "median": 7111.351,
+            "min": 6794.634,
+            "max": 7465.206
+          },
+          "queue_p95_ms": {
+            "median": 767.2,
+            "min": 116.24,
+            "max": 978.76
+          },
+          "output_tokens_per_s": {
+            "median": 254.85,
+            "min": 215.7,
+            "max": 321.6
+          }
+        },
+        "vs_baseline": {
+          "ttft_p50_ms": {
+            "median_change": -0.0122,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "ttft_p95_ms": {
+            "median_change": 0.0061,
+            "better_in": 1,
+            "rounds": 6
+          },
+          "ttft_p99_ms": {
+            "median_change": 0.002,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "itl_p50_ms": {
+            "median_change": 0.0009,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "itl_p95_ms": {
+            "median_change": -0.001,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "max_itl_p95_ms": {
+            "median_change": 0.0006,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "e2e_p50_ms": {
+            "median_change": 0.0019,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "e2e_p95_ms": {
+            "median_change": -0.0001,
+            "better_in": 3,
+            "rounds": 6
+          },
+          "e2e_p99_ms": {
+            "median_change": 0.0036,
+            "better_in": 2,
+            "rounds": 6
+          },
+          "queue_p95_ms": {
+            "median_change": -0.0103,
+            "better_in": 4,
+            "rounds": 6
+          },
+          "output_tokens_per_s": {
+            "median_change": 0.0002,
+            "better_in": 3,
+            "rounds": 6
+          }
+        }
+      },
+      "decode-first": {
+        "rounds": 6,
+        "failed": 35,
+        "preemptions": 0,
+        "errors": {
+          "queue_timeout": 35
+        },
+        "metrics": {
+          "ttft_p50_ms": {
+            "median": 22299.944,
+            "min": 13676.437,
+            "max": 27565.097
+          },
+          "ttft_p95_ms": {
+            "median": 29514.99,
+            "min": 27992.236,
+            "max": 29981.387
+          },
+          "ttft_p99_ms": {
+            "median": 29954.711,
+            "min": 29013.061,
+            "max": 30039.73
+          },
+          "itl_p50_ms": {
+            "median": 16.095,
+            "min": 15.96,
+            "max": 16.3
+          },
+          "itl_p95_ms": {
+            "median": 19.02,
+            "min": 18.49,
+            "max": 19.79
+          },
+          "max_itl_p95_ms": {
+            "median": 82.73,
+            "min": 73.09,
+            "max": 98.86
+          },
+          "e2e_p50_ms": {
+            "median": 23773.317,
+            "min": 16864.064,
+            "max": 29017.057
+          },
+          "e2e_p95_ms": {
+            "median": 32804.643,
+            "min": 29440.143,
+            "max": 35500.796
+          },
+          "e2e_p99_ms": {
+            "median": 35401.612,
+            "min": 30882.283,
+            "max": 36084.73
+          },
+          "queue_p95_ms": {
+            "median": 29405.6,
+            "min": 27498.5,
+            "max": 29827.44
+          },
+          "output_tokens_per_s": {
+            "median": 180.1,
+            "min": 152.9,
+            "max": 199.7
+          }
+        },
+        "vs_baseline": {
+          "ttft_p50_ms": {
+            "median_change": 385.8037,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "ttft_p95_ms": {
+            "median_change": 32.0037,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "ttft_p99_ms": {
+            "median_change": 24.2069,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "itl_p50_ms": {
+            "median_change": -0.0378,
+            "better_in": 6,
+            "rounds": 6
+          },
+          "itl_p95_ms": {
+            "median_change": -0.0644,
+            "better_in": 5,
+            "rounds": 6
+          },
+          "max_itl_p95_ms": {
+            "median_change": -0.4365,
+            "better_in": 6,
+            "rounds": 6
+          },
+          "e2e_p50_ms": {
+            "median_change": 9.8569,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "e2e_p95_ms": {
+            "median_change": 3.8128,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "e2e_p99_ms": {
+            "median_change": 3.8924,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "queue_p95_ms": {
+            "median_change": 36.3028,
+            "better_in": 0,
+            "rounds": 6
+          },
+          "output_tokens_per_s": {
+            "median_change": -0.3421,
+            "better_in": 0,
+            "rounds": 6
+          }
+        }
+      }
+    }
+  },
+  "warnings": [
+    "round 4 mixed token-budget: thermal slowdown in 1 of 358 samples"
+  ],
+  "runs": [
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 1,
+      "schedule_sha256": "4aa685c32ceae43088b51b5806c3085067b2e4b46f75c9e308ed9f03cafaa7c7",
+      "duration_s": 32.671,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 28.565,
+        "ttft_p95_ms": 116.082,
+        "ttft_p99_ms": 303.825,
+        "itl_p50_ms": 16.5,
+        "itl_p95_ms": 17.63,
+        "max_itl_p95_ms": 48.55,
+        "e2e_p50_ms": 1071.46,
+        "e2e_p95_ms": 1148.041,
+        "e2e_p99_ms": 1331.487,
+        "queue_p95_ms": 86.52,
+        "output_tokens_per_s": 235.1
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1950,
+        "prefill_tokens": 5200,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 129,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 160,
+          "busy_samples": 154,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 61,
+          "power_w_mean": 57.2,
+          "util_pct_mean": 93.5,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 1,
+      "schedule_sha256": "4aa685c32ceae43088b51b5806c3085067b2e4b46f75c9e308ed9f03cafaa7c7",
+      "duration_s": 32.668,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.238,
+        "ttft_p95_ms": 106.821,
+        "ttft_p99_ms": 307.965,
+        "itl_p50_ms": 16.49,
+        "itl_p95_ms": 17.58,
+        "max_itl_p95_ms": 48.11,
+        "e2e_p50_ms": 1074.164,
+        "e2e_p95_ms": 1142.51,
+        "e2e_p99_ms": 1338.841,
+        "queue_p95_ms": 82.91,
+        "output_tokens_per_s": 235.1
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1948,
+        "prefill_tokens": 5200,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 129,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 160,
+          "busy_samples": 155,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 63,
+          "power_w_mean": 57.63,
+          "util_pct_mean": 94.4,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 1,
+      "schedule_sha256": "4aa685c32ceae43088b51b5806c3085067b2e4b46f75c9e308ed9f03cafaa7c7",
+      "duration_s": 32.667,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.454,
+        "ttft_p95_ms": 103.655,
+        "ttft_p99_ms": 303.368,
+        "itl_p50_ms": 16.48,
+        "itl_p95_ms": 17.54,
+        "max_itl_p95_ms": 48.49,
+        "e2e_p50_ms": 1072.828,
+        "e2e_p95_ms": 1150.368,
+        "e2e_p99_ms": 1325.67,
+        "queue_p95_ms": 75.56,
+        "output_tokens_per_s": 235.1
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1948,
+        "prefill_tokens": 5200,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 129,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 160,
+          "busy_samples": 155,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 64,
+          "power_w_mean": 58.49,
+          "util_pct_mean": 94.6,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 1,
+      "schedule_sha256": "c48e489ab7d0640402840c7385240e2e56bb83ba55f26014342811ac46c238e4",
+      "duration_s": 65.668,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 52.845,
+        "ttft_p95_ms": 398.574,
+        "ttft_p99_ms": 909.574,
+        "itl_p50_ms": 17.03,
+        "itl_p95_ms": 20.34,
+        "max_itl_p95_ms": 146.91,
+        "e2e_p50_ms": 2144.302,
+        "e2e_p95_ms": 6723.97,
+        "e2e_p99_ms": 7346.308,
+        "queue_p95_ms": 322.08,
+        "output_tokens_per_s": 254.9
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3661,
+        "prefill_tokens": 17792,
+        "decode_tokens": 16616
+      },
+      "decisions": {
+        "count": 138,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 299,
+          "busy_samples": 281,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 57.5,
+          "util_pct_mean": 91.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 1,
+      "schedule_sha256": "c48e489ab7d0640402840c7385240e2e56bb83ba55f26014342811ac46c238e4",
+      "duration_s": 65.64,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 50.479,
+        "ttft_p95_ms": 407.24,
+        "ttft_p99_ms": 879.422,
+        "itl_p50_ms": 16.98,
+        "itl_p95_ms": 20.22,
+        "max_itl_p95_ms": 147.21,
+        "e2e_p50_ms": 2144.562,
+        "e2e_p95_ms": 6763.458,
+        "e2e_p99_ms": 7342.191,
+        "queue_p95_ms": 323.97,
+        "output_tokens_per_s": 255.0
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3668,
+        "prefill_tokens": 17792,
+        "decode_tokens": 16616
+      },
+      "decisions": {
+        "count": 136,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 317,
+          "busy_samples": 298,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 71,
+          "power_w_mean": 58.85,
+          "util_pct_mean": 91.9,
+          "thermal_slowdown_frac": 0.003,
+          "thermal_slowdown_samples": 1,
+          "power_cap_frac": 0.006
+        }
+      }
+    },
+    {
+      "round": 1,
+      "measured": false,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 1,
+      "schedule_sha256": "c48e489ab7d0640402840c7385240e2e56bb83ba55f26014342811ac46c238e4",
+      "duration_s": 91.251,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 112,
+        "failed": 8,
+        "errors": {
+          "queue_timeout": 8
+        },
+        "ttft_p50_ms": 16518.272,
+        "ttft_p95_ms": 29160.83,
+        "ttft_p99_ms": 30010.534,
+        "itl_p50_ms": 16.28,
+        "itl_p95_ms": 19.96,
+        "max_itl_p95_ms": 90.76,
+        "e2e_p50_ms": 18382.953,
+        "e2e_p95_ms": 31833.366,
+        "e2e_p99_ms": 33869.633,
+        "queue_p95_ms": 29068.22,
+        "output_tokens_per_s": 171.8
+      },
+      "engine": {
+        "completed": 112,
+        "rejected": 0,
+        "timed_out": 8,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 5484,
+        "prefill_tokens": 14400,
+        "decode_tokens": 15568
+      },
+      "decisions": {
+        "count": 1227,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 445,
+          "busy_samples": 427,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 72,
+          "power_w_mean": 61.05,
+          "util_pct_mean": 93.6,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.004
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 2,
+      "schedule_sha256": "0adfae513309a8a2d5c202eafc5947d35c608b22c29bbbd6b7d8f6f5d7ad5482",
+      "duration_s": 33.185,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.457,
+        "ttft_p95_ms": 247.144,
+        "ttft_p99_ms": 383.127,
+        "itl_p50_ms": 16.7,
+        "itl_p95_ms": 17.65,
+        "max_itl_p95_ms": 49.75,
+        "e2e_p50_ms": 1087.608,
+        "e2e_p95_ms": 1359.41,
+        "e2e_p99_ms": 1466.167,
+        "queue_p95_ms": 226.03,
+        "output_tokens_per_s": 231.4
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1958,
+        "prefill_tokens": 5218,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 138,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 149,
+          "busy_samples": 142,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 69,
+          "power_w_mean": 59.18,
+          "util_pct_mean": 93.2,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 2,
+      "schedule_sha256": "0adfae513309a8a2d5c202eafc5947d35c608b22c29bbbd6b7d8f6f5d7ad5482",
+      "duration_s": 33.187,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.588,
+        "ttft_p95_ms": 274.547,
+        "ttft_p99_ms": 379.085,
+        "itl_p50_ms": 16.8,
+        "itl_p95_ms": 17.72,
+        "max_itl_p95_ms": 49.56,
+        "e2e_p50_ms": 1092.986,
+        "e2e_p95_ms": 1424.179,
+        "e2e_p99_ms": 1597.57,
+        "queue_p95_ms": 221.35,
+        "output_tokens_per_s": 231.4
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1935,
+        "prefill_tokens": 5218,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 138,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 150,
+          "busy_samples": 143,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 58.47,
+          "util_pct_mean": 93.9,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 2,
+      "schedule_sha256": "0adfae513309a8a2d5c202eafc5947d35c608b22c29bbbd6b7d8f6f5d7ad5482",
+      "duration_s": 33.186,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.967,
+        "ttft_p95_ms": 249.021,
+        "ttft_p99_ms": 390.556,
+        "itl_p50_ms": 16.7,
+        "itl_p95_ms": 17.62,
+        "max_itl_p95_ms": 49.58,
+        "e2e_p50_ms": 1085.487,
+        "e2e_p95_ms": 1361.139,
+        "e2e_p99_ms": 1467.702,
+        "queue_p95_ms": 227.4,
+        "output_tokens_per_s": 231.4
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1960,
+        "prefill_tokens": 5218,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 138,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 151,
+          "busy_samples": 144,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 58.78,
+          "util_pct_mean": 93.5,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 2,
+      "schedule_sha256": "c4b842617286289237b4f475fc98af6d60ffa7710014dde1e9ac2309f019ac59",
+      "duration_s": 72.174,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 52.271,
+        "ttft_p95_ms": 930.368,
+        "ttft_p99_ms": 1292.077,
+        "itl_p50_ms": 16.64,
+        "itl_p95_ms": 19.72,
+        "max_itl_p95_ms": 146.68,
+        "e2e_p50_ms": 2148.614,
+        "e2e_p95_ms": 6685.3,
+        "e2e_p99_ms": 7140.398,
+        "queue_p95_ms": 766.53,
+        "output_tokens_per_s": 232.3
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4113,
+        "prefill_tokens": 16544,
+        "decode_tokens": 16648
+      },
+      "decisions": {
+        "count": 144,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 350,
+          "busy_samples": 331,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 68,
+          "power_w_mean": 57.99,
+          "util_pct_mean": 93.0,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.009
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 2,
+      "schedule_sha256": "c4b842617286289237b4f475fc98af6d60ffa7710014dde1e9ac2309f019ac59",
+      "duration_s": 72.173,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 50.652,
+        "ttft_p95_ms": 933.613,
+        "ttft_p99_ms": 1295.393,
+        "itl_p50_ms": 16.63,
+        "itl_p95_ms": 19.74,
+        "max_itl_p95_ms": 147.34,
+        "e2e_p50_ms": 2153.38,
+        "e2e_p95_ms": 6682.937,
+        "e2e_p99_ms": 7160.348,
+        "queue_p95_ms": 759.07,
+        "output_tokens_per_s": 232.3
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4119,
+        "prefill_tokens": 16544,
+        "decode_tokens": 16648
+      },
+      "decisions": {
+        "count": 145,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 349,
+          "busy_samples": 329,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 57.93,
+          "util_pct_mean": 92.9,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 2,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 2,
+      "schedule_sha256": "c4b842617286289237b4f475fc98af6d60ffa7710014dde1e9ac2309f019ac59",
+      "duration_s": 85.748,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 16248.121,
+        "ttft_p95_ms": 27992.236,
+        "ttft_p99_ms": 29013.061,
+        "itl_p50_ms": 16.12,
+        "itl_p95_ms": 19.08,
+        "max_itl_p95_ms": 82.6,
+        "e2e_p50_ms": 19034.533,
+        "e2e_p95_ms": 29440.143,
+        "e2e_p99_ms": 30882.283,
+        "queue_p95_ms": 27498.5,
+        "output_tokens_per_s": 195.5
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 5203,
+        "prefill_tokens": 16544,
+        "decode_tokens": 16648
+      },
+      "decisions": {
+        "count": 1331,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 416,
+          "busy_samples": 408,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 70,
+          "power_w_mean": 61.47,
+          "util_pct_mean": 96.4,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 0,
+      "seed": 3,
+      "schedule_sha256": "750b2b0af58998e1d0e37b0cdc03d7f7e6383ed2021db2fd3bb3d74622f45e0a",
+      "duration_s": 34.476,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.054,
+        "ttft_p95_ms": 47.847,
+        "ttft_p99_ms": 218.33,
+        "itl_p50_ms": 16.5,
+        "itl_p95_ms": 17.45,
+        "max_itl_p95_ms": 50.27,
+        "e2e_p50_ms": 1071.919,
+        "e2e_p95_ms": 1133.961,
+        "e2e_p99_ms": 1189.895,
+        "queue_p95_ms": 26.77,
+        "output_tokens_per_s": 222.8
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2028,
+        "prefill_tokens": 5213,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 124,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 169,
+          "busy_samples": 162,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 58.48,
+          "util_pct_mean": 94.1,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 1,
+      "seed": 3,
+      "schedule_sha256": "750b2b0af58998e1d0e37b0cdc03d7f7e6383ed2021db2fd3bb3d74622f45e0a",
+      "duration_s": 34.479,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 27.886,
+        "ttft_p95_ms": 47.557,
+        "ttft_p99_ms": 168.704,
+        "itl_p50_ms": 16.46,
+        "itl_p95_ms": 17.45,
+        "max_itl_p95_ms": 49.52,
+        "e2e_p50_ms": 1069.482,
+        "e2e_p95_ms": 1133.83,
+        "e2e_p99_ms": 1182.748,
+        "queue_p95_ms": 26.82,
+        "output_tokens_per_s": 222.7
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2058,
+        "prefill_tokens": 5213,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 124,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 169,
+          "busy_samples": 162,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 59.18,
+          "util_pct_mean": 93.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 2,
+      "seed": 3,
+      "schedule_sha256": "750b2b0af58998e1d0e37b0cdc03d7f7e6383ed2021db2fd3bb3d74622f45e0a",
+      "duration_s": 34.493,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.456,
+        "ttft_p95_ms": 47.339,
+        "ttft_p99_ms": 170.466,
+        "itl_p50_ms": 16.45,
+        "itl_p95_ms": 17.52,
+        "max_itl_p95_ms": 50.12,
+        "e2e_p50_ms": 1075.015,
+        "e2e_p95_ms": 1137.688,
+        "e2e_p99_ms": 1182.806,
+        "queue_p95_ms": 21.4,
+        "output_tokens_per_s": 222.7
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2058,
+        "prefill_tokens": 5213,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 124,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 169,
+          "busy_samples": 163,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 67,
+          "power_w_mean": 59.11,
+          "util_pct_mean": 93.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 0,
+      "seed": 3,
+      "schedule_sha256": "b059eb4d8ef50b992db51af5b1bbb7124a3a398015d08704a8fe32aedd0c2af3",
+      "duration_s": 60.477,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 65.187,
+        "ttft_p95_ms": 981.703,
+        "ttft_p99_ms": 1845.365,
+        "itl_p50_ms": 17.05,
+        "itl_p95_ms": 21.29,
+        "max_itl_p95_ms": 146.24,
+        "e2e_p50_ms": 2163.942,
+        "e2e_p95_ms": 7026.309,
+        "e2e_p99_ms": 7465.206,
+        "queue_p95_ms": 886.78,
+        "output_tokens_per_s": 265.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3548,
+        "prefill_tokens": 19296,
+        "decode_tokens": 15944
+      },
+      "decisions": {
+        "count": 140,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 295,
+          "busy_samples": 293,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 60.15,
+          "util_pct_mean": 97.0,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 1,
+      "seed": 3,
+      "schedule_sha256": "b059eb4d8ef50b992db51af5b1bbb7124a3a398015d08704a8fe32aedd0c2af3",
+      "duration_s": 88.755,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 108,
+        "failed": 12,
+        "errors": {
+          "queue_timeout": 12
+        },
+        "ttft_p50_ms": 27565.097,
+        "ttft_p95_ms": 29981.387,
+        "ttft_p99_ms": 30039.73,
+        "itl_p50_ms": 15.96,
+        "itl_p95_ms": 18.49,
+        "max_itl_p95_ms": 73.21,
+        "e2e_p50_ms": 29017.057,
+        "e2e_p95_ms": 34242.821,
+        "e2e_p99_ms": 35893.954,
+        "queue_p95_ms": 29827.44,
+        "output_tokens_per_s": 159.4
+      },
+      "engine": {
+        "completed": 108,
+        "rejected": 0,
+        "timed_out": 12,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 5605,
+        "prefill_tokens": 13536,
+        "decode_tokens": 14036
+      },
+      "decisions": {
+        "count": 1432,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 432,
+          "busy_samples": 429,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 71,
+          "power_w_mean": 63.32,
+          "util_pct_mean": 97.3,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 3,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 2,
+      "seed": 3,
+      "schedule_sha256": "b059eb4d8ef50b992db51af5b1bbb7124a3a398015d08704a8fe32aedd0c2af3",
+      "duration_s": 60.503,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 69.074,
+        "ttft_p95_ms": 973.241,
+        "ttft_p99_ms": 1842.881,
+        "itl_p50_ms": 17.05,
+        "itl_p95_ms": 21.48,
+        "max_itl_p95_ms": 147.09,
+        "e2e_p50_ms": 2160.805,
+        "e2e_p95_ms": 7025.014,
+        "e2e_p99_ms": 7480.922,
+        "queue_p95_ms": 878.53,
+        "output_tokens_per_s": 265.5
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3544,
+        "prefill_tokens": 19296,
+        "decode_tokens": 15944
+      },
+      "decisions": {
+        "count": 139,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 295,
+          "busy_samples": 291,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 70,
+          "power_w_mean": 60.7,
+          "util_pct_mean": 96.3,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 0,
+      "seed": 4,
+      "schedule_sha256": "92d31ff45bbaa8b455803eb266ad0dcd48685767cf84d81287ccb2816937ab52",
+      "duration_s": 29.959,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.099,
+        "ttft_p95_ms": 64.097,
+        "ttft_p99_ms": 240.611,
+        "itl_p50_ms": 16.61,
+        "itl_p95_ms": 17.54,
+        "max_itl_p95_ms": 50.83,
+        "e2e_p50_ms": 1081.626,
+        "e2e_p95_ms": 1224.711,
+        "e2e_p99_ms": 1529.729,
+        "queue_p95_ms": 27.58,
+        "output_tokens_per_s": 256.4
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1770,
+        "prefill_tokens": 5244,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 123,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 147,
+          "busy_samples": 143,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 67,
+          "power_w_mean": 58.41,
+          "util_pct_mean": 95.6,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 1,
+      "seed": 4,
+      "schedule_sha256": "92d31ff45bbaa8b455803eb266ad0dcd48685767cf84d81287ccb2816937ab52",
+      "duration_s": 29.964,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.08,
+        "ttft_p95_ms": 50.506,
+        "ttft_p99_ms": 181.57,
+        "itl_p50_ms": 16.55,
+        "itl_p95_ms": 17.45,
+        "max_itl_p95_ms": 49.96,
+        "e2e_p50_ms": 1076.816,
+        "e2e_p95_ms": 1136.105,
+        "e2e_p99_ms": 1257.017,
+        "queue_p95_ms": 24.52,
+        "output_tokens_per_s": 256.3
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1787,
+        "prefill_tokens": 5244,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 123,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 147,
+          "busy_samples": 144,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 66,
+          "power_w_mean": 58.42,
+          "util_pct_mean": 95.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 2,
+      "seed": 4,
+      "schedule_sha256": "92d31ff45bbaa8b455803eb266ad0dcd48685767cf84d81287ccb2816937ab52",
+      "duration_s": 29.97,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.003,
+        "ttft_p95_ms": 53.661,
+        "ttft_p99_ms": 243.4,
+        "itl_p50_ms": 16.69,
+        "itl_p95_ms": 17.62,
+        "max_itl_p95_ms": 50.09,
+        "e2e_p50_ms": 1083.888,
+        "e2e_p95_ms": 1244.977,
+        "e2e_p99_ms": 1561.871,
+        "queue_p95_ms": 27.85,
+        "output_tokens_per_s": 256.3
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1766,
+        "prefill_tokens": 5244,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 123,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 146,
+          "busy_samples": 142,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 66,
+          "power_w_mean": 57.97,
+          "util_pct_mean": 95.5,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 0,
+      "seed": 4,
+      "schedule_sha256": "6ca5880c387c01aea70c12e90acbdbf4a0020817f938349516e421e180105330",
+      "duration_s": 103.156,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 119,
+        "failed": 1,
+        "errors": {
+          "queue_timeout": 1
+        },
+        "ttft_p50_ms": 13676.437,
+        "ttft_p95_ms": 29280.708,
+        "ttft_p99_ms": 30006.811,
+        "itl_p50_ms": 16.03,
+        "itl_p95_ms": 19.2,
+        "max_itl_p95_ms": 98.86,
+        "e2e_p50_ms": 16864.064,
+        "e2e_p95_ms": 30907.082,
+        "e2e_p99_ms": 35255.845,
+        "queue_p95_ms": 29134.67,
+        "output_tokens_per_s": 152.9
+      },
+      "engine": {
+        "completed": 119,
+        "rejected": 0,
+        "timed_out": 1,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 6433,
+        "prefill_tokens": 18112,
+        "decode_tokens": 15657
+      },
+      "decisions": {
+        "count": 1314,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 501,
+          "busy_samples": 496,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 71,
+          "power_w_mean": 63.46,
+          "util_pct_mean": 96.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 1,
+      "seed": 4,
+      "schedule_sha256": "6ca5880c387c01aea70c12e90acbdbf4a0020817f938349516e421e180105330",
+      "duration_s": 73.705,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 48.541,
+        "ttft_p95_ms": 187.161,
+        "ttft_p99_ms": 300.699,
+        "itl_p50_ms": 16.55,
+        "itl_p95_ms": 21.0,
+        "max_itl_p95_ms": 146.4,
+        "e2e_p50_ms": 2064.484,
+        "e2e_p95_ms": 6505.021,
+        "e2e_p99_ms": 6740.308,
+        "queue_p95_ms": 129.96,
+        "output_tokens_per_s": 215.8
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4265,
+        "prefill_tokens": 18592,
+        "decode_tokens": 15784
+      },
+      "decisions": {
+        "count": 124,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 335,
+          "busy_samples": 322,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 70,
+          "power_w_mean": 59.23,
+          "util_pct_mean": 94.1,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 4,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 2,
+      "seed": 4,
+      "schedule_sha256": "6ca5880c387c01aea70c12e90acbdbf4a0020817f938349516e421e180105330",
+      "duration_s": 73.724,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 50.003,
+        "ttft_p95_ms": 201.216,
+        "ttft_p99_ms": 335.298,
+        "itl_p50_ms": 16.61,
+        "itl_p95_ms": 20.97,
+        "max_itl_p95_ms": 147.32,
+        "e2e_p50_ms": 2070.148,
+        "e2e_p95_ms": 6507.263,
+        "e2e_p99_ms": 6794.634,
+        "queue_p95_ms": 116.24,
+        "output_tokens_per_s": 215.7
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4243,
+        "prefill_tokens": 18592,
+        "decode_tokens": 15784
+      },
+      "decisions": {
+        "count": 124,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 358,
+          "busy_samples": 344,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 58.62,
+          "util_pct_mean": 93.9,
+          "thermal_slowdown_frac": 0.003,
+          "thermal_slowdown_samples": 1,
+          "power_cap_frac": 0.003
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 0,
+      "seed": 5,
+      "schedule_sha256": "0ddd320982eb5731216048143256f00bc48caab209454f81fcb303b5a19830c6",
+      "duration_s": 32.873,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 28.36,
+        "ttft_p95_ms": 46.245,
+        "ttft_p99_ms": 241.787,
+        "itl_p50_ms": 16.48,
+        "itl_p95_ms": 17.49,
+        "max_itl_p95_ms": 48.14,
+        "e2e_p50_ms": 1072.672,
+        "e2e_p95_ms": 1136.432,
+        "e2e_p99_ms": 1532.551,
+        "queue_p95_ms": 25.33,
+        "output_tokens_per_s": 233.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1981,
+        "prefill_tokens": 5235,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 121,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 148,
+          "busy_samples": 146,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 59.58,
+          "util_pct_mean": 96.0,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 5,
+      "schedule_sha256": "0ddd320982eb5731216048143256f00bc48caab209454f81fcb303b5a19830c6",
+      "duration_s": 32.879,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 28.714,
+        "ttft_p95_ms": 44.645,
+        "ttft_p99_ms": 50.494,
+        "itl_p50_ms": 16.51,
+        "itl_p95_ms": 17.51,
+        "max_itl_p95_ms": 48.58,
+        "e2e_p50_ms": 1069.63,
+        "e2e_p95_ms": 1130.239,
+        "e2e_p99_ms": 1139.893,
+        "queue_p95_ms": 22.82,
+        "output_tokens_per_s": 233.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2015,
+        "prefill_tokens": 5235,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 121,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 148,
+          "busy_samples": 146,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 59.94,
+          "util_pct_mean": 96.1,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 2,
+      "seed": 5,
+      "schedule_sha256": "0ddd320982eb5731216048143256f00bc48caab209454f81fcb303b5a19830c6",
+      "duration_s": 32.871,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 28.953,
+        "ttft_p95_ms": 43.912,
+        "ttft_p99_ms": 92.966,
+        "itl_p50_ms": 16.46,
+        "itl_p95_ms": 17.46,
+        "max_itl_p95_ms": 49.7,
+        "e2e_p50_ms": 1069.693,
+        "e2e_p95_ms": 1127.805,
+        "e2e_p99_ms": 1134.837,
+        "queue_p95_ms": 18.08,
+        "output_tokens_per_s": 233.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2011,
+        "prefill_tokens": 5235,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 121,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 148,
+          "busy_samples": 147,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 59.96,
+          "util_pct_mean": 96.3,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 0,
+      "seed": 5,
+      "schedule_sha256": "d5688e08763f6eebf5d4ca7800b9187adb7acabbe9e5fa71a3ed8af92fd84073",
+      "duration_s": 79.643,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 111,
+        "failed": 9,
+        "errors": {
+          "queue_timeout": 9
+        },
+        "ttft_p50_ms": 26917.812,
+        "ttft_p95_ms": 29751.205,
+        "ttft_p99_ms": 29908.158,
+        "itl_p50_ms": 16.3,
+        "itl_p95_ms": 18.82,
+        "max_itl_p95_ms": 82.86,
+        "e2e_p50_ms": 28054.338,
+        "e2e_p95_ms": 35500.796,
+        "e2e_p99_ms": 36084.73,
+        "queue_p95_ms": 29676.53,
+        "output_tokens_per_s": 199.7
+      },
+      "engine": {
+        "completed": 111,
+        "rejected": 0,
+        "timed_out": 9,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4944,
+        "prefill_tokens": 12928,
+        "decode_tokens": 15793
+      },
+      "decisions": {
+        "count": 1300,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 369,
+          "busy_samples": 364,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 62.11,
+          "util_pct_mean": 96.7,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 1,
+      "seed": 5,
+      "schedule_sha256": "d5688e08763f6eebf5d4ca7800b9187adb7acabbe9e5fa71a3ed8af92fd84073",
+      "duration_s": 52.134,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 54.675,
+        "ttft_p95_ms": 846.177,
+        "ttft_p99_ms": 1074.948,
+        "itl_p50_ms": 17.17,
+        "itl_p95_ms": 20.39,
+        "max_itl_p95_ms": 147.25,
+        "e2e_p50_ms": 2223.088,
+        "e2e_p95_ms": 6915.037,
+        "e2e_p99_ms": 7267.632,
+        "queue_p95_ms": 775.33,
+        "output_tokens_per_s": 321.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 2980,
+        "prefill_tokens": 17248,
+        "decode_tokens": 16648
+      },
+      "decisions": {
+        "count": 153,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 243,
+          "busy_samples": 238,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 70,
+          "power_w_mean": 60.41,
+          "util_pct_mean": 95.9,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 5,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 2,
+      "seed": 5,
+      "schedule_sha256": "d5688e08763f6eebf5d4ca7800b9187adb7acabbe9e5fa71a3ed8af92fd84073",
+      "duration_s": 52.129,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 51.564,
+        "ttft_p95_ms": 845.166,
+        "ttft_p99_ms": 1069.71,
+        "itl_p50_ms": 17.08,
+        "itl_p95_ms": 20.4,
+        "max_itl_p95_ms": 146.83,
+        "e2e_p50_ms": 2216.587,
+        "e2e_p95_ms": 6902.13,
+        "e2e_p99_ms": 7236.143,
+        "queue_p95_ms": 766.21,
+        "output_tokens_per_s": 321.7
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3003,
+        "prefill_tokens": 17248,
+        "decode_tokens": 16648
+      },
+      "decisions": {
+        "count": 156,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 243,
+          "busy_samples": 239,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 60.55,
+          "util_pct_mean": 96.3,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 6,
+      "schedule_sha256": "8fe041b96b665ccdeed4b4eb07cd9b96094a08435d064dc2f18094e10b0f7e3c",
+      "duration_s": 27.674,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.805,
+        "ttft_p95_ms": 291.048,
+        "ttft_p99_ms": 391.626,
+        "itl_p50_ms": 16.98,
+        "itl_p95_ms": 17.67,
+        "max_itl_p95_ms": 47.97,
+        "e2e_p50_ms": 1110.062,
+        "e2e_p95_ms": 1382.146,
+        "e2e_p99_ms": 1477.508,
+        "queue_p95_ms": 271.1,
+        "output_tokens_per_s": 277.5
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1626,
+        "prefill_tokens": 5260,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 142,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 125,
+          "busy_samples": 121,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 67,
+          "power_w_mean": 58.36,
+          "util_pct_mean": 94.4,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 1,
+      "seed": 6,
+      "schedule_sha256": "8fe041b96b665ccdeed4b4eb07cd9b96094a08435d064dc2f18094e10b0f7e3c",
+      "duration_s": 27.668,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.051,
+        "ttft_p95_ms": 285.331,
+        "ttft_p99_ms": 385.653,
+        "itl_p50_ms": 16.86,
+        "itl_p95_ms": 17.63,
+        "max_itl_p95_ms": 49.91,
+        "e2e_p50_ms": 1108.954,
+        "e2e_p95_ms": 1358.378,
+        "e2e_p99_ms": 1474.143,
+        "queue_p95_ms": 265.15,
+        "output_tokens_per_s": 277.6
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1629,
+        "prefill_tokens": 5260,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 142,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 125,
+          "busy_samples": 121,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 66,
+          "power_w_mean": 58.56,
+          "util_pct_mean": 95.0,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 2,
+      "seed": 6,
+      "schedule_sha256": "8fe041b96b665ccdeed4b4eb07cd9b96094a08435d064dc2f18094e10b0f7e3c",
+      "duration_s": 27.677,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.709,
+        "ttft_p95_ms": 290.796,
+        "ttft_p99_ms": 396.919,
+        "itl_p50_ms": 16.86,
+        "itl_p95_ms": 17.63,
+        "max_itl_p95_ms": 47.63,
+        "e2e_p50_ms": 1103.998,
+        "e2e_p95_ms": 1359.552,
+        "e2e_p99_ms": 1477.096,
+        "queue_p95_ms": 270.98,
+        "output_tokens_per_s": 277.5
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1633,
+        "prefill_tokens": 5260,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 141,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 128,
+          "busy_samples": 124,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 65,
+          "power_w_mean": 58.49,
+          "util_pct_mean": 95.4,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 0,
+      "seed": 6,
+      "schedule_sha256": "58fa4f176e56dbd6c1bda7b235a9156de4cf672d0d8eb2e6428271ba7e1d9497",
+      "duration_s": 73.564,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 48.874,
+        "ttft_p95_ms": 277.02,
+        "ttft_p99_ms": 879.919,
+        "itl_p50_ms": 16.58,
+        "itl_p95_ms": 18.29,
+        "max_itl_p95_ms": 147.37,
+        "e2e_p50_ms": 2116.228,
+        "e2e_p95_ms": 6670.099,
+        "e2e_p99_ms": 6892.256,
+        "queue_p95_ms": 202.37,
+        "output_tokens_per_s": 244.0
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4400,
+        "prefill_tokens": 19712,
+        "decode_tokens": 17832
+      },
+      "decisions": {
+        "count": 127,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 327,
+          "busy_samples": 324,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 70,
+          "power_w_mean": 60.03,
+          "util_pct_mean": 96.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 1,
+      "seed": 6,
+      "schedule_sha256": "58fa4f176e56dbd6c1bda7b235a9156de4cf672d0d8eb2e6428271ba7e1d9497",
+      "duration_s": 102.104,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 117,
+        "failed": 3,
+        "errors": {
+          "queue_timeout": 3
+        },
+        "ttft_p50_ms": 18305.325,
+        "ttft_p95_ms": 28956.02,
+        "ttft_p99_ms": 29418.398,
+        "itl_p50_ms": 16.07,
+        "itl_p95_ms": 18.96,
+        "max_itl_p95_ms": 83.09,
+        "e2e_p50_ms": 19492.296,
+        "e2e_p95_ms": 31366.464,
+        "e2e_p99_ms": 32326.912,
+        "queue_p95_ms": 28839.03,
+        "output_tokens_per_s": 169.6
+      },
+      "engine": {
+        "completed": 117,
+        "rejected": 0,
+        "timed_out": 3,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 6400,
+        "prefill_tokens": 18272,
+        "decode_tokens": 17195
+      },
+      "decisions": {
+        "count": 1097,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 478,
+          "busy_samples": 476,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 71,
+          "power_w_mean": 62.56,
+          "util_pct_mean": 97.3,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 6,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 2,
+      "seed": 6,
+      "schedule_sha256": "58fa4f176e56dbd6c1bda7b235a9156de4cf672d0d8eb2e6428271ba7e1d9497",
+      "duration_s": 73.545,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 49.192,
+        "ttft_p95_ms": 286.476,
+        "ttft_p99_ms": 862.788,
+        "itl_p50_ms": 16.61,
+        "itl_p95_ms": 18.25,
+        "max_itl_p95_ms": 145.97,
+        "e2e_p50_ms": 2119.616,
+        "e2e_p95_ms": 6646.316,
+        "e2e_p99_ms": 6872.077,
+        "queue_p95_ms": 182.38,
+        "output_tokens_per_s": 244.1
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 4402,
+        "prefill_tokens": 19712,
+        "decode_tokens": 17832
+      },
+      "decisions": {
+        "count": 127,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 326,
+          "busy_samples": 323,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 70,
+          "power_w_mean": 60.35,
+          "util_pct_mean": 96.7,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "short",
+      "policy": "token-budget",
+      "position": 0,
+      "seed": 7,
+      "schedule_sha256": "e675f99a6e099eb3715c9c49efdc85c8e7a6707fcc11b090c42a5020fc7fab81",
+      "duration_s": 32.706,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.203,
+        "ttft_p95_ms": 300.733,
+        "ttft_p99_ms": 430.578,
+        "itl_p50_ms": 16.39,
+        "itl_p95_ms": 17.66,
+        "max_itl_p95_ms": 48.31,
+        "e2e_p50_ms": 1065.829,
+        "e2e_p95_ms": 1387.901,
+        "e2e_p99_ms": 1548.316,
+        "queue_p95_ms": 279.35,
+        "output_tokens_per_s": 234.8
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1978,
+        "prefill_tokens": 5203,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 139,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 147,
+          "busy_samples": 144,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 68,
+          "power_w_mean": 59.73,
+          "util_pct_mean": 95.6,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "short",
+      "policy": "fcfs",
+      "position": 1,
+      "seed": 7,
+      "schedule_sha256": "e675f99a6e099eb3715c9c49efdc85c8e7a6707fcc11b090c42a5020fc7fab81",
+      "duration_s": 32.713,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 29.287,
+        "ttft_p95_ms": 293.165,
+        "ttft_p99_ms": 421.524,
+        "itl_p50_ms": 16.45,
+        "itl_p95_ms": 17.8,
+        "max_itl_p95_ms": 50.66,
+        "e2e_p50_ms": 1068.142,
+        "e2e_p95_ms": 1408.522,
+        "e2e_p99_ms": 1546.571,
+        "queue_p95_ms": 273.63,
+        "output_tokens_per_s": 234.8
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1956,
+        "prefill_tokens": 5203,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 138,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 160,
+          "busy_samples": 156,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 67,
+          "power_w_mean": 58.53,
+          "util_pct_mean": 95.6,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "short",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 7,
+      "schedule_sha256": "e675f99a6e099eb3715c9c49efdc85c8e7a6707fcc11b090c42a5020fc7fab81",
+      "duration_s": 32.712,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 30.975,
+        "ttft_p95_ms": 300.515,
+        "ttft_p99_ms": 428.772,
+        "itl_p50_ms": 16.46,
+        "itl_p95_ms": 17.63,
+        "max_itl_p95_ms": 49.04,
+        "e2e_p50_ms": 1066.924,
+        "e2e_p95_ms": 1384.19,
+        "e2e_p99_ms": 1545.713,
+        "queue_p95_ms": 279.66,
+        "output_tokens_per_s": 234.8
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 1975,
+        "prefill_tokens": 5203,
+        "decode_tokens": 7560
+      },
+      "decisions": {
+        "count": 139,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 160,
+          "busy_samples": 157,
+          "sm_clock_mhz_median": 2745,
+          "sm_clock_mhz_p5": 2745,
+          "temp_c_max": 67,
+          "power_w_mean": 59.34,
+          "util_pct_mean": 95.8,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "token-budget",
+      "position": 0,
+      "seed": 7,
+      "schedule_sha256": "64c2b432b90ec7bf461ddb163d7834eb80e1b36d83161acb9ea4d4014306a0e6",
+      "duration_s": 60.049,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 53.482,
+        "ttft_p95_ms": 1019.718,
+        "ttft_p99_ms": 1852.366,
+        "itl_p50_ms": 16.97,
+        "itl_p95_ms": 20.89,
+        "max_itl_p95_ms": 147.36,
+        "e2e_p50_ms": 2253.824,
+        "e2e_p95_ms": 6785.492,
+        "e2e_p99_ms": 7062.354,
+        "queue_p95_ms": 978.76,
+        "output_tokens_per_s": 310.1
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3495,
+        "prefill_tokens": 16736,
+        "decode_tokens": 18504
+      },
+      "decisions": {
+        "count": 152,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 292,
+          "busy_samples": 286,
+          "sm_clock_mhz_median": 2745.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 69,
+          "power_w_mean": 59.84,
+          "util_pct_mean": 96.0,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "fcfs",
+      "position": 1,
+      "seed": 7,
+      "schedule_sha256": "64c2b432b90ec7bf461ddb163d7834eb80e1b36d83161acb9ea4d4014306a0e6",
+      "duration_s": 60.09,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 120,
+        "failed": 0,
+        "errors": {},
+        "ttft_p50_ms": 55.663,
+        "ttft_p95_ms": 1030.161,
+        "ttft_p99_ms": 1868.201,
+        "itl_p50_ms": 16.99,
+        "itl_p95_ms": 20.86,
+        "max_itl_p95_ms": 147.6,
+        "e2e_p50_ms": 2250.872,
+        "e2e_p95_ms": 6804.345,
+        "e2e_p99_ms": 6950.301,
+        "queue_p95_ms": 989.54,
+        "output_tokens_per_s": 309.9
+      },
+      "engine": {
+        "completed": 120,
+        "rejected": 0,
+        "timed_out": 0,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 3515,
+        "prefill_tokens": 16736,
+        "decode_tokens": 18504
+      },
+      "decisions": {
+        "count": 153,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 293,
+          "busy_samples": 287,
+          "sm_clock_mhz_median": 2730,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 70,
+          "power_w_mean": 60.16,
+          "util_pct_mean": 95.9,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    },
+    {
+      "round": 7,
+      "measured": true,
+      "profile": "mixed",
+      "policy": "decode-first",
+      "position": 2,
+      "seed": 7,
+      "schedule_sha256": "64c2b432b90ec7bf461ddb163d7834eb80e1b36d83161acb9ea4d4014306a0e6",
+      "duration_s": 89.493,
+      "metrics": {
+        "requests": 120,
+        "succeeded": 110,
+        "failed": 10,
+        "errors": {
+          "queue_timeout": 10
+        },
+        "ttft_p50_ms": 26294.563,
+        "ttft_p95_ms": 29749.272,
+        "ttft_p99_ms": 30001.265,
+        "itl_p50_ms": 16.24,
+        "itl_p95_ms": 19.79,
+        "max_itl_p95_ms": 73.09,
+        "e2e_p50_ms": 28142.55,
+        "e2e_p95_ms": 34474.165,
+        "e2e_p99_ms": 35547.379,
+        "queue_p95_ms": 29696.85,
+        "output_tokens_per_s": 190.6
+      },
+      "engine": {
+        "completed": 110,
+        "rejected": 0,
+        "timed_out": 10,
+        "cancelled": 0,
+        "preemptions": 0,
+        "decode_steps": 5629,
+        "prefill_tokens": 11936,
+        "decode_tokens": 16946
+      },
+      "decisions": {
+        "count": 1176,
+        "dropped": 0
+      },
+      "gpu": {
+        "available": true,
+        "reason": null,
+        "device_index": 0,
+        "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "interval_s": 0.2,
+        "summary": {
+          "samples": 435,
+          "busy_samples": 430,
+          "sm_clock_mhz_median": 2730.0,
+          "sm_clock_mhz_p5": 2730,
+          "temp_c_max": 71,
+          "power_w_mean": 63.0,
+          "util_pct_mean": 96.7,
+          "thermal_slowdown_frac": 0.0,
+          "thermal_slowdown_samples": 0,
+          "power_cap_frac": 0.0
+        }
+      }
+    }
+  ]
+}
