@@ -1,0 +1,341 @@
+# KV cache
+
+This is the design of NeuroServe's KV-cache manager for Phase 3 (Days 26–45). It records how KV
+memory works today, the design that replaces it, who owns what, and the invariants that the
+per-step checker enforces. Each later Phase 3 day implements one part, against this document.
+
+Requirements: KV-001 to KV-010 in the technical specification.
+
+## Today (v0.1)
+
+### Physical memory
+
+K and V live in **pools of fixed-size blocks**, one K pool and one V pool per layer, each shaped
+`[num_blocks, block_size, n_kv_heads, head_dim]` in FP16. A block number names the same slot in
+all 32 pools (16 layers × K and V), so one block holds the K/V of 16 consecutive positions of one
+sequence in every layer.
+
+| Llama-3.2-1B, FP16 | Value |
+| --- | --- |
+| K + V per token, all layers | 2 × 16 layers × 8 KV heads × 64 dims × 2 bytes = **32 KiB** |
+| Block (16 tokens) | **512 KiB** |
+| Pool in `configs/dev.yaml` (2048 blocks) | **1 GiB**: 32,768 tokens of KV |
+| Longest sequence (`max_pages_per_sequence` 64) | 1,024 tokens |
+
+The code says "page" for a block (`num_pages`, `free_pages`). This document says **block**; the
+two words mean the same thing.
+
+### Who owns it today
+
+- **cuda-llm-engine owns the memory and the allocator.** A `PageAllocator` is a LIFO free list;
+  a `Sequence` holds the vector of its block numbers (`pages`), its length, and a device copy of
+  its block table. `reserve()` takes blocks from the free list as a sequence grows, and
+  `free_sequence()` returns them. The engine `exit(1)`s if the free list runs dry, so it must never
+  be asked to.
+- **`CudaLlmEngineBackend`** checks, before every engine call, that enough blocks are free, and
+  throws `KvCacheExhausted` instead.
+- **`EngineLoop`** keeps its own count of each request's blocks (`ceil(cached / 16)`), and
+  passes it to the scheduling policy, which decides admissions and preemptions (ADR-0004).
+
+A block belongs to exactly one sequence; nothing is shared, so nothing is counted.
+
+### How a block table is used
+
+```
+ sequence R1: 40 tokens cached           K pool, layer l: [num_blocks, 16, 8 heads, 64]
+ block table (logical → physical)        ┌─────────┐
+   logical 0 ──────────────────────────► │ block 7 │  positions  0–15 of R1
+   logical 1 ──────────────────────────► │ block 3 │  positions 16–31 of R1
+   logical 2 ──────────────────────────► │ block 12│  positions 32–39 of R1 (8 of 16 slots used)
+                                         └─────────┘
+ position p lives in block table[p / 16], slot p % 16, in every layer's K and V pool
+```
+
+- **Prefill** writes the prompt's K/V through the table (`kv_scatter`). Its attention runs over
+  the prompt's own tokens (`attention_naive`), not through the pools.
+- **Batched decode** builds one table per sequence into a `[max_batch, max_pages]` device array
+  every step. It writes each new token's K/V at position `len` (`kv_scatter_batch`), and the
+  split-KV attention kernel reads all positions through the tables.
+
+Two consequences shape the design:
+1. **A block is written only at its next free slot.** Positions before `len` are never written
+   again. So **a full block is immutable**, which is what makes sharing it safe.
+2. **Prefill cannot yet start from a cached offset.** Its attention sees only the new tokens. Prefix
+   reuse needs a prefill whose attention also reads the cached positions through the table (see
+   "Prefill from a cached offset").
+
+## The design
+
+One **`KVCacheManager`** in `runtime/core` becomes the single owner of KV memory **accounting**.
+The GPU pools stay where they are, allocated once by the backend at startup.
+
+| Structure | Holds | Purpose |
+| --- | --- | --- |
+| Block records | per block: state, reference count, hash, last-release tick | the truth about every block |
+| Free list | blocks in state `FREE` | allocation without eviction |
+| Block tables | per sequence: physical block ids, in logical order, plus its token count | what the kernels read |
+| Prefix index | hash → block id, for full blocks | finding reusable blocks |
+| LRU queue | blocks in state `CACHED`, least recently released first | eviction order |
+| Statistics | occupancy, hits, misses, reused tokens, evictions, copy-on-write copies, preemptions | metrics (Day 40) |
+
+### Block states
+
+```
+            allocate                 last reference released, block not indexed
+   FREE ─────────────────► OWNED ───────────────────────────────────────────────► FREE
+    ▲                       │  ▲
+    │ evict (LRU)           │  │ prefix hit (ref 0 → 1)
+    │                       ▼  │
+    └────────────────── CACHED ◄───── last reference released, block indexed (full)
+```
+
+- **`FREE`:** in the free list, not indexed, reference count 0.
+- **`OWNED`:** referenced by at least one block table (count ≥ 1). It may be indexed, if full.
+- **`CACHED`:** count 0 but indexed. Its K/V are still valid, so a later request with the same
+  prefix can revive it. It sits in the LRU queue and is evicted (unindexed, freed) only when an
+  allocation finds the free list empty.
+
+**Capacity for scheduling is `FREE` + `CACHED`.** A cached block is free memory that happens to
+hold something useful.
+
+### Ownership and threads
+
+- **The engine thread is the only thread that touches the manager.** Every operation happens
+  between GPU calls, in the same step that decides it, so reference counts are plain integers.
+  Atomics would only hide a second writer, and a second writer would be a bug (KV-006).
+- **Other threads see copies.** `/health`, metrics and the decision log read a snapshot taken
+  under the engine loop's mutex, as `stats()` does today.
+- **The backend stops allocating.**
+  - Before each prefill or decode it receives the manager's tables, and fills each engine
+    `Sequence.pages` with them, so the engine's `reserve()` finds enough blocks and allocates
+    nothing.
+  - On release it clears `pages` before `free_sequence()`, so the engine's allocator is never
+    used.
+  - The submodule is not modified: the engine API already lets the caller supply the block list.
+  - The engine's allocator is left with no blocks, so a missed path fails loudly instead of
+    silently double-allocating.
+- **Blocks carry their owner.** Each block table records its sequence id, and in debug builds each
+  block records the sequence that last wrote it. A leak or a write through a stale table then
+  names the request responsible (KV-003).
+
+### Operations
+
+The CPU reference allocator (Day 27) and the manager (Day 28) share one interface. The reference
+is the test oracle: the same calls must leave both in the same state (Day 29).
+
+```cpp
+// All calls happen on the engine thread. Block ids index the GPU pools; block_size is 16.
+class KvBlockManager {
+public:
+    // Capacity the scheduler may plan with: FREE + CACHED blocks.
+    int available_blocks() const;
+
+    // Blocks a sequence of `tokens` tokens needs, and how many of those it must newly obtain.
+    // Counts revived CACHED blocks as newly obtained (they leave the evictable pool);
+    // blocks already OWNED by another sequence cost nothing.
+    AdmissionCost admission_cost(std::span<const TokenId> prompt) const;
+
+    // A new sequence: looks up the prompt's full blocks in the prefix index, references the hits
+    // (reviving CACHED ones), allocates the rest, and returns how many tokens are already cached.
+    int admit(SeqId seq, std::span<const TokenId> prompt);
+
+    // Makes room for `n` more tokens at the end of the sequence (allocates a block at a boundary;
+    // copies the last block first if it is shared: copy-on-write).
+    void append(SeqId seq, int n);
+
+    // Records that the sequence's tokens up to `len` are written: full blocks get their hash and
+    // enter the prefix index.
+    void commit(SeqId seq, std::span<const TokenId> tokens);
+
+    // Drops the sequence's references. Blocks reaching 0 become CACHED if indexed, else FREE.
+    void release(SeqId seq);
+
+    std::span<const int> table(SeqId seq) const;  // physical block ids, in logical order
+    KvStats stats() const;
+    void check_invariants() const;                 // every invariant below; throws with details
+};
+```
+
+## Reference counting (Day 31)
+
+- **A block's count is the number of block tables that list it.** `admit` increments it for every
+  prefix hit; `release` decrements it for every block in the table.
+- **A block is freed only when the last owner releases it** (count 1 → 0). Then it becomes
+  `CACHED` if it is indexed, or `FREE` otherwise.
+- **Preemption is a release.** A preempted request drops its references; blocks other requests
+  still use survive. **The memory a preemption reclaims is only the blocks whose count drops to
+  0**, so the policy's `pages_held` becomes "blocks this request alone holds". A policy that
+  counted shared blocks would expect memory that preemption cannot give back.
+
+## Prefix caching
+
+### Hashing full blocks (Day 32)
+
+- **Only full blocks are hashed and shared.** A partial block is still being written.
+- **Every block's hash is chained to the one before it:**
+  `h_i = H(h_{i-1}, tokens of block i)`, with
+  `h_{-1} = H(model id, weights digest, dtype, block size, RoPE theta and scaling)`.
+- **Why chained:** a block's K/V depend on every token before it, not only its own 16. The chain
+  makes equal hashes mean equal whole prefixes.
+- **Why the root carries the configuration:** another model, dtype, block size or RoPE setting
+  changes K/V values for the same tokens, so it must change every hash (KV-007).
+- **H is a 64-bit hash for lookup.** A hit is then **verified**: the block's stored tokens must
+  equal the request's, and its parent must be the block before it in the request's table.
+  Collisions can cost a lookup, never a wrong output.
+
+### Lookup at admission (Day 33)
+
+1. Walk the prompt's full blocks in order, hash by hash. Stop at the first miss: a block can only
+   be reused if everything before it is too.
+2. **A hit on an `OWNED` block** shares it (count + 1). **A hit on a `CACHED` block** revives it:
+   it leaves the LRU queue, count 0 → 1.
+3. Allocate blocks for the rest of the prompt.
+4. The prefill then starts at the first uncached token.
+5. Hits, misses and reused tokens are counted.
+
+**Example.** 16 requests share a 512-token system prompt (32 full blocks). Without the cache they
+hold 16 × 32 = 512 blocks for it. With it they hold 32, which frees 480 blocks (**240 MiB**) and
+skips 7,680 tokens of prefill. That is the shared-prefix test of Day 36.
+
+### Prefill from a cached offset (Day 34)
+
+The suffix must attend to the cached positions, which today's prefill cannot do. There are two
+ways:
+
+| Option | How | Cost |
+| --- | --- | --- |
+| A. Decode the suffix token by token | Feed each uncached token through the existing paged decode path | No new kernel, but one step per suffix token: slow for long suffixes, and the suffix's K/V come from a different code path than a full prefill's |
+| B. Paged causal prefill attention | A prefill that writes the suffix's K/V through the table and attends to positions `0 … p` for each query `p` | One new, simple attention kernel. It is the first step toward Phase 4's variable-length prefill (Days 47–49) |
+
+**Decision: B.** The kernel starts simple and correct; Phase 4 makes it fast. Positions and RoPE
+start at the cached length, so query `p` uses position id `p`, not `p - cached`.
+
+**A risk, from ADR-0006.** A cached block's K/V were computed inside another request's prefill,
+whose GEMMs had a different number of rows. The values can therefore differ in the last bits from
+those of a fresh prefill of this prompt, and at a near-tie that can change a greedy choice. The
+Day 34 acceptance test, matching Hugging Face exactly, is checked on the reference workloads; on
+other inputs any difference from the no-cache run is measured and reported, as the release gate
+already does.
+
+### Copy-on-write (Day 35)
+
+**The rule: a write goes only into a block with reference count 1 that is not indexed.** Because
+writes happen only at a sequence's next free slot, the only time this can fail in v0.1.5 is a
+**full prefix hit**:
+1. Every prompt token is cached, including the last, whose logits are still needed.
+2. Computing them writes that token's K/V again, into a shared, indexed block.
+3. The new values may differ in the last bits (another code path), which would corrupt the block
+   for every other user.
+
+The manager therefore **copies that block first**: it allocates a new block, copies the 512 KiB
+on the GPU, points this request's table at the copy, drops one reference on the original, and
+recomputes the last token into the copy. The alternative (never reusing the block that holds the
+last prompt token) costs up to 15 tokens of prefill per request and needs no copy. Copy-on-write
+also stays the guard for every later feature that writes after sharing (parallel sampling,
+forked sequences).
+
+### Eviction (Day 37)
+
+- **`CACHED` blocks are evicted least recently released first,** and only when the free list
+  cannot satisfy an allocation: before the request is deferred, and before anything is preempted.
+- **Evicting a block** removes it from the index and the LRU queue, and returns it to `FREE`.
+- **Only count-0 blocks can be evicted.** An `OWNED` block is never touched (KV-008).
+- LRU is the baseline. A cost-aware policy (reuse frequency × recompute cost) is a later
+  experiment, measured against it.
+
+## Preemption (Day 38)
+
+Today a preempted request restarts from its prompt and regenerates its tokens. ADR-0006 showed this
+can diverge from what it already streamed: decoding is deterministic, not batch-invariant, and the
+restart runs in another batch.
+
+**With the manager, a preemption becomes cheap and safe:**
+- **The release is cheap.** The request's full blocks stay indexed as `CACHED`. Its prompt and
+  generated tokens are kept.
+- **Resumption reuses what survived.** It looks up **prompt + generated tokens** in the prefix
+  index. Every block not evicted in between is reused, and the rest is prefilled from the first
+  missing token.
+- **Streaming stays consistent.** The tokens the client already has are **input** to the
+  recompute, never regenerated, so a stream cannot diverge from itself.
+- **The stop rules count every token,** old and new: `max_tokens` and stop tokens apply to the
+  whole generation.
+
+So the cache that serves shared prefixes also makes preemption cost close to nothing when memory
+is only briefly short.
+
+## Memory-aware admission (Day 39)
+
+Bytes per token come from the model's `config.json`:
+
+    2 (K and V) × num_hidden_layers × num_key_value_heads × head_dim × sizeof(dtype)
+
+Two modes, chosen in the config:
+- **`on_demand`** (today): blocks are taken as requests grow, and preemption handles shortage.
+- **`worst_case`:** each request reserves `prompt + max_tokens` at admission, so it never preempts,
+  but fewer requests run at once.
+
+The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block.
+
+## Invariants
+
+The checker (Day 30) runs after every engine step in debug builds and in every test. A violation
+throws with the block, the sequence and both sides of the broken equation.
+
+| # | Invariant | Catches |
+| --- | --- | --- |
+| I1 | Every block is in exactly one of: the free list, the LRU queue, or referenced by at least one table | lost and double-listed blocks |
+| I2 | `FREE + CACHED + OWNED = num_blocks`, and every block id is in `[0, num_blocks)` | leaks, stray ids |
+| I3 | A block's reference count equals the number of tables listing it | counting bugs, use after free |
+| I4 | No table lists a block twice | aliasing within a sequence |
+| I5 | A table has exactly `ceil(len / block_size)` blocks, at most `max_pages_per_sequence` | over- and under-allocation |
+| I6 | A block with count > 1 is full and indexed | sharing a block that can still change |
+| I7 | Every indexed block is full; index and block records agree in both directions | stale index entries |
+| I8 | An indexed block's hash equals `H(hash of the block before it in the table, its tokens)` | broken chains, wrong reuse |
+| I9 | The block that receives a step's new token has count 1 and is not indexed | writes into shared blocks |
+| I10 | The LRU queue holds exactly the `CACHED` blocks, ordered by last release | unevictable leaks, evicting live blocks |
+| I11 | The scheduler's view (`free_pages`, each request's blocks) equals the manager's | policy deciding on wrong numbers |
+| I12 | A released or finished sequence has no table | references from dead requests |
+| I13 | (debug) The device block tables equal the host tables after upload | stale tables on the GPU |
+
+**Fault injection (Day 30)** corrupts each of them on purpose (a count off by one, a double
+free, a block in two lists, a write into a shared block) and checks that the checker names it.
+
+## Testing
+
+| Day | Test | Proves |
+| --- | --- | --- |
+| 27 | CPU reference allocator, own unit tests | the oracle behaves as specified |
+| 29 | 10,000 seeded random allocate / append / share / release sequences, manager vs reference, after every operation | the manager equals the oracle (KV-004) |
+| 30 | Invariant checker and fault injection | every invariant is checked |
+| 31 | Shared block freed only by its last owner | reference counting |
+| 32 | Same prefix → same chain; any change in model, dtype, block size or a token → a different hash | hash identity |
+| 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
+| 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
+| 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |
+| 41 | Compute Sanitizer memcheck and racecheck on the KV and scheduler suites | no invalid GPU memory access |
+| 44 | 30 minutes of mixed high-concurrency load: no leaks, no invariant failures | stability |
+
+## Open questions
+
+- **Block size.** 16 is fixed by the fast decode kernel. The Day 42 sweep (8 / 16 / 32) needs the
+  generic paged kernel for the other sizes, so it measures capacity and waste with it, and
+  attention time with both kernels.
+- **Hash width.** 64 bits plus verification is enough for correctness. If verification ever shows
+  up in profiles, compare against a 128-bit hash without it.
+- **Eviction policy.** LRU first. A cost-aware policy is tested only with a workload that can tell
+  them apart (Day 43, `shared_prefix` and `memory_pressure`).
+
+## Requirements map
+
+| Requirement | Where |
+| --- | --- |
+| KV-001 Fixed-size block allocation | Free list and block records (Days 27–28) |
+| KV-002 Block tables per sequence | Block tables (Day 28) |
+| KV-003 Associate blocks with requests | Owner sequence ids on tables and blocks (Day 28) |
+| KV-004 Safe release | I3, I12, property tests (Day 29), Compute Sanitizer (Day 41) |
+| KV-005 Free-block tracking | I1, I2 after every step (Day 30) |
+| KV-006 Reference counting | Day 31 |
+| KV-007 Exact-prefix caching | Days 32–36 |
+| KV-008 Eviction (LRU) | Day 37 |
+| KV-009 Cache utilization metrics | Day 40 |
+| KV-010 Detect invalid block states | The invariant checker and fault injection (Day 30) |
