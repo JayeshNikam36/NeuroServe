@@ -105,6 +105,8 @@ class FakeEngine:
         self.stop_token_ids: list[list[int]] = []
         self.client_request_ids: list[str] = []
         self.priorities: list[int] = []
+        self.policy = "fcfs"
+        self.policy_history: list[str] = []  # every set_scheduling_policy call, in order
 
     def run(self, prompt_ids, max_new_tokens, *, stop_token_ids=(), client_request_id="", priority=1):
         if self.error is not None:
@@ -141,7 +143,14 @@ class FakeEngine:
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64}
 
     def stats(self):
-        return {"submitted": len(self.calls), "pending": 0, "active": 0}
+        return {"submitted": len(self.calls), "completed": len(self.calls), "pending": 0, "active": 0,
+                "policy": self.policy}
+
+    def set_scheduling_policy(self, name):
+        if name not in neuroserve.scheduling_policies:
+            raise ValueError(f"unknown scheduling policy '{name}'")
+        self.policy = name
+        self.policy_history.append(name)
 
     def latency(self):
         summary = {"count": len(self.calls), "mean": 1.0, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0}
@@ -658,3 +667,27 @@ def test_decisions_endpoint_validates_its_parameters(tok, params, param):
     with TestClient(app) as client:
         resp = client.get("/v1/runtime/decisions", params=params)
     assert resp.status_code == 400 and resp.json()["error"]["param"] == param
+
+
+# ---- Day 24: switching the scheduling policy at runtime ------------------------------------------
+
+def test_the_policy_can_be_switched_at_runtime(tok):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        before = client.get("/v1/runtime/policy").json()
+        changed = client.put("/v1/runtime/policy", json={"policy": "decode-first"}).json()
+        health = client.get("/health").json()
+    assert before == {"object": "runtime.policy", "policy": "fcfs", "available": list(neuroserve.scheduling_policies)}
+    assert changed["policy"] == "decode-first" and changed["previous"] == "fcfs"
+    assert health["engine"]["policy"] == "decode-first" and engine.policy_history == ["decode-first"]
+
+
+@pytest.mark.parametrize("payload, code", [({"policy": "lifo"}, "unknown_policy"), ({}, None),
+                                           ({"policy": "fcfs", "extra": 1}, None)])
+def test_a_bad_policy_change_is_400_and_changes_nothing(tok, payload, code):
+    app, engine, _ = make_app(tok)
+    with TestClient(app) as client:
+        resp = client.put("/v1/runtime/policy", json=payload)
+        policy = client.get("/v1/runtime/policy").json()["policy"]
+    assert resp.status_code == 400 and resp.json()["error"]["code"] == code
+    assert policy == "fcfs" and engine.policy_history == []

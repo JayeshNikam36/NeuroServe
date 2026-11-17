@@ -19,7 +19,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import CudaError, EngineStopped, KvCacheExhausted, QueueFull, QueueTimeout, RequestCancelled, __version__
+from .. import (CudaError, EngineStopped, KvCacheExhausted, QueueFull, QueueTimeout, RequestCancelled, __version__,
+                 scheduling_policies)
 from .config import ServerConfig
 from .engine_service import ContextLengthExceeded, EngineService, GenerationResult, StreamingGeneration
 from .logging_setup import request_id_var
@@ -33,6 +34,7 @@ from .schemas import (
     CompletionResponse,
     NeuroServeInfo,
     NeuroServeOptions,
+    PolicyChange,
     ResponseMessage,
     StreamOptions,
     Usage,
@@ -340,6 +342,23 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         page = svc.decisions(since, limit)
         return {"object": "list", "data": page["data"], "next_since": page["next_since"],
                 "dropped": page["dropped"]}
+
+    @app.get("/v1/runtime/policy")
+    async def get_policy(request: Request) -> dict:
+        svc: EngineService = request.app.state.service
+        return {"object": "runtime.policy", "policy": svc.scheduling_policy(), "available": list(scheduling_policies)}
+
+    @app.put("/v1/runtime/policy")
+    async def set_policy(body: PolicyChange, request: Request) -> dict:
+        """Switches the scheduling policy from the next engine step on (A/B benchmarks)."""
+        svc: EngineService = request.app.state.service
+        try:
+            previous = svc.set_scheduling_policy(body.policy)
+        except ValueError as exc:
+            raise ApiError(400, str(exc), param="policy", code="unknown_policy") from exc
+        logger.info("scheduling policy changed", extra={"policy": body.policy, "previous_policy": previous})
+        return {"object": "runtime.policy", "policy": body.policy, "previous": previous,
+                "available": list(scheduling_policies)}
 
     @app.delete("/v1/requests/{request_id}")
     async def cancel_request(request_id: str, request: Request) -> dict:

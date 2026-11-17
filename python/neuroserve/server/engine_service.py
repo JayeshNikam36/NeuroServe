@@ -57,6 +57,9 @@ class GenerationEngine(Protocol):
 
     def cancel(self, request_id: str) -> bool: ...
 
+    def set_scheduling_policy(self, name: str) -> None:
+        """From the next engine step on; an unknown name raises ValueError."""
+
 
 class ContextLengthExceeded(ValueError):
     """The prompt is longer than the engine accepts."""
@@ -177,6 +180,15 @@ class EngineService:
 
     def cancel(self, engine_request_id: str) -> bool:
         return self._engine.cancel(engine_request_id)
+
+    def scheduling_policy(self) -> str:
+        return self._engine.stats()["policy"]
+
+    def set_scheduling_policy(self, name: str) -> str:
+        """Switches the policy from the next engine step on; returns the previous one."""
+        previous = self.scheduling_policy()
+        self._engine.set_scheduling_policy(name)
+        return previous
 
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int, *,
              ignore_eos: bool = False, priority: int = 1) -> GenerationResult:

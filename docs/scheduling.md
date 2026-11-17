@@ -48,6 +48,15 @@ Every policy must produce exactly the same tokens for every request; only the or
 the work differ. The engine-loop correctness tests run once per policy, and so does the GPU
 preemption test (token-exact against Hugging Face).
 
+The policy can be switched while the server runs. The change applies from the next engine step:
+requests in progress keep their state, only later decisions change.
+
+    GET /v1/runtime/policy                              {"object": "runtime.policy", "policy": "fcfs", "available": [...]}
+    PUT /v1/runtime/policy  {"policy": "decode-first"}  {..., "policy": "decode-first", "previous": "fcfs"}
+
+An unknown name is a 400 (`unknown_policy`). This is an operator control for benchmarks and
+experiments; the server listens on localhost only by default.
+
 ## Priorities and aging
 
 A request has a priority: 0 (low), 1 (normal, the default) or 2 (high). Over HTTP it is

@@ -17,6 +17,13 @@ class NeuroServeOptions(BaseModel):
     priority: int = Field(default=1, ge=0, le=2)  # 0 low, 1 normal, 2 high (used by the "priority" policy)
 
 
+class PolicyChange(BaseModel):
+    """Body of PUT /v1/runtime/policy (the engine checks the name)."""
+
+    model_config = ConfigDict(extra="forbid")
+    policy: str
+
+
 class StreamOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
     include_usage: bool = False  # send a last chunk with usage (and the neuroserve block)

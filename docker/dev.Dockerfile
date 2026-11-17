@@ -15,10 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Ubuntu 22.04 ships CMake 3.22, which can't set C++20 for CUDA. Pin a modern CMake.
 # pytest/httpx/openai: tests (openai: the official client, for streaming tests and demos).
 # tokenizers/jinja2: tokenization. fastapi/uvicorn/pydantic/pyyaml: API server.
+# nvidia-ml-py: NVML bindings (pynvml), for the benchmarks' GPU clock/temperature/power sampler.
 RUN python3 -m pip install --no-cache-dir \
         "cmake==3.30.5" "pytest==8.3.3" "httpx==0.27.2" "openai==1.55.3" \
         "tokenizers==0.20.3" "jinja2==3.1.4" \
         "fastapi==0.115.5" "uvicorn==0.32.1" "pydantic==2.10.3" "pyyaml==6.0.2" \
+        "nvidia-ml-py==12.560.30" \
     && cmake --version
 
 # Non-root user matching the host UID/GID, so files created in the
