@@ -68,6 +68,14 @@ public:
     // Number of tokens currently cached for the sequence.
     virtual int sequence_length(SeqId seq) const = 0;
 
+    // Debug check, run after every engine step when EngineLoopOptions::check_invariants is set:
+    // throws a std::logic_error (core::KvInvariantViolation) naming what is inconsistent in the
+    // backend's KV bookkeeping. The default checks nothing.
+    virtual void check_kv_invariants() const {}
+
+    // Sequences the backend currently holds, or -1 if it does not count them.
+    virtual int live_sequences() const { return -1; }
+
 protected:
     InferenceBackend() = default;
 };

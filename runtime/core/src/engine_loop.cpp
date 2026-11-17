@@ -4,6 +4,7 @@
 #include <iterator>
 #include <utility>
 
+#include "neuroserve/core/kv_block_manager.hpp"
 #include "neuroserve/core/log.hpp"
 
 namespace neuroserve::core {
@@ -376,8 +377,51 @@ void EngineLoop::loop() {
             }
         }
         refresh_kv_snapshot();
+        if (options_.check_invariants) {
+            check_kv_bookkeeping();  // a violation ends the loop (run() logs it and cancels everything)
+        }
         std::lock_guard lock(mu_);
         stats_.active = active_.size();
+    }
+}
+
+void EngineLoop::check_kv_bookkeeping() const {
+    backend_.check_kv_invariants();
+    // I11: the loop plans with the same numbers the backend holds. Each running request's cached
+    // tokens must be its sequence's length, and their blocks must be every used block. (Exact while
+    // no block is shared; prefix sharing, Day 33, will count shared blocks once.)
+    long long held = 0;
+    for (const auto& entry : active_) {
+        if (!entry->has_seq) {
+            throw KvInvariantViolation("I12: running request " + entry->request.id() + " has no sequence");
+        }
+        const int length = backend_.sequence_length(entry->seq);
+        if (length != entry->cached) {
+            throw KvInvariantViolation("I11: request " + entry->request.id() + " has " + std::to_string(entry->cached) +
+                                       " cached tokens in the loop's view but " + std::to_string(length) +
+                                       " in the backend");
+        }
+        held += pages_for_tokens(entry->cached);
+    }
+    // I12: finished, failed, cancelled and preempted requests hold nothing.
+    const int live = backend_.live_sequences();
+    if (live >= 0 && static_cast<std::size_t>(live) != active_.size()) {
+        throw KvInvariantViolation("I12: the backend holds " + std::to_string(live) + " sequences for " +
+                                   std::to_string(active_.size()) + " running requests");
+    }
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& entry : pending_) {
+            if (entry->has_seq) {
+                throw KvInvariantViolation("I12: queued request " + entry->request.id() + " still holds a sequence");
+            }
+        }
+    }
+    const KvCacheStats kv = backend_.kv_stats();
+    const int used = kv.total_pages - kv.free_pages;
+    if (used != held) {
+        throw KvInvariantViolation("I11: the running requests hold " + std::to_string(held) +
+                                   " pages, the backend reports " + std::to_string(used) + " used");
     }
 }
 

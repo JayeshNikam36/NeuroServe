@@ -14,6 +14,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 27 | `KvBlockManager` contract and `ReferenceBlockManager`, the CPU oracle | done |
 | 28 | `KVCacheManager` (ordered free set, running counts, `allocated_by`), with the backend taking every block from it and the engine's allocator emptied | done |
 | 29 | Property-based tests (`tests/unit/test_kv_property.cpp`, harness in `tests/support/kv_ops.hpp`): 10,000 seeded random programs, about 600,000 operations, manager vs reference after every operation; a divergence is shrunk to a short reproduction. `NS_KV_PROPERTY_PROGRAMS` / `NS_KV_PROPERTY_SEED` run more or other programs | done |
+| 30 | Per-step checks: the manager's I1–I6, the engine's and the manager's views of every sequence, and the loop's I11–I12, after every engine step (`EngineLoopOptions::check_invariants`); fault injection for each (`tests/unit/test_kv_invariants.cpp`) | done |
 
 ## Today (v0.1)
 
@@ -288,8 +289,22 @@ The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block
 
 ## Invariants
 
-The checker (Day 30) runs after every engine step in debug builds and in every test. A violation
-throws with the block, the sequence and both sides of the broken equation.
+The checks run after every engine step when `EngineLoopOptions::check_invariants` is on. It is on
+by default, because the `NS_CHECK_INVARIANTS` build option is on; a release build turns the
+option off. Each step's checks cover:
+
+- **in the manager,** I1–I6;
+- **in the backend,** that the engine's sequences and the manager's tables agree, block for block,
+  and that the engine's own allocator stays empty;
+- **in the engine loop,** I11 and I12.
+
+A violation names the invariant, the block or sequence, and both sides of the broken equation. It
+also stops the engine: running requests get `EngineStopped`, and the error is logged ("engine loop
+crashed"). A server whose KV bookkeeping is wrong must not keep writing K/V into blocks it may no
+longer own.
+
+I7–I10 arrive with the prefix index and the LRU queue (Days 33 and 37), and I13 with GPU-side
+table checks.
 
 | # | Invariant | Catches |
 | --- | --- | --- |

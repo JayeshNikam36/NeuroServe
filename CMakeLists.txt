@@ -10,6 +10,7 @@ option(NS_ENABLE_CUDA         "Build CUDA components and GPU tests"            O
 option(NS_BUILD_TESTS         "Build unit tests"                               ON)
 option(NS_BUILD_PYTHON        "Build the Python extension module (needs CUDA)" OFF)
 option(NS_WARNINGS_AS_ERRORS  "Treat compiler warnings as errors"              OFF)
+option(NS_CHECK_INVARIANTS    "Check KV invariants after every engine step by default (off for release builds)" ON)
 
 # ---- Language standards --------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)

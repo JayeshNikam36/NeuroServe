@@ -20,6 +20,10 @@ target_compile_definitions(neuroserve_core
 if(NS_ENABLE_CUDA)
     target_compile_definitions(neuroserve_core PRIVATE NS_WITH_CUDA=1)
 endif()
+if(NS_CHECK_INVARIANTS)
+    # PUBLIC: EngineLoopOptions' default must be the same in the library and everything using it.
+    target_compile_definitions(neuroserve_core PUBLIC NS_CHECK_INVARIANTS=1)
+endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(neuroserve_core

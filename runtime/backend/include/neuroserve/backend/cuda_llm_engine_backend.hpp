@@ -35,6 +35,8 @@ public:
                                      std::span<const TokenId> tokens) override;
     void free_sequence(SeqId seq) override;
     int sequence_length(SeqId seq) const override;
+    void check_kv_invariants() const override;
+    int live_sequences() const override;
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

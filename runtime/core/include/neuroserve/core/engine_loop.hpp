@@ -113,6 +113,14 @@ struct StepStats {
     std::size_t preempted = 0;
 };
 
+// Whether EngineLoopOptions::check_invariants is on by default: the NS_CHECK_INVARIANTS build
+// option (CMake), on unless turned off for a release build.
+#ifdef NS_CHECK_INVARIANTS
+inline constexpr bool kCheckInvariantsByDefault = true;
+#else
+inline constexpr bool kCheckInvariantsByDefault = false;
+#endif
+
 struct EngineLoopOptions {
     int max_batch = 8;             // most sequences in one decode step
     int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
@@ -121,6 +129,10 @@ struct EngineLoopOptions {
     int max_queue = 1024;          // most requests waiting in the queue; submit() throws QueueFull beyond it
     int queue_timeout_ms = 0;      // a request not admitted within this time is REJECTED (QueueTimeout); 0 = never
     int decision_log_capacity = 4096;  // explanations kept for decisions() (the newest; older ones are dropped)
+    // After every step, check the KV bookkeeping (docs/kv-cache.md, "Invariants"): the backend's own
+    // (the block manager's I1-I6, engine vs manager) and the loop's view against the backend's
+    // (I11, I12). A violation stops the engine loudly: corrupted KV state must not keep serving.
+    bool check_invariants = kCheckInvariantsByDefault;
     // Called on the engine thread after every step that did work. Must be fast and must not throw.
     std::function<void(const StepStats&)> on_step{};
 };
@@ -243,6 +255,7 @@ private:
     void release(Entry& entry) noexcept;
     void cancel_all() noexcept;
     void refresh_kv_snapshot() noexcept;
+    void check_kv_bookkeeping() const;  // options_.check_invariants; throws KvInvariantViolation
 
     InferenceBackend& backend_;
     const EngineLoopOptions options_;
