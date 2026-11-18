@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include "neuroserve/backend/cuda_llm_engine_backend.hpp"
 
 namespace fs = std::filesystem;
+namespace core = neuroserve::core;
 using neuroserve::CudaLlmEngineBackend;
 using neuroserve::CudaLlmEngineConfig;
 using neuroserve::KvCacheExhausted;
@@ -66,6 +68,7 @@ protected:
         config.max_batch = 8;
         config.max_pages_per_sequence = 64;
         backend_ = std::make_unique<CudaLlmEngineBackend>(config);
+        model_dir_ = model_dir;
 
         for (int i = 0; i < kNumPrompts; ++i) {
             char stem[32];
@@ -94,6 +97,7 @@ protected:
     static inline std::unique_ptr<CudaLlmEngineBackend> backend_;
     static inline std::vector<Reference> refs_;
     static inline std::string skip_reason_;
+    static inline std::string model_dir_;
 };
 
 TEST_F(CudaLlmEngineBackendTest, ModelInfoMatchesLlama32_1B) {
@@ -105,6 +109,25 @@ TEST_F(CudaLlmEngineBackendTest, ModelInfoMatchesLlama32_1B) {
     EXPECT_EQ(info.kv_bytes_per_token, 32768u);  // 2 x 16 x 8 x 64 x 2 bytes
     EXPECT_EQ(backend_->kv_stats().page_size_tokens, 16);
     expect_no_leaked_pages();
+}
+
+// The root of every prefix hash chain names this model, these weights, FP16 K/V, 16-token pages and
+// Llama 3's RoPE (docs/kv-cache.md, "Hashing full blocks").
+TEST_F(CudaLlmEngineBackendTest, KvCacheKeyIsTheRootOfTheModelsIdentity) {
+    const core::KvCacheIdentity& id = backend_->kv_identity();
+    EXPECT_EQ(id.model_id, "llama-3.2-1b");
+    EXPECT_EQ(id.dtype, "fp16");
+    EXPECT_EQ(id.block_size, 16);
+    EXPECT_EQ(id.rope.theta, 500000.0);
+    EXPECT_EQ(id.rope.scaling_type, "llama3");
+    EXPECT_EQ(id.weights_digest, core::file_fingerprint((fs::path(model_dir_) / "weights.bin").string()) + ":" +
+                                     core::file_fingerprint((fs::path(model_dir_) / "index.tsv").string()));
+
+    const std::string& key = backend_->model_info().kv_cache_key;
+    EXPECT_EQ(key, core::hash_hex(core::PrefixHasher(id).root()));
+    ASSERT_EQ(key.size(), 16u);
+    const auto is_hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
+    EXPECT_TRUE(std::all_of(key.begin(), key.end(), is_hex)) << key;
 }
 
 TEST_F(CudaLlmEngineBackendTest, SinglePromptMatchesHuggingFace) {

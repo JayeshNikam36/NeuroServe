@@ -76,6 +76,14 @@ def test_generate_matches_hugging_face(engine):
 
 
 @needs_model
+def test_model_info_reports_the_kv_cache_key(engine):
+    # The root of the KV prefix hash chain (docs/kv-cache.md): 16 hex digits, fixed for a model.
+    key = engine.model_info()["kv_cache_key"]
+    assert len(key) == 16 and set(key) <= set("0123456789abcdef"), key
+    assert engine.model_info()["kv_cache_key"] == key
+
+
+@needs_model
 def test_bad_requests_raise_python_exceptions(engine):
     prompt, _ = reference(0)
     with pytest.raises(ValueError):

@@ -16,6 +16,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 29 | Property-based tests (`tests/unit/test_kv_property.cpp`, harness in `tests/support/kv_ops.hpp`): 10,000 seeded random programs, about 600,000 operations, manager vs reference after every operation; a divergence is shrunk to a short reproduction. `NS_KV_PROPERTY_PROGRAMS` / `NS_KV_PROPERTY_SEED` run more or other programs | done |
 | 30 | Per-step checks: the manager's I1–I6, the engine's and the manager's views of every sequence, and the loop's I11–I12, after every engine step (`EngineLoopOptions::check_invariants`); fault injection for each (`tests/unit/test_kv_invariants.cpp`) | done |
 | 31 | Reference counting through the backend and the engine: `share_prefix` and `sequence_pages` on every backend, shared pages in `/health`, preemption planned with a request's own pages, I11 counting a shared page once; tests in every release order and through completion, cancellation and preemption (`tests/unit/test_kv_sharing.cpp`) | done |
+| 32 | Prefix hashing for full blocks (`kv_prefix_hash.hpp`): XXH64, a pinned byte encoding, the chained block hash and its root, the CUDA backend's K/V identity, `kv_cache_key` in `model_info()`; tests against an independent implementation (`tests/unit/test_kv_prefix_hash.cpp`) | done |
 
 ## Today (v0.1)
 
@@ -217,7 +218,48 @@ and 37), to the reference first and then to the manager.
   equal the request's, and its parent must be the block before it in the request's table.
   Collisions can cost a lookup, never a wrong output.
 
-### Lookup at admission (Day 33)
+**Implemented (Day 32)** in `runtime/core/include/neuroserve/core/kv_prefix_hash.hpp`.
+
+- **`PrefixHasher(identity)`** gives `root()`, `next(parent, block)`, `chain(tokens)` (one hash per
+  full block) and `extend(chain, tokens)`, which hashes each block once, when a growing sequence
+  fills it.
+- **H is XXH64,** implemented in the file (no dependency, so a library upgrade cannot change it).
+- **The hashes are a stable format.** They are the same in every process, build and platform: no
+  `std::hash`, no pointers, explicit little-endian bytes. Golden values in the tests pin the format,
+  so changing it is a visible decision.
+
+**The encoding.** Integers are fixed-width little-endian, a double is its IEEE-754 bits, and a
+string is a `u32` length followed by its bytes. The length prefixes keep fields apart:
+`("ab", "c")` and `("a", "bc")` encode differently.
+
+| Hash | XXH64 (seed 0) of |
+| --- | --- |
+| root | `"neuroserve.kv.root.v1"`, model id, weights digest, dtype, `u32` block size, `f64` RoPE theta, RoPE scaling type, `f64` factor, `f64` low-frequency factor, `f64` high-frequency factor, `u32` original context |
+| block | `"neuroserve.kv.block.v1"`, `u64` parent hash, `u32` token count, each token as `i32` |
+
+**The CUDA backend's identity.**
+
+| Field | Value |
+| --- | --- |
+| model id | the configured model name |
+| weights digest | `file_fingerprint(weights.bin) + ":" + file_fingerprint(index.tsv)` |
+| dtype | `fp16` |
+| block size | the page size, 16 |
+| RoPE | Llama 3: theta 500,000, scaling `llama3` (factor 32, low 1, high 4, original context 8,192), the values cuda-llm-engine hard-codes in `load_model` |
+
+- **`model_info()["kv_cache_key"]` is the root, as 16 hex digits.** Two engines with equal keys
+  compute equal K/V for equal tokens, so cached blocks may only ever be reused under an equal key.
+- **The weights digest is sampled.** `file_fingerprint` hashes a file's size plus either all of it
+  (up to 16 MiB) or 64 evenly spaced 64 KiB chunks from its first byte to its last, about 4 MiB.
+  - **Why sampled:** hashing all 2.5 GB at every start would read the weights a second time.
+  - **What it catches:** another export, model or fine-tune changes nearly every tensor, so it
+    changes the samples. The base and instruct Llama-3.2-1B have the same shapes and file size, and
+    still get different keys.
+  - **What it does not catch:** one byte changed between two samples. A checkpoint is never edited
+    in place like that; the test documents the limit.
+- **I8** ("an indexed block's hash equals `H(parent, its tokens)`") is checked from Day 33, once
+  blocks are indexed.
+
 
 1. Walk the prompt's full blocks in order, hash by hash. Stop at the first miss: a block can only
    be reused if everything before it is too.
@@ -356,7 +398,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 29 | 10,000 seeded random allocate / append / share / release sequences, manager vs reference, after every operation | the manager equals the oracle (KV-004) |
 | 30 | Invariant checker and fault injection | every invariant is checked |
 | 31 | Shared block freed only by its last owner | reference counting |
-| 32 | Same prefix → same chain; any change in model, dtype, block size or a token → a different hash | hash identity |
+| 32 | Same prefix → same chain; any change in model, weights, dtype, block size, RoPE or a token → a different hash, from that block on; XXH64 and the encoding match an independent implementation; no collisions among 200,000 blocks | hash identity |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

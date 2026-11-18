@@ -21,6 +21,8 @@ struct ModelInfo {
     int vocab_size = 0;
     int max_prompt_tokens = 0;          // longest prompt prefill() accepts
     std::size_t kv_bytes_per_token = 0; // K + V for all layers
+    std::string kv_cache_key;           // root of the KV prefix hash chain (16 hex digits); empty if the
+                                        // backend has no prefix hashing. Equal keys: compatible K/V
 };
 
 struct KvCacheStats {
