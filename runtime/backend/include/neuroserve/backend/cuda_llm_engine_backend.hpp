@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "neuroserve/core/inference_backend.hpp"
+#include "neuroserve/core/kv_prefix_hash.hpp"
 
 namespace neuroserve {
 
@@ -39,6 +40,10 @@ public:
     int live_sequences() const override;
     void share_prefix(SeqId dst, SeqId src, int pages) override;
     SequencePages sequence_pages(SeqId seq) const override;
+
+    // What the K/V values depend on besides the tokens: the root of every prefix hash chain
+    // (docs/kv-cache.md, "Hashing full blocks"). model_info().kv_cache_key is its hash.
+    const core::KvCacheIdentity& kv_identity() const noexcept;
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

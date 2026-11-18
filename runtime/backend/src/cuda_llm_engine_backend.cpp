@@ -13,6 +13,7 @@
 #include "batched.h"
 
 #include "neuroserve/core/kv_cache_manager.hpp"
+#include "neuroserve/core/kv_prefix_hash.hpp"
 #include "neuroserve/cuda/device_info.hpp"
 
 namespace neuroserve {
@@ -48,6 +49,22 @@ std::size_t kv_bytes_per_token(const Model& m) {
            static_cast<std::size_t>(m.cfg.head_dim) * sizeof(__half);
 }
 
+// The K/V identity: everything besides the tokens that decides the K/V values (docs/kv-cache.md).
+// cuda-llm-engine computes K/V in FP16 and hard-codes Llama 3's RoPE in load_model
+// (engine/model.cu: compute_rope_inv_freq(head_dim, 500000.0, 32.0, 1.0, 4.0, 8192.0)); the values
+// here must stay equal to it.
+core::KvCacheIdentity kv_identity_for(const CudaLlmEngineConfig& c) {
+    const fs::path dir(c.model_dir);
+    core::KvCacheIdentity id;
+    id.model_id = c.model_name;
+    id.weights_digest = core::file_fingerprint((dir / "weights.bin").string()) + ":" +
+                        core::file_fingerprint((dir / "index.tsv").string());
+    id.dtype = "fp16";
+    id.block_size = c.page_size_tokens;
+    id.rope = {500000.0, "llama3", 32.0, 1.0, 4.0, 8192};
+    return id;
+}
+
 // First maximum, like the engine and torch.argmax: ties go to the lowest token id.
 TokenId argmax_first(const std::vector<float>& logits) {
     return static_cast<TokenId>(std::max_element(logits.begin(), logits.end()) - logits.begin());
@@ -62,6 +79,7 @@ struct CudaLlmEngineBackend::Impl {
     std::optional<PagedKVCache> cache;   // the GPU pools; its own allocator is emptied and never used
     std::optional<core::KVCacheManager> kv;  // the single owner of KV block accounting (docs/kv-cache.md)
     BatchState batch{};
+    std::optional<core::PrefixHasher> hasher;  // the K/V identity and the root of every hash chain
     bool model_loaded = false;
     bool batch_allocated = false;
     std::unordered_map<SeqId, ::Sequence> sequences;
@@ -137,6 +155,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     // Every check runs before the engine is called: the engine calls exit() on failure.
     validate_config(config);
     impl_->config = config;
+    impl_->hasher.emplace(kv_identity_for(config));  // reads about 4 MiB of the weights; may throw
 
     const cuda::InitResult init = cuda::initialize_device(config.device_index);
 
@@ -172,6 +191,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     info.vocab_size = impl_->model.vocab;
     info.max_prompt_tokens = config.max_prompt_tokens;
     info.kv_bytes_per_token = kv_bytes_per_token(impl_->model);
+    info.kv_cache_key = core::hash_hex(impl_->hasher->root());
 }
 
 CudaLlmEngineBackend::~CudaLlmEngineBackend() = default;
@@ -179,6 +199,10 @@ CudaLlmEngineBackend::~CudaLlmEngineBackend() = default;
 std::string_view CudaLlmEngineBackend::name() const noexcept { return "cuda-llm-engine"; }
 
 const ModelInfo& CudaLlmEngineBackend::model_info() const noexcept { return impl_->info; }
+
+const core::KvCacheIdentity& CudaLlmEngineBackend::kv_identity() const noexcept {
+    return impl_->hasher->identity();
+}
 
 KvCacheStats CudaLlmEngineBackend::kv_stats() const {
     KvCacheStats s;

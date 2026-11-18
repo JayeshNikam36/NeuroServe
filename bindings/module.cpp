@@ -130,6 +130,7 @@ public:
         out["vocab_size"] = i.vocab_size;
         out["max_prompt_tokens"] = i.max_prompt_tokens;
         out["kv_bytes_per_token"] = i.kv_bytes_per_token;
+        out["kv_cache_key"] = i.kv_cache_key;
         return out;
     }
 

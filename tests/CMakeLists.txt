@@ -18,7 +18,8 @@ add_executable(ns_unit_tests
     unit/test_kv_block_manager.cpp
     unit/test_kv_property.cpp
     unit/test_kv_invariants.cpp
-    unit/test_kv_sharing.cpp)
+    unit/test_kv_sharing.cpp
+    unit/test_kv_prefix_hash.cpp)
 target_include_directories(ns_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
 # Golden scheduler traces live in tests/data; NS_UPDATE_GOLDEN=1 rewrites their expected sections.
 target_compile_definitions(ns_unit_tests PRIVATE NS_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
