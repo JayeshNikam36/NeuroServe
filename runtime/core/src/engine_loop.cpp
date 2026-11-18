@@ -38,6 +38,7 @@ struct EngineLoop::Entry {
     int waited_steps = 0;     // engine steps spent in the queue since it was (re)queued
     SeqId seq = 0;
     bool has_seq = false;
+    int own_pages = 0;        // pages only this request holds: what preempting it would give back
     std::vector<TokenId> tokens;
     Request::Clock::time_point first_token_at{};
     FinishReason finish = FinishReason::kLength;
@@ -342,7 +343,8 @@ void EngineLoop::loop() {
         }
         apply_cancellations();  // first: cancelled requests free their pages before this step's decisions
         expire_queued();
-        const int free_pages = backend_.kv_stats().free_pages;  // backend call: outside the lock
+        const int free_pages = backend_.kv_stats().free_pages;  // backend calls: outside the lock
+        refresh_own_pages();
         {
             std::lock_guard lock(mu_);
             schedule_locked(free_pages, admitted, preempted);
@@ -385,12 +387,18 @@ void EngineLoop::loop() {
     }
 }
 
+void EngineLoop::refresh_own_pages() {
+    for (const auto& entry : active_) {
+        entry->own_pages = backend_.sequence_pages(entry->seq).exclusive;
+    }
+}
+
 void EngineLoop::check_kv_bookkeeping() const {
     backend_.check_kv_invariants();
     // I11: the loop plans with the same numbers the backend holds. Each running request's cached
-    // tokens must be its sequence's length, and their blocks must be every used block. (Exact while
-    // no block is shared; prefix sharing, Day 33, will count shared blocks once.)
-    long long held = 0;
+    // tokens must be its sequence's length and cover its pages, and the used pages must be the
+    // requests' own pages plus the shared ones, each counted once.
+    long long own = 0;
     for (const auto& entry : active_) {
         if (!entry->has_seq) {
             throw KvInvariantViolation("I12: running request " + entry->request.id() + " has no sequence");
@@ -401,7 +409,13 @@ void EngineLoop::check_kv_bookkeeping() const {
                                        " cached tokens in the loop's view but " + std::to_string(length) +
                                        " in the backend");
         }
-        held += pages_for_tokens(entry->cached);
+        const SequencePages pages = backend_.sequence_pages(entry->seq);
+        if (pages.held != pages_for_tokens(entry->cached)) {
+            throw KvInvariantViolation("I11: request " + entry->request.id() + " holds " + std::to_string(pages.held) +
+                                       " pages for " + std::to_string(entry->cached) + " cached tokens, which need " +
+                                       std::to_string(pages_for_tokens(entry->cached)));
+        }
+        own += pages.exclusive;
     }
     // I12: finished, failed, cancelled and preempted requests hold nothing.
     const int live = backend_.live_sequences();
@@ -419,9 +433,10 @@ void EngineLoop::check_kv_bookkeeping() const {
     }
     const KvCacheStats kv = backend_.kv_stats();
     const int used = kv.total_pages - kv.free_pages;
-    if (used != held) {
-        throw KvInvariantViolation("I11: the running requests hold " + std::to_string(held) +
-                                   " pages, the backend reports " + std::to_string(used) + " used");
+    if (used != own + kv.shared_pages) {
+        throw KvInvariantViolation("I11: the running requests hold " + std::to_string(own) + " pages of their own and " +
+                                   std::to_string(kv.shared_pages) + " shared, the backend reports " +
+                                   std::to_string(used) + " used");
     }
 }
 
@@ -609,8 +624,10 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     }
     input.running.reserve(active_.size());
     for (const auto& entry : active_) {
-        const int held = pages_for_tokens(entry->cached);
-        input.running.push_back({entry->request.id(), held, pages_for_tokens(entry->cached + 1) - held,
+        // A shared page is not freed when one of its holders is preempted, so the policy counts only
+        // the request's own pages. Growth is always a new page of its own (shared pages are full).
+        const int growth = pages_for_tokens(entry->cached + 1) - pages_for_tokens(entry->cached);
+        input.running.push_back({entry->request.id(), entry->own_pages, growth,
                                  static_cast<int>(entry->tokens.size()), entry->params.max_new_tokens,
                                  entry->params.priority, age_ms(*entry)});
     }

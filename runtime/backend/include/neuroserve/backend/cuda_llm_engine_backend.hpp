@@ -37,6 +37,8 @@ public:
     int sequence_length(SeqId seq) const override;
     void check_kv_invariants() const override;
     int live_sequences() const override;
+    void share_prefix(SeqId dst, SeqId src, int pages) override;
+    SequencePages sequence_pages(SeqId seq) const override;
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

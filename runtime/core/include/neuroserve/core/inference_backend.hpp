@@ -28,6 +28,14 @@ struct KvCacheStats {
     int total_pages = 0;
     int free_pages = 0;
     int max_pages_per_sequence = 0;
+    int shared_pages = 0;  // pages listed by two or more sequences (prefix sharing)
+};
+
+// The pages one sequence lists, and how many of them no other sequence lists: the pages that
+// releasing it (completion, cancellation, preemption) gives back.
+struct SequencePages {
+    int held = 0;
+    int exclusive = 0;
 };
 
 // Thrown when KV memory is too short for a request. The scheduler catches this to defer or preempt.
@@ -75,6 +83,22 @@ public:
 
     // Sequences the backend currently holds, or -1 if it does not count them.
     virtual int live_sequences() const { return -1; }
+
+    // Makes the empty sequence `dst` start with the first `pages` pages of `src`, which must be full
+    // (prefix sharing; docs/kv-cache.md). Their K/V are reused, not copied: each shared page is
+    // freed only when the last sequence listing it is freed. std::invalid_argument for a bad call;
+    // std::logic_error if the backend cannot share.
+    virtual void share_prefix(SeqId dst, SeqId src, int pages) {
+        (void)dst, (void)src, (void)pages;
+        throw std::logic_error("this backend cannot share KV pages");
+    }
+
+    // The default, for backends that never share: every page is the sequence's own.
+    virtual SequencePages sequence_pages(SeqId seq) const {
+        const int page = kv_stats().page_size_tokens;
+        const int held = page > 0 ? (sequence_length(seq) + page - 1) / page : 0;
+        return {held, held};
+    }
 
 protected:
     InferenceBackend() = default;

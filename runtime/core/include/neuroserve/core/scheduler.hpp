@@ -41,7 +41,7 @@ struct QueuedRequest {
 
 struct RunningRequest {
     std::string id;
-    int pages = 0;            // pages it holds now
+    int pages = 0;            // pages only it holds: what preempting it gives back (shared ones stay)
     int next_step_pages = 0;  // new pages its decode in this step needs (0 or 1)
     int generated_tokens = 0;
     int max_new_tokens = 0;

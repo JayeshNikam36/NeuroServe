@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "fake_backend.hpp"
+#include "prefill_gate.hpp"
 #include "neuroserve/core/engine_loop.hpp"
 #include "neuroserve/core/kv_cache_manager.hpp"
 #include "neuroserve/core/log.hpp"
@@ -222,12 +223,16 @@ TEST(EngineInvariants, WithChecksOffTheSameLeakGoesUnnoticed) {
 TEST(EngineInvariants, AHealthyEngineUnderPreemptionPassesEveryCheck) {
     // 8 pages of 16 tokens for 24 requests that each grow to 3 pages: admission, preemption,
     // restarts and completion all happen, and the checks run after every step.
+    // All 24 are queued before the engine goes on, so they compete: without the gate a loaded
+    // machine let the engine finish requests as they came, and nothing was ever preempted.
     FakeBackend backend(1000, /*total_pages=*/8);
+    neuroserve::test_support::FirstPrefillGate gate(backend);
     EngineLoop loop(backend, checked());
     std::vector<neuroserve::core::RequestHandle> handles;
     for (int i = 0; i < 24; ++i) {
         handles.push_back(loop.submit(params(std::vector<TokenId>(20, static_cast<TokenId>(i + 1)), 24)));
     }
+    gate.open();
     for (auto& h : handles) {
         ASSERT_TRUE(h.wait_for(30s));
         EXPECT_EQ(h.wait().tokens.size(), 24u);

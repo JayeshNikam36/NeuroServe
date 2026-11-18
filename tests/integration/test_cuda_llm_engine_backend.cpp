@@ -213,3 +213,65 @@ TEST_F(CudaLlmEngineBackendTest, ReportsKvExhaustionInsteadOfCrashing) {
     }
     expect_no_leaked_pages();
 }
+TEST_F(CudaLlmEngineBackendTest, SharedPrefixPagesAreReusedAndFreedByTheirLastHolder) {
+    // A 40-token prompt (the reference prompts, concatenated): pages 0-1 full, page 2 partial.
+    std::vector<TokenId> prompt;
+    for (const Reference& r : refs_) {
+        prompt.insert(prompt.end(), r.prompt.begin(), r.prompt.end());
+    }
+    ASSERT_GE(prompt.size(), 40u);
+    prompt.resize(40);
+    const auto decode_alone = [&](SeqId id, TokenId token) {
+        const SeqId ids[] = {id};
+        const TokenId tokens[] = {token};
+        return backend_->decode_step(ids, tokens).at(0);
+    };
+
+    // The truth: the prompt alone, then 8 more tokens.
+    const SeqId solo = backend_->create_sequence();
+    std::vector<TokenId> truth{backend_->prefill(solo, prompt)};
+    while (truth.size() < 9) {
+        truth.push_back(decode_alone(solo, truth.back()));
+    }
+    backend_->free_sequence(solo);
+    const int free_before = backend_->kv_stats().free_pages;
+
+    const SeqId a = backend_->create_sequence();
+    ASSERT_EQ(backend_->prefill(a, prompt), truth[0]);
+    const SeqId b = backend_->create_sequence();
+    backend_->share_prefix(b, a, 2);  // b starts with a's two full pages: 32 cached positions
+    EXPECT_EQ(backend_->sequence_length(b), 32);
+    EXPECT_EQ(backend_->sequence_pages(a).exclusive, 1);
+    EXPECT_EQ(backend_->sequence_pages(b).exclusive, 0);
+    EXPECT_EQ(backend_->kv_stats().shared_pages, 2);
+    EXPECT_EQ(backend_->kv_stats().free_pages, free_before - 3) << "sharing took no page";
+    backend_->check_kv_invariants();
+
+    // b feeds the 8 uncached prompt tokens itself: its K/V for positions 32-39 go to a page of its
+    // own, and its attention reads the shared pages. Its next token must be the prompt's (the path
+    // Day 34's "prefill from a cached offset" will take; a mismatch here would be the ADR-0006
+    // near-tie risk between the prefill and decode code paths, not a counting bug).
+    TokenId next = 0;
+    for (std::size_t i = 32; i < prompt.size(); ++i) {
+        next = decode_alone(b, prompt[i]);
+    }
+    EXPECT_EQ(next, truth[0]) << "reused prefix + decoded suffix vs the whole prompt prefilled";
+    EXPECT_EQ(backend_->sequence_pages(b).held, 3);
+    EXPECT_EQ(backend_->sequence_pages(b).exclusive, 1);
+
+    // b's writes never touched the shared pages: a continues exactly as the prompt alone did.
+    std::vector<TokenId> continued{truth[0]};
+    while (continued.size() < truth.size()) {
+        continued.push_back(decode_alone(a, continued.back()));
+    }
+    EXPECT_EQ(continued, truth);
+
+    backend_->free_sequence(a);  // the shared pages stay: b still lists them
+    EXPECT_EQ(backend_->kv_stats().shared_pages, 0);
+    EXPECT_EQ(backend_->sequence_pages(b).exclusive, 3);
+    EXPECT_EQ(backend_->kv_stats().free_pages, free_before - 3);
+    backend_->check_kv_invariants();
+    backend_->free_sequence(b);  // the last holder: everything is free
+    expect_no_leaked_pages();
+    backend_->check_kv_invariants();
+}
