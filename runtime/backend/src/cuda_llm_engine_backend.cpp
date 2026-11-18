@@ -186,6 +186,7 @@ KvCacheStats CudaLlmEngineBackend::kv_stats() const {
     s.total_pages = impl_->kv->config().num_blocks;
     s.free_pages = impl_->kv->free_blocks();
     s.max_pages_per_sequence = impl_->config.max_pages_per_sequence;
+    s.shared_pages = impl_->kv->stats().shared_blocks;
     return s;
 }
 
@@ -325,5 +326,26 @@ void CudaLlmEngineBackend::check_kv_invariants() const {
 }
 
 int CudaLlmEngineBackend::live_sequences() const { return static_cast<int>(impl_->sequences.size()); }
+
+void CudaLlmEngineBackend::share_prefix(SeqId dst, SeqId src, int pages) {
+    Impl& im = *impl_;
+    ::Sequence& to = im.get(dst);
+    im.get(src);                          // both must exist
+    im.kv->share_prefix(dst, src, pages);  // validates (empty dst, full pages) and counts the references
+    im.sync_pages(dst, to);
+    to.len = pages * im.config.page_size_tokens;  // the shared positions are cached: decode continues after them
+    im.check_in_sync(dst, to);
+}
+
+SequencePages CudaLlmEngineBackend::sequence_pages(SeqId id) const {
+    const Impl& im = *impl_;
+    im.get(id);
+    SequencePages out;
+    for (const core::BlockId block : im.kv->table(id)) {
+        ++out.held;
+        out.exclusive += im.kv->ref_count(block) == 1;
+    }
+    return out;
+}
 
 }  // namespace neuroserve

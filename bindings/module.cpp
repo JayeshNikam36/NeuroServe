@@ -140,6 +140,7 @@ public:
         out["total_pages"] = s.total_pages;
         out["free_pages"] = s.free_pages;
         out["max_pages_per_sequence"] = s.max_pages_per_sequence;
+        out["shared_pages"] = s.shared_pages;
         return out;
     }
 

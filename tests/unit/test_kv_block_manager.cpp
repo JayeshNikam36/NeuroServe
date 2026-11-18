@@ -3,7 +3,9 @@
 // state on purpose (fault injection) to test check_invariants() comes with the checker on Day 30.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <functional>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <random>
@@ -273,6 +275,76 @@ TEST_P(KvBlockContract, InvariantsHoldThroughARandomWorkload) {
         kv->release(s);
     }
     EXPECT_EQ(kv->free_blocks(), 48);
+    kv->check_invariants();
+}
+
+TEST_P(KvBlockContract, EveryReleaseOrderFreesASharedBlockOnlyWithItsLastOwner) {
+    // Sequence 0 holds 50 tokens (blocks 0-3); 1, 2 and 3 share its first 3, 2 and 1 blocks. For
+    // every one of the 24 release orders, a block must be free exactly when no remaining sequence
+    // lists it.
+    std::vector<neuroserve::SeqId> order = {0, 1, 2, 3};
+    int orders = 0;
+    do {
+        auto kv = make(8);
+        kv->create(0);
+        kv->append(0, 50);
+        for (neuroserve::SeqId s = 1; s <= 3; ++s) {
+            kv->create(s);
+            kv->share_prefix(s, 0, 4 - static_cast<int>(s));
+        }
+        std::map<neuroserve::SeqId, std::vector<BlockId>> tables;
+        for (neuroserve::SeqId s = 0; s <= 3; ++s) {
+            tables[s] = kv->table(s);
+        }
+        for (const neuroserve::SeqId gone : order) {
+            kv->release(gone);
+            tables.erase(gone);
+            for (BlockId b = 0; b < 8; ++b) {
+                int listed = 0;
+                for (const auto& [s, table] : tables) {
+                    listed += static_cast<int>(std::count(table.begin(), table.end(), b));
+                }
+                ASSERT_EQ(kv->ref_count(b), listed) << "block " << b << " after releasing " << gone;
+            }
+            kv->check_invariants();
+        }
+        EXPECT_EQ(kv->free_blocks(), 8);
+        ++orders;
+    } while (std::next_permutation(order.begin(), order.end()));
+    EXPECT_EQ(orders, 24);
+}
+
+TEST_P(KvBlockContract, ASharerOfASharerCountsAsAnotherOwner) {
+    auto kv = make(8);
+    kv->create(0);
+    kv->append(0, 32);       // blocks 0, 1
+    kv->create(1);
+    kv->share_prefix(1, 0, 2);
+    kv->create(2);
+    kv->share_prefix(2, 1, 2);  // 1's blocks are 0's: three owners
+    EXPECT_EQ(kv->ref_count(0), 3);
+    kv->release(0);
+    kv->release(1);
+    EXPECT_EQ(kv->ref_count(0), 1) << "the last owner keeps them";
+    EXPECT_EQ(kv->free_blocks(), 6);
+    kv->release(2);
+    EXPECT_EQ(kv->free_blocks(), 8);
+    kv->check_invariants();
+}
+
+TEST_P(KvBlockContract, SharingTakesNoCapacityAndReleasingASharerFreesNothingShared) {
+    auto kv = make(4);
+    kv->create(0);
+    kv->append(0, 64);  // the whole pool
+    kv->create(1);
+    kv->share_prefix(1, 0, 4);
+    EXPECT_EQ(kv->free_blocks(), 0);
+    EXPECT_THROW(kv->append(1, 1), KvCacheExhausted) << "growing past the shared blocks needs a new one";
+    kv->release(0);
+    EXPECT_EQ(kv->free_blocks(), 0) << "1 still lists all four";
+    EXPECT_THROW(kv->append(1, 1), KvCacheExhausted);
+    kv->release(1);
+    EXPECT_EQ(kv->free_blocks(), 4);
     kv->check_invariants();
 }
 

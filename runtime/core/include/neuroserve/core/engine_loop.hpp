@@ -255,6 +255,7 @@ private:
     void release(Entry& entry) noexcept;
     void cancel_all() noexcept;
     void refresh_kv_snapshot() noexcept;
+    void refresh_own_pages();  // each running request's exclusive pages, for this step's decision
     void check_kv_bookkeeping() const;  // options_.check_invariants; throws KvInvariantViolation
 
     InferenceBackend& backend_;

@@ -15,6 +15,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 28 | `KVCacheManager` (ordered free set, running counts, `allocated_by`), with the backend taking every block from it and the engine's allocator emptied | done |
 | 29 | Property-based tests (`tests/unit/test_kv_property.cpp`, harness in `tests/support/kv_ops.hpp`): 10,000 seeded random programs, about 600,000 operations, manager vs reference after every operation; a divergence is shrunk to a short reproduction. `NS_KV_PROPERTY_PROGRAMS` / `NS_KV_PROPERTY_SEED` run more or other programs | done |
 | 30 | Per-step checks: the manager's I1–I6, the engine's and the manager's views of every sequence, and the loop's I11–I12, after every engine step (`EngineLoopOptions::check_invariants`); fault injection for each (`tests/unit/test_kv_invariants.cpp`) | done |
+| 31 | Reference counting through the backend and the engine: `share_prefix` and `sequence_pages` on every backend, shared pages in `/health`, preemption planned with a request's own pages, I11 counting a shared page once; tests in every release order and through completion, cancellation and preemption (`tests/unit/test_kv_sharing.cpp`) | done |
 
 ## Today (v0.1)
 
@@ -178,6 +179,28 @@ and 37), to the reference first and then to the manager.
   0**, so the policy's `pages_held` becomes "blocks this request alone holds". A policy that
   counted shared blocks would expect memory that preemption cannot give back.
 
+**Implemented (Day 31).**
+- **Backends:** every backend has `share_prefix(dst, src, pages)` and
+  `sequence_pages(seq) -> {held, exclusive}`, and `/health` reports `shared_pages`.
+- **The engine loop:** each step it reads every running request's exclusive pages before the policy
+  decides, and passes them as `RunningRequest::pages`.
+- **I11:** it now checks `used = Σ exclusive + shared`, so each shared page is counted once.
+- **The test that proves the policy side:** 16 requests share a two-page prefix on a 10-page pool,
+  and the engine must preempt among them. With the old count (all pages held), the policy admits
+  requests whose prefill then runs out of pages, and they fail. With the exclusive count none does.
+
+**Why the counts are plain integers, not atomics (KV-006).**
+- **Who touches them:** reference counts are only read and changed on the engine thread, between
+  GPU calls. That thread is the only one that calls the backend, which owns the manager.
+- **What other threads see:** `/health`, metrics and the decision log read copies, made under the
+  engine loop's mutex at the end of a step.
+- **Why atomics would be wrong here:** there is no second writer, so an atomic would only hide one
+  if a bug ever added it. ThreadSanitizer runs every CPU test in CI, and would report that bug as a
+  data race instead.
+- **When this would change:** only if several threads ever drove one backend (for example a
+  separate prefill thread). That would need a design of its own, not just atomic counters, because
+  a block's count and its place in the free set must change together.
+
 ## Prefix caching
 
 ### Hashing full blocks (Day 32)
@@ -318,7 +341,7 @@ table checks.
 | I8 | An indexed block's hash equals `H(hash of the block before it in the table, its tokens)` | broken chains, wrong reuse |
 | I9 | The block that receives a step's new token has count 1 and is not indexed | writes into shared blocks |
 | I10 | The LRU queue holds exactly the `CACHED` blocks, ordered by last release | unevictable leaks, evicting live blocks |
-| I11 | The scheduler's view (`free_pages`, each request's blocks) equals the manager's | policy deciding on wrong numbers |
+| I11 | The scheduler's view equals the backend's: each running request's cached tokens are its sequence's length and cover its pages, and used pages = the requests' exclusive pages + shared pages | policy deciding on wrong numbers |
 | I12 | A released or finished sequence has no table | references from dead requests |
 | I13 | (debug) The device block tables equal the host tables after upload | stale tables on the GPU |
 
