@@ -142,6 +142,10 @@ public:
         out["free_pages"] = s.free_pages;
         out["max_pages_per_sequence"] = s.max_pages_per_sequence;
         out["shared_pages"] = s.shared_pages;
+        out["indexed_pages"] = s.indexed_pages;
+        out["prefix_lookups"] = s.prefix_lookups;
+        out["prefix_lookup_pages"] = s.prefix_lookup_pages;
+        out["prefix_hit_pages"] = s.prefix_hit_pages;
         return out;
     }
 

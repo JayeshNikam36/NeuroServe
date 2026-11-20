@@ -210,7 +210,12 @@ KvCacheStats CudaLlmEngineBackend::kv_stats() const {
     s.total_pages = impl_->kv->config().num_blocks;
     s.free_pages = impl_->kv->free_blocks();
     s.max_pages_per_sequence = impl_->config.max_pages_per_sequence;
-    s.shared_pages = impl_->kv->stats().shared_blocks;
+    const core::KvBlockStats kv = impl_->kv->stats();
+    s.shared_pages = kv.shared_blocks;
+    s.indexed_pages = kv.indexed_blocks;  // 0: prefix caching starts with prefill from a cached offset
+    s.prefix_lookups = kv.prefix_lookups;
+    s.prefix_lookup_pages = kv.prefix_lookup_blocks;
+    s.prefix_hit_pages = kv.prefix_hit_blocks;
     return s;
 }
 

@@ -90,7 +90,7 @@ TEST(KvSharing, TheBackendCountsASharedPageOnce) {
 
 TEST(KvSharing, RequestsWithACommonPrefixShareItsPages) {
     FakeBackend backend;
-    backend.share_prompt_prefixes = true;
+    backend.prefix_caching = true;
     int most_shared = 0;
     backend.on_decode = [&](std::size_t) { most_shared = std::max(most_shared, backend.kv_stats().shared_pages); };
     FirstPrefillGate gate(backend);  // both queued before the engine goes on: they run together
@@ -111,7 +111,7 @@ TEST(KvSharing, RequestsWithACommonPrefixShareItsPages) {
 
 TEST(KvSharing, SharedPagesOutliveTheRequestThatWroteThem) {
     FakeBackend backend;
-    backend.share_prompt_prefixes = true;
+    backend.prefix_caching = true;
     bool shared_while_both_ran = false;
     bool own_after_first_finished = false;
     backend.on_decode = [&](std::size_t batch) {
@@ -139,7 +139,7 @@ TEST(KvSharing, SharedPagesOutliveTheRequestThatWroteThem) {
 
 TEST(KvSharing, ACancelledSharerReleasesOnlyItsOwnPages) {
     FakeBackend backend;
-    backend.share_prompt_prefixes = true;
+    backend.prefix_caching = true;
     std::atomic<int> decodes{0};
     backend.on_decode = [&](std::size_t) {
         if (++decodes == 3) {
@@ -170,7 +170,7 @@ TEST(KvSharing, PreemptingSharersNeverPlansWithPagesItCannotFree) {
     // 3 its own), so the engine must preempt. A policy that counted shared pages as freed by a
     // preemption would admit requests the memory cannot hold, and their prefill would fail.
     FakeBackend backend(1000, /*total_pages=*/10);
-    backend.share_prompt_prefixes = true;
+    backend.prefix_caching = true;
     FirstPrefillGate gate(backend);  // all 16 queued, so they compete for the pages
     EngineLoop loop(backend, checked());
     std::vector<GenerationParams> all;

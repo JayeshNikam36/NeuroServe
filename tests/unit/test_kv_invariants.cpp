@@ -28,6 +28,8 @@ struct KVCacheManagerTestPeer {
     static int& length(KVCacheManager& m, SeqId s) { return m.sequences_.at(s).length; }
     static void drift_shared(KVCacheManager& m, int delta) { m.shared_blocks_ += delta; }
     static void drift_tokens(KVCacheManager& m, int delta) { m.cached_tokens_ += delta; }
+    static void corrupt_indexed_token(KVCacheManager& m, BlockId b) { m.blocks_[static_cast<std::size_t>(b)].tokens[0] += 1; }
+    static void drop_from_index(KVCacheManager& m, BlockId b) { m.index_.erase(m.blocks_[static_cast<std::size_t>(b)].hash); }
 };
 
 }  // namespace neuroserve::core
@@ -239,6 +241,41 @@ TEST(EngineInvariants, AHealthyEngineUnderPreemptionPassesEveryCheck) {
     }
     EXPECT_FALSE(loop.stop_requested());
     EXPECT_GT(loop.stats().preemptions, 0u) << "the test should exercise preemption";
+}
+
+// ---- The prefix index (Day 33): I7 and I8.
+
+std::unique_ptr<KVCacheManager> indexed_prompt(std::vector<neuroserve::TokenId>& p) {
+    neuroserve::core::KvCacheIdentity id;
+    id.model_id = "m";
+    id.weights_digest = "w";
+    id.dtype = "fp16";
+    id.block_size = 16;
+    id.rope.theta = 10000.0;
+    auto m = std::make_unique<KVCacheManager>(KvBlockConfig{8, 16, 4}, id);
+    for (int i = 0; i < 40; ++i) {
+        p.push_back(300 + i);
+    }
+    m->create(1);
+    m->admit(1, p);
+    m->commit(1, p);  // blocks 0 and 1 indexed
+    m->check_invariants();
+    return m;
+}
+
+TEST(KvInvariants, ATamperedIndexedBlockIsReportedAndNeverReused) {
+    std::vector<neuroserve::TokenId> p;
+    auto m = indexed_prompt(p);
+    Peer::corrupt_indexed_token(*m, 1);  // its stored tokens no longer give its hash
+    expect_violation(*m, {"I8", "block 1"});
+    EXPECT_EQ(m->match(p), 1) << "verification refuses the block whose tokens differ";
+}
+
+TEST(KvInvariants, AnIndexedBlockMissingFromTheIndexIsReported) {
+    std::vector<neuroserve::TokenId> p;
+    auto m = indexed_prompt(p);
+    Peer::drop_from_index(*m, 0);
+    expect_violation(*m, {"I7", "block 0"});
 }
 
 }  // namespace

@@ -1,0 +1,239 @@
+// The prefix index and lookup at admission (Day 33, KV-007): the contract, run on the reference and
+// on the KVCacheManager alike. docs/kv-cache.md, "Lookup at admission".
+#include <gtest/gtest.h>
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "neuroserve/core/kv_cache_manager.hpp"
+#include "neuroserve/core/kv_reference.hpp"
+
+namespace {
+
+using neuroserve::KvCacheExhausted;
+using neuroserve::TokenId;
+using neuroserve::core::BlockId;
+using neuroserve::core::KvBlockConfig;
+using neuroserve::core::KvBlockManager;
+using neuroserve::core::KvCacheIdentity;
+using neuroserve::core::KVCacheManager;
+using neuroserve::core::ReferenceBlockManager;
+
+KvCacheIdentity identity(int block_size = 16) {
+    KvCacheIdentity id;
+    id.model_id = "llama-3.2-1b";
+    id.weights_digest = "test";
+    id.dtype = "fp16";
+    id.block_size = block_size;
+    id.rope = {500000.0, "llama3", 32.0, 1.0, 4.0, 8192};
+    return id;
+}
+
+using Factory = std::function<std::unique_ptr<KvBlockManager>(KvBlockConfig, std::optional<KvCacheIdentity>)>;
+struct Implementation {
+    std::string name;
+    Factory make;
+};
+
+// A system prompt of `n` tokens, then `tail` tokens of the request's own.
+std::vector<TokenId> prompt(int n, TokenId own = 0, int tail = 0) {
+    std::vector<TokenId> p;
+    for (int i = 0; i < n; ++i) {
+        p.push_back(1000 + i);
+    }
+    for (int i = 0; i < tail; ++i) {
+        p.push_back(own);
+    }
+    return p;
+}
+
+class KvPrefixIndex : public ::testing::TestWithParam<Implementation> {
+protected:
+    std::unique_ptr<KvBlockManager> make(int num_blocks, int max_per_sequence = 16) {
+        auto kv = GetParam().make(KvBlockConfig{num_blocks, 16, max_per_sequence}, identity());
+        EXPECT_TRUE(kv->prefix_caching());
+        return kv;
+    }
+    // Admits `p` as a new sequence, as a backend does: admit, then (K/V written) commit.
+    static int admit_and_commit(KvBlockManager& kv, neuroserve::SeqId seq, const std::vector<TokenId>& p) {
+        kv.create(seq);
+        const int cached = kv.admit(seq, p);
+        kv.commit(seq, p);
+        kv.check_invariants();
+        return cached;
+    }
+};
+
+TEST_P(KvPrefixIndex, ASecondRequestWithTheSameSystemPromptReusesItsFullBlocks) {
+    auto kv = make(16);
+    const auto a = prompt(64, 1, 8);  // 72 tokens: 4 full blocks of system prompt, 1 partial
+    const auto b = prompt(64, 2, 8);
+    EXPECT_EQ(admit_and_commit(*kv, 1, a), 0) << "nothing to reuse yet";
+    EXPECT_EQ(kv->stats().indexed_blocks, 4) << "the partial block is not indexed";
+
+    EXPECT_EQ(admit_and_commit(*kv, 2, b), 64);
+    const std::vector<BlockId> ta = kv->table(1);
+    const std::vector<BlockId> tb = kv->table(2);
+    ASSERT_EQ(tb.size(), 5u);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(tb[static_cast<std::size_t>(i)], ta[static_cast<std::size_t>(i)]) << "block " << i;
+        EXPECT_EQ(kv->ref_count(ta[static_cast<std::size_t>(i)]), 2);
+    }
+    EXPECT_NE(tb[4], ta[4]) << "the requests' own tails are their own";
+    EXPECT_EQ(kv->length(2), 72);
+
+    const auto s = kv->stats();
+    EXPECT_EQ(s.used_blocks, 6) << "4 shared + 2 own, instead of 10";
+    EXPECT_EQ(s.shared_blocks, 4);
+    EXPECT_EQ(s.prefix_lookups, 2);
+    EXPECT_EQ(s.prefix_lookup_blocks, 8);
+    EXPECT_EQ(s.prefix_hit_blocks, 4) << "the hit is counted";
+}
+
+TEST_P(KvPrefixIndex, TheBlockHoldingTheLastPromptTokenIsNeverReused) {
+    auto kv = make(16);
+    const auto p = prompt(32);  // exactly 2 full blocks
+    admit_and_commit(*kv, 1, p);
+    EXPECT_EQ(kv->stats().indexed_blocks, 2);
+    EXPECT_EQ(admit_and_commit(*kv, 2, p), 16) << "block 1 holds the last token: its logits must be computed";
+    EXPECT_EQ(kv->table(2)[0], kv->table(1)[0]);
+    EXPECT_NE(kv->table(2)[1], kv->table(1)[1]);
+    EXPECT_FALSE(kv->indexed(kv->table(2)[1])) << "a duplicate of an indexed block is not indexed";
+    EXPECT_EQ(kv->stats().indexed_blocks, 2);
+    EXPECT_EQ(kv->stats().prefix_lookup_blocks, 2) << "each lookup could reuse 1 block";
+}
+
+TEST_P(KvPrefixIndex, LookupStopsAtTheFirstMiss) {
+    auto kv = make(16);
+    admit_and_commit(*kv, 1, prompt(64, 0, 1));
+    auto changed = prompt(64, 0, 1);
+    changed[20] = 7;  // block 1 differs; blocks 2 and 3 have the same tokens as sequence 1's
+    EXPECT_EQ(kv->match(changed), 1) << "a block is reusable only if everything before it is";
+    EXPECT_EQ(admit_and_commit(*kv, 2, changed), 16);
+    EXPECT_EQ(kv->stats().indexed_blocks, 4 + 3) << "its own blocks 1..3 are a different prefix";
+}
+
+TEST_P(KvPrefixIndex, IndexedBlocksStayWhileAnyHolderRemainsAndGoWithTheLast) {
+    auto kv = make(16);
+    admit_and_commit(*kv, 1, prompt(64, 1, 4));
+    admit_and_commit(*kv, 2, prompt(64, 2, 4));
+    kv->release(1);  // the request that wrote them
+    kv->check_invariants();
+    EXPECT_EQ(kv->stats().indexed_blocks, 4) << "sequence 2 still holds them";
+    EXPECT_EQ(admit_and_commit(*kv, 3, prompt(64, 3, 4)), 64);
+
+    kv->release(2);
+    kv->release(3);
+    kv->check_invariants();
+    EXPECT_EQ(kv->stats().indexed_blocks, 0) << "free again: no longer indexed (CACHED comes on Day 37)";
+    EXPECT_EQ(kv->free_blocks(), 16);
+    EXPECT_EQ(kv->match(prompt(64, 4, 4)), 0);
+}
+
+TEST_P(KvPrefixIndex, CommitIndexesEachBlockOnceAsItFills) {
+    auto kv = make(16);
+    std::vector<TokenId> tokens = prompt(10);
+    kv->create(1);
+    kv->admit(1, tokens);
+    EXPECT_EQ(kv->commit(1, tokens), 0);
+    for (int step = 0; step < 40; ++step) {  // decode: one token at a time
+        kv->append(1, 1);
+        tokens.push_back(500 + step);
+        const int added = kv->commit(1, tokens);
+        EXPECT_EQ(added, tokens.size() % 16 == 0 ? 1 : 0) << tokens.size() << " tokens";
+        kv->check_invariants();
+    }
+    EXPECT_EQ(kv->stats().indexed_blocks, 3);
+    // A later request whose prompt continues with the generated tokens reuses them too.
+    std::vector<TokenId> follow_up = tokens;
+    follow_up.push_back(9);
+    EXPECT_EQ(kv->match(follow_up), 3);
+}
+
+TEST_P(KvPrefixIndex, ADuplicateIsIndexedOnceTheOriginalIsGone) {
+    auto kv = make(16);
+    const auto p = prompt(32);
+    admit_and_commit(*kv, 1, p);  // blocks A0, A1 indexed
+    admit_and_commit(*kv, 2, p);  // reuses A0; its own block 1 duplicates A1
+    const BlockId own = kv->table(2)[1];
+    EXPECT_FALSE(kv->indexed(own));
+    kv->release(1);  // A1 is freed and unindexed; A0 stays (sequence 2 holds it)
+    EXPECT_EQ(kv->commit(2, p), 1) << "the retry indexes sequence 2's copy";
+    EXPECT_TRUE(kv->indexed(own));
+    kv->check_invariants();
+    auto longer = p;
+    longer.push_back(5);
+    EXPECT_EQ(kv->match(longer), 2);
+}
+
+TEST_P(KvPrefixIndex, AdmitIsAllOrNothing) {
+    auto kv = make(6);
+    admit_and_commit(*kv, 1, prompt(64, 1, 8));  // 5 blocks, 4 indexed; 1 free
+    kv->create(2);
+    const auto before = kv->stats();
+    // Reuses 4, but needs 2 more for its own 20-token tail: only 1 is free.
+    EXPECT_THROW(kv->admit(2, prompt(64, 2, 20)), KvCacheExhausted);
+    const auto after = kv->stats();
+    EXPECT_EQ(kv->length(2), 0);
+    EXPECT_TRUE(kv->table(2).empty());
+    EXPECT_EQ(after.shared_blocks, before.shared_blocks) << "the reused blocks were given back";
+    EXPECT_EQ(after.prefix_lookups, before.prefix_lookups) << "a failed admission is not counted";
+    EXPECT_EQ(after.prefix_hit_blocks, before.prefix_hit_blocks);
+    kv->check_invariants();
+    EXPECT_EQ(kv->admit(2, prompt(64, 2, 8)), 64) << "one that fits is admitted";
+
+    kv->create(3);
+    EXPECT_THROW(kv->admit(3, prompt(16 * 17)), std::length_error);  // over max_blocks_per_sequence
+}
+
+TEST_P(KvPrefixIndex, BadCallsAreRejectedAndChangeNothing) {
+    auto kv = make(8);
+    admit_and_commit(*kv, 1, prompt(40));
+    EXPECT_THROW(kv->admit(1, prompt(8)), std::invalid_argument) << "not empty";
+    EXPECT_THROW(kv->admit(9, prompt(8)), std::invalid_argument) << "unknown";
+    kv->create(2);
+    EXPECT_THROW(kv->admit(2, {}), std::invalid_argument) << "empty prompt";
+    EXPECT_THROW(kv->commit(1, prompt(39)), std::invalid_argument) << "wrong number of tokens";
+    auto tampered = prompt(40);
+    tampered[3] = 1;
+    EXPECT_THROW(kv->commit(1, tampered), std::invalid_argument) << "disagrees with an indexed block";
+    EXPECT_EQ(kv->stats().indexed_blocks, 2);
+    kv->check_invariants();
+}
+
+TEST_P(KvPrefixIndex, MatchChangesNothing) {
+    auto kv = make(8);
+    admit_and_commit(*kv, 1, prompt(40));
+    const auto before = kv->stats();
+    EXPECT_EQ(kv->match(prompt(40)), 2);
+    EXPECT_EQ(kv->match(prompt(33)), 2);
+    EXPECT_EQ(kv->match(prompt(32)), 1) << "never the last token's block";
+    const auto after = kv->stats();
+    EXPECT_EQ(after.prefix_lookups, before.prefix_lookups);
+    EXPECT_EQ(after.shared_blocks, before.shared_blocks);
+}
+
+TEST_P(KvPrefixIndex, WithoutAnIdentityPrefixCachingIsOff) {
+    auto kv = GetParam().make(KvBlockConfig{8, 16, 8}, std::nullopt);
+    EXPECT_FALSE(kv->prefix_caching());
+    kv->create(1);
+    EXPECT_THROW(kv->admit(1, prompt(8)), std::logic_error);
+    EXPECT_THROW(kv->commit(1, {}), std::logic_error);
+    EXPECT_THROW((void)kv->match(prompt(8)), std::logic_error);
+    EXPECT_THROW(GetParam().make(KvBlockConfig{8, 16, 8}, identity(8)), std::invalid_argument)
+        << "the identity's block size must be the pool's";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BothImplementations, KvPrefixIndex,
+    ::testing::Values(Implementation{"Reference", [](KvBlockConfig c, std::optional<KvCacheIdentity> id) {
+                                         return std::make_unique<ReferenceBlockManager>(c, std::move(id));
+                                     }},
+                      Implementation{"KVCacheManager", [](KvBlockConfig c, std::optional<KvCacheIdentity> id) {
+                                         return std::make_unique<KVCacheManager>(c, std::move(id));
+                                     }}),
+    [](const ::testing::TestParamInfo<Implementation>& p) { return p.param.name; });
+
+}  // namespace

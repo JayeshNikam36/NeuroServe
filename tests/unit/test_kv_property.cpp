@@ -1,5 +1,6 @@
 // Property-based tests (Day 29): the KVCacheManager must behave exactly like the CPU reference on
-// 10,000 seeded random programs, compared after every operation (KV-004). On a divergence the
+// 10,000 seeded random programs, compared after every operation (KV-004). Since Day 33 both run
+// with prefix caching on, and the programs admit, commit and match prompts too. On a divergence the
 // failing program is shrunk to a short reproduction and printed with its seed.
 //
 // NS_KV_PROPERTY_PROGRAMS and NS_KV_PROPERTY_SEED change how many programs run and the first seed,
@@ -29,14 +30,24 @@ std::uint64_t env_or(const char* name, std::uint64_t fallback) {
     return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
 }
 
-const kvt::Factory kReference = [](KvBlockConfig c) { return std::make_unique<ReferenceBlockManager>(c); };
-const kvt::Factory kManager = [](KvBlockConfig c) { return std::make_unique<KVCacheManager>(c); };
+neuroserve::core::KvCacheIdentity identity(int block_size) {
+    neuroserve::core::KvCacheIdentity id;
+    id.model_id = "property-test";
+    id.weights_digest = "0";
+    id.dtype = "fp16";
+    id.block_size = block_size;
+    id.rope.theta = 10000.0;
+    return id;
+}
+
+const kvt::Factory kReference = [](KvBlockConfig c) { return std::make_unique<ReferenceBlockManager>(c, identity(c.block_size)); };
+const kvt::Factory kManager = [](KvBlockConfig c) { return std::make_unique<KVCacheManager>(c, identity(c.block_size)); };
 
 // A deliberately wrong manager, to prove the harness finds and shrinks a real bug: it shares one
 // block fewer than asked whenever two or more are asked for.
 class SharesOneBlockTooFew final : public KvBlockManager {
 public:
-    explicit SharesOneBlockTooFew(KvBlockConfig c) : inner_(c) {}
+    explicit SharesOneBlockTooFew(KvBlockConfig c) : inner_(c, identity(c.block_size)) {}
     const KvBlockConfig& config() const noexcept override { return inner_.config(); }
     void create(neuroserve::SeqId s) override { inner_.create(s); }
     int blocks_needed(neuroserve::SeqId s, int t) const override { return inner_.blocks_needed(s, t); }
@@ -51,6 +62,11 @@ public:
     int ref_count(neuroserve::core::BlockId b) const override { return inner_.ref_count(b); }
     int free_blocks() const override { return inner_.free_blocks(); }
     neuroserve::core::KvBlockStats stats() const override { return inner_.stats(); }
+    bool prefix_caching() const noexcept override { return inner_.prefix_caching(); }
+    int admit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> p) override { return inner_.admit(s, p); }
+    int commit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> t) override { return inner_.commit(s, t); }
+    int match(std::span<const neuroserve::TokenId> p) const override { return inner_.match(p); }
+    bool indexed(neuroserve::core::BlockId b) const override { return inner_.indexed(b); }
     void check_invariants() const override { inner_.check_invariants(); }
 
 private:
@@ -66,7 +82,7 @@ TEST(KvProperty, ProgramsAreReproducibleFromTheirSeed) {
     // be a decision (old failure seeds would no longer reproduce).
     EXPECT_EQ(kvt::describe(kvt::generate(7, 4)),
               "seed 7, config {num_blocks 5, block_size 16, max_blocks_per_sequence 7}:\n"
-              "  0: blocks_needed(2, 35)\n  1: release(1)\n  2: append(0, 30)");
+              "  0: create(0)\n  1: admit(0, [12211221200002120000])\n  2: share_prefix(0, 0, 2)");
 }
 
 TEST(KvProperty, ManagerMatchesTheReferenceOnRandomPrograms) {
@@ -75,10 +91,16 @@ TEST(KvProperty, ManagerMatchesTheReferenceOnRandomPrograms) {
     std::map<std::string, long> coverage;  // "<op> -> <outcome>": how often each happened
     std::uint64_t ops = 0;
     const kvt::Observer count = [&](const kvt::Op& op, const std::string& outcome) {
-        static const char* names[] = {"create", "append", "share_prefix", "release", "blocks_needed"};
+        static const char* names[] = {"create", "append", "share_prefix", "release", "blocks_needed",
+                                      "admit", "commit", "match"};
         const std::string result = outcome.rfind("ok", 0) == 0 ? "ok" : outcome;
         const bool sharing = op.kind == kvt::OpKind::kShare && result == "ok" && op.amount > 0;
-        ++coverage[std::string(names[static_cast<int>(op.kind)]) + (sharing ? " (blocks shared)" : "") + " -> " + result];
+        const bool counted = (op.kind == kvt::OpKind::kAdmit || op.kind == kvt::OpKind::kCommit ||
+                              op.kind == kvt::OpKind::kMatch) && result == "ok";
+        const std::string detail = sharing ? " (blocks shared)"
+                                   : counted ? (outcome == "ok 0" ? " (none)" : op.kind == kvt::OpKind::kCommit ? " (indexed)" : " (hit)")
+                                             : "";
+        ++coverage[std::string(names[static_cast<int>(op.kind)]) + detail + " -> " + result];
         ++ops;
     };
     for (std::uint64_t i = 0; i < programs; ++i) {
@@ -103,6 +125,14 @@ TEST(KvProperty, ManagerMatchesTheReferenceOnRandomPrograms) {
         EXPECT_GE(coverage["share_prefix -> invalid_argument"], 5'000);
         EXPECT_GE(coverage["create -> invalid_argument"], 10'000);
         EXPECT_GE(coverage["release -> ok"], 20'000);
+        EXPECT_GE(coverage["admit (hit) -> ok"], 5'000);
+        EXPECT_GE(coverage["admit (none) -> ok"], 10'000);
+        EXPECT_GE(coverage["admit -> KvCacheExhausted"], 1'000);
+        EXPECT_GE(coverage["admit -> invalid_argument"], 1'000);
+        EXPECT_GE(coverage["commit (indexed) -> ok"], 10'000);
+        EXPECT_GE(coverage["commit (none) -> ok"], 10'000);
+        EXPECT_GE(coverage["commit -> invalid_argument"], 1'000);
+        EXPECT_GE(coverage["match (hit) -> ok"], 5'000);
     }
 }
 
