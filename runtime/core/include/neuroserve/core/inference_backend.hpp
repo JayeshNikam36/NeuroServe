@@ -31,6 +31,11 @@ struct KvCacheStats {
     int free_pages = 0;
     int max_pages_per_sequence = 0;
     int shared_pages = 0;  // pages listed by two or more sequences (prefix sharing)
+    // Prefix caching (docs/kv-cache.md); zero while it is off:
+    int indexed_pages = 0;               // full, written pages in the prefix index
+    std::int64_t prefix_lookups = 0;      // prompts looked up at admission
+    std::int64_t prefix_lookup_pages = 0; // full prompt pages they could have reused
+    std::int64_t prefix_hit_pages = 0;    // of those, the pages they did reuse
 };
 
 // The pages one sequence lists, and how many of them no other sequence lists: the pages that

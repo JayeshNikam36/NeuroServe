@@ -20,15 +20,15 @@ namespace neuroserve::test_support {
 // KV pages are accounted by the real KVCacheManager, exactly as in the CUDA backend: a sequence
 // holds ceil(length / page_size) pages, and prefill or decode_step throw KvCacheExhausted
 // (changing nothing) when the pages run out.
-// With share_prompt_prefixes, prefill reuses the full pages of a live sequence whose prompt starts
-// the same way (prefix sharing, before the real prefix index exists), so engine tests can run
-// requests that share pages.
+// With prefix_caching, prefill admits the prompt through the manager's prefix index (reusing the
+// full pages of live sequences with the same prefix) and computes only the rest, and every written
+// full page is committed to the index, as a prefix-caching GPU backend does (docs/kv-cache.md).
 // Like a real backend it is not thread-safe: only the engine thread may call it. Read the
 // test helpers only after the engine thread has stopped.
 class FakeBackend final : public InferenceBackend {
 public:
     explicit FakeBackend(int vocab_size = 1000, int total_pages = 64, int page_size = 16)
-        : page_size_(page_size), kv_(core::KvBlockConfig{total_pages, page_size, total_pages}) {
+        : page_size_(page_size), kv_(core::KvBlockConfig{total_pages, page_size, total_pages}, identity(page_size)) {
         info_.name = "fake";
         info_.vocab_size = vocab_size;
         info_.max_prompt_tokens = 512;
@@ -43,7 +43,12 @@ public:
         s.total_pages = kv_.config().num_blocks;
         s.free_pages = kv_.free_blocks();
         s.max_pages_per_sequence = kv_.config().max_blocks_per_sequence;
-        s.shared_pages = kv_.stats().shared_blocks;
+        const core::KvBlockStats kv = kv_.stats();
+        s.shared_pages = kv.shared_blocks;
+        s.indexed_pages = kv.indexed_blocks;
+        s.prefix_lookups = kv.prefix_lookups;
+        s.prefix_lookup_pages = kv.prefix_lookup_blocks;
+        s.prefix_hit_pages = kv.prefix_hit_blocks;
         return s;
     }
 
@@ -68,21 +73,26 @@ public:
         if (fail_prefill_token_ >= 0 && prompt.front() == fail_prefill_token_) {
             throw std::runtime_error("injected prefill failure");
         }
-        const auto [source, shared] = share_prompt_prefixes ? longest_shared_prefix(prompt) : std::pair<SeqId, int>{0, 0};
         const int n = static_cast<int>(prompt.size());
-        const int pages = (n + page_size_ - 1) / page_size_ - shared;
-        if (pages > kv_.free_blocks()) {
-            throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages");
+        int cached = 0;
+        if (prefix_caching) {
+            cached = kv_.admit(id, prompt);  // KvCacheExhausted (changing nothing) if pages are short
+        } else {
+            const int pages = (n + page_size_ - 1) / page_size_;
+            if (pages > kv_.free_blocks()) {
+                throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages");
+            }
+            kv_.append(id, n);
         }
         ++prefill_calls_;
+        prefilled_tokens_ += n - cached;  // the fake "computes" only what the cache did not hold
         if (record_batches) {
             prefill_first_tokens.push_back(prompt.front());
         }
-        if (shared > 0) {
-            kv_.share_prefix(id, source, shared);
+        tokens_[id].assign(prompt.begin(), prompt.end());
+        if (prefix_caching) {
+            kv_.commit(id, tokens_[id]);  // its full pages are written now
         }
-        kv_.append(id, n - shared * page_size_);
-        prompts_[id].assign(prompt.begin(), prompt.end());
         len = n;
         return next(prompt.back());
     }
@@ -115,6 +125,10 @@ public:
         for (std::size_t i = 0; i < ids.size(); ++i) {
             kv_.append(ids[i], 1);
             ++length(ids[i]);
+            tokens_[ids[i]].push_back(tokens[i]);
+            if (prefix_caching) {
+                kv_.commit(ids[i], tokens_[ids[i]]);  // indexes the page this token filled, if any
+            }
             out.push_back(next(tokens[i]));
         }
         length(ids[0]) += drift_after_decode;
@@ -127,7 +141,7 @@ public:
         }
         if (!leak_on_free) {
             lengths_.erase(id);
-            prompts_.erase(id);
+            tokens_.erase(id);
             kv_.release(id);
         }
     }
@@ -151,6 +165,8 @@ public:
         length(src);
         kv_.share_prefix(dst, src, pages);
         lengths_[dst] = pages * page_size_;
+        const std::vector<TokenId>& from = tokens_[src];
+        tokens_[dst].assign(from.begin(), from.begin() + std::min<std::ptrdiff_t>(pages * page_size_, static_cast<std::ptrdiff_t>(from.size())));
     }
 
     SequencePages sequence_pages(SeqId id) const override {
@@ -164,8 +180,9 @@ public:
     }
 
     // ---- Test helpers ----
-    // Prefill reuses the full pages of a live sequence whose prompt starts the same way.
-    bool share_prompt_prefixes = false;
+    // Prefill looks prompts up in the prefix index and commits written pages to it.
+    bool prefix_caching = false;
+    std::int64_t prefilled_tokens() const { return prefilled_tokens_; }  // prompt tokens computed
     const core::KVCacheManager& kv() const { return kv_; }
     // Injected bookkeeping faults, for the engine loop's invariant checks:
     bool leak_on_free = false;   // free_sequence() succeeds but keeps the sequence (a leak)
@@ -198,25 +215,22 @@ private:
 
     TokenId next(TokenId t) const { return (t + 1) % info_.vocab_size; }
 
-    // The live sequence whose prompt shares the most full pages with this one (ties: lowest id).
-    std::pair<SeqId, int> longest_shared_prefix(std::span<const TokenId> prompt) const {
-        std::pair<SeqId, int> best{0, 0};
-        for (const auto& [id, other] : prompts_) {
-            const auto common = static_cast<int>(
-                std::mismatch(prompt.begin(), prompt.end(), other.begin(), other.end()).first - prompt.begin());
-            const int pages = common / page_size_;
-            if (pages > best.second || (pages == best.second && pages > 0 && id < best.first)) {
-                best = {id, pages};
-            }
-        }
-        return best;
+    static core::KvCacheIdentity identity(int page_size) {
+        core::KvCacheIdentity id;
+        id.model_id = "fake";
+        id.weights_digest = "fake";
+        id.dtype = "fp16";
+        id.block_size = page_size;
+        id.rope.theta = 10000.0;
+        return id;
     }
 
     ModelInfo info_;
     int page_size_;
     core::KVCacheManager kv_;
     std::unordered_map<SeqId, int> lengths_;             // the backend's lengths (drift_after_decode bends them)
-    std::unordered_map<SeqId, std::vector<TokenId>> prompts_;  // of live, prefilled sequences
+    std::unordered_map<SeqId, std::vector<TokenId>> tokens_;  // every token each live sequence holds
+    std::int64_t prefilled_tokens_ = 0;
     SeqId next_id_ = 1;
     int decode_calls_ = 0;
     int prefill_calls_ = 0;

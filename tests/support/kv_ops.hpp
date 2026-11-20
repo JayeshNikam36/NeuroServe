@@ -1,11 +1,12 @@
 #pragma once
 // Property-based testing of KV block managers (docs/kv-cache.md, Day 29): seeded random programs of
 // operations, run on two implementations side by side and compared after every operation. Header
-// only, for the unit tests; later days add operations (prefix lookup, eviction) here.
+// only, for the unit tests; later days add operations here (Day 33: prefix admit, commit, match).
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -19,18 +20,32 @@
 namespace ns_test::kv {
 
 using neuroserve::SeqId;
+using neuroserve::TokenId;
 using neuroserve::core::BlockId;
 using neuroserve::core::KvBlockConfig;
 using neuroserve::core::KvBlockManager;
 
-enum class OpKind { kCreate, kAppend, kShare, kRelease, kBlocksNeeded };
+enum class OpKind { kCreate, kAppend, kShare, kRelease, kBlocksNeeded, kAdmit, kCommit, kMatch };
 
 struct Op {
     OpKind kind = OpKind::kCreate;
     SeqId seq = 0;    // the sequence acted on (share: the destination)
     SeqId src = 0;    // share: the source
-    int amount = 0;   // append / blocks_needed: tokens; share: blocks (may be invalid on purpose)
+    int amount = 0;   // append / blocks_needed: tokens; share: blocks (may be invalid on purpose);
+                      // admit / match: prompt length; commit: 0 = its tokens, 1 = one token too many
+    std::vector<TokenId> tokens;  // append: the tokens appended; admit / match: the prompt (the first
+                                  // `amount` of them, padded with 0, so lowering amount shortens it)
 };
+
+// The first n tokens of an op (padded with 0 past its list).
+inline std::vector<TokenId> tokens_of(const Op& op, int n) {
+    std::vector<TokenId> out(op.tokens.begin(), op.tokens.begin() + std::min<std::ptrdiff_t>(std::max(n, 0), static_cast<std::ptrdiff_t>(op.tokens.size())));
+    out.resize(static_cast<std::size_t>(std::max(n, 0)), 0);
+    return out;
+}
+
+// The tokens each live sequence holds, as the successful ops so far define them: commit's argument.
+using TokenLog = std::map<SeqId, std::vector<TokenId>>;
 
 struct Program {
     std::uint64_t seed = 0;
@@ -71,6 +86,16 @@ inline Program generate(std::uint64_t seed, int max_ops = 120) {
     const int bs = p.config.block_size;
     const int ids = rng.between(2, 8);
     std::vector<int> length(static_cast<std::size_t>(ids), -1);  // the model: -1 = not live
+    std::vector<std::vector<TokenId>> held(static_cast<std::size_t>(ids));  // and their tokens
+    // Tokens from a 3-letter alphabet: equal blocks are common, so lookups hit, miss and collide in
+    // content (duplicates) often.
+    const auto random_tokens = [&](int n) {
+        std::vector<TokenId> t;
+        for (int k = 0; k < n; ++k) {
+            t.push_back(static_cast<TokenId>(rng.below(3)));
+        }
+        return t;
+    };
     const auto pick = [&](bool live) {  // an id that is (or is not) live, if there is one
         std::vector<int> matching;
         for (int id = 0; id < ids; ++id) {
@@ -94,13 +119,43 @@ inline Program generate(std::uint64_t seed, int max_ops = 120) {
         Op op;
         const bool invalid = rng.below(8) == 0;
         const int roll = rng.below(100);
-        if (roll < 20) {
+        if (rng.below(10) < 3) {  // prefix caching: admit, commit, match
+            const int kind = rng.below(20);
+            if (kind < 10) {
+                const int empty = pick_where([&](int len) { return len == 0; });
+                if (!invalid && empty < 0) {
+                    op.kind = OpKind::kCreate;
+                    op.seq = static_cast<SeqId>(pick(false));
+                } else {
+                    op.kind = OpKind::kAdmit;
+                    op.seq = static_cast<SeqId>(empty >= 0 && !invalid ? empty : pick(true));
+                }
+            } else {
+                op.kind = kind < 17 ? OpKind::kCommit : OpKind::kMatch;
+                op.seq = static_cast<SeqId>(pick(!invalid || op.kind == OpKind::kMatch));
+            }
+            if (op.kind == OpKind::kAdmit || op.kind == OpKind::kMatch) {
+                // Mostly a prefix of a live sequence's tokens, so that it can hit, plus a tail.
+                const int source = pick_where([&](int len) { return len > 0; });
+                if (source >= 0 && rng.below(4) != 0) {
+                    const auto& from = held[static_cast<std::size_t>(source)];
+                    const int n = static_cast<int>(from.size());
+                    op.tokens.assign(from.begin(), from.begin() + rng.between((n + 1) / 2, n));
+                }
+                const std::vector<TokenId> tail = random_tokens(rng.between(0, 2 * bs + 1));
+                op.tokens.insert(op.tokens.end(), tail.begin(), tail.end());
+                op.amount = invalid && op.kind == OpKind::kAdmit && rng.below(2) == 0 ? 0 : static_cast<int>(op.tokens.size());
+            } else if (op.kind == OpKind::kCommit) {
+                op.amount = invalid && rng.below(2) == 0 ? 1 : 0;
+            }
+        } else if (roll < 20) {
             op.kind = OpKind::kCreate;
             op.seq = static_cast<SeqId>(pick(invalid));
         } else if (roll < 60) {
             op.kind = OpKind::kAppend;
             op.seq = static_cast<SeqId>(pick(!invalid));
             op.amount = invalid && rng.below(2) == 0 ? -1 : rng.between(0, 3 * bs + 1);
+            op.tokens = random_tokens(std::max(op.amount, 0));
         } else if (roll < 78) {
             // A valid share needs an empty destination and a source with full blocks: use them if
             // the model has them; with no empty sequence, create one (the share can come later).
@@ -127,20 +182,29 @@ inline Program generate(std::uint64_t seed, int max_ops = 120) {
         // Keep the model roughly right (it ignores blocks running out, which only makes an op
         // fail; the managers are the ones compared, not the model).
         int& len = length[op.seq];
+        auto& toks = held[op.seq];
         switch (op.kind) {
-            case OpKind::kCreate: if (len < 0) len = 0; break;
+            case OpKind::kCreate: if (len < 0) { len = 0; toks.clear(); } break;
             case OpKind::kAppend:
                 if (len >= 0 && op.amount > 0 && (len + op.amount + bs - 1) / bs <= p.config.max_blocks_per_sequence) {
                     len += op.amount;
+                    toks.insert(toks.end(), op.tokens.begin(), op.tokens.end());
                 }
                 break;
             case OpKind::kShare:
                 if (len == 0 && op.seq != op.src && op.amount >= 0 && op.amount <= std::max(0, length[op.src] / bs)) {
                     len = op.amount * bs;
+                    toks.assign(held[op.src].begin(), held[op.src].begin() + len);
                 }
                 break;
-            case OpKind::kRelease: len = -1; break;
-            case OpKind::kBlocksNeeded: break;
+            case OpKind::kAdmit:
+                if (len == 0 && op.amount > 0 && (op.amount + bs - 1) / bs <= p.config.max_blocks_per_sequence) {
+                    len = op.amount;
+                    toks = op.tokens;
+                }
+                break;
+            case OpKind::kRelease: len = -1; toks.clear(); break;
+            case OpKind::kBlocksNeeded: case OpKind::kCommit: case OpKind::kMatch: break;
         }
         p.ops.push_back(op);
     }
@@ -155,6 +219,27 @@ inline std::string describe(const Op& op) {
         case OpKind::kShare: os << "share_prefix(" << op.seq << ", " << op.src << ", " << op.amount << ")"; break;
         case OpKind::kRelease: os << "release(" << op.seq << ")"; break;
         case OpKind::kBlocksNeeded: os << "blocks_needed(" << op.seq << ", " << op.amount << ")"; break;
+        case OpKind::kAdmit:
+        case OpKind::kMatch: {
+            os << (op.kind == OpKind::kAdmit ? "admit(" : "match(");
+            if (op.kind == OpKind::kAdmit) {
+                os << op.seq << ", ";
+            }
+            os << "[";
+            for (const TokenId t : tokens_of(op, op.amount)) {
+                os << t;
+            }
+            os << "])";
+            break;
+        }
+        case OpKind::kCommit: os << "commit(" << op.seq << (op.amount == 1 ? ", its tokens + 1)" : ")"); break;
+    }
+    if (op.kind == OpKind::kAppend && op.amount > 0) {
+        os << " [";
+        for (const TokenId t : tokens_of(op, op.amount)) {
+            os << t;
+        }
+        os << "]";
     }
     return os.str();
 }
@@ -169,8 +254,9 @@ inline std::string describe(const Program& p) {
     return os.str();
 }
 
-// What a call did: "ok" plus any result, or the kind of exception it threw.
-inline std::string apply(KvBlockManager& m, const Op& op) {
+// What a call did: "ok" plus any result, or the kind of exception it threw. `log` holds each live
+// sequence's tokens (commit's argument); record() updates it once both implementations agreed.
+inline std::string apply(KvBlockManager& m, const Op& op, const TokenLog& log = {}) {
     try {
         switch (op.kind) {
             case OpKind::kCreate: m.create(op.seq); return "ok";
@@ -178,6 +264,16 @@ inline std::string apply(KvBlockManager& m, const Op& op) {
             case OpKind::kShare: m.share_prefix(op.seq, op.src, op.amount); return "ok";
             case OpKind::kRelease: m.release(op.seq); return "ok";
             case OpKind::kBlocksNeeded: return "ok " + std::to_string(m.blocks_needed(op.seq, op.amount));
+            case OpKind::kAdmit: return "ok " + std::to_string(m.admit(op.seq, tokens_of(op, op.amount)));
+            case OpKind::kMatch: return "ok " + std::to_string(m.match(tokens_of(op, op.amount)));
+            case OpKind::kCommit: {
+                const auto it = log.find(op.seq);
+                std::vector<TokenId> tokens = it == log.end() ? std::vector<TokenId>{} : it->second;
+                if (op.amount == 1) {
+                    tokens.push_back(0);
+                }
+                return "ok " + std::to_string(m.commit(op.seq, tokens));
+            }
         }
     } catch (const neuroserve::KvCacheExhausted&) {
         return "KvCacheExhausted";
@@ -185,10 +281,34 @@ inline std::string apply(KvBlockManager& m, const Op& op) {
         return "length_error";
     } catch (const std::invalid_argument&) {
         return "invalid_argument";
+    } catch (const std::logic_error&) {
+        return "logic_error";
     } catch (const std::exception& e) {
         return std::string("unexpected exception: ") + e.what();
     }
     return "unreachable";
+}
+
+inline void record(TokenLog& log, const Op& op, const std::string& outcome, int block_size) {
+    if (outcome.rfind("ok", 0) != 0) {
+        return;  // a failed op changed nothing
+    }
+    switch (op.kind) {
+        case OpKind::kCreate: log[op.seq].clear(); break;
+        case OpKind::kAppend: {
+            const std::vector<TokenId> t = tokens_of(op, op.amount);
+            log[op.seq].insert(log[op.seq].end(), t.begin(), t.end());
+            break;
+        }
+        case OpKind::kShare: {
+            const std::vector<TokenId> from = log[op.src];  // a copy (op.seq != op.src when it succeeded)
+            log[op.seq].assign(from.begin(), from.begin() + static_cast<std::ptrdiff_t>(op.amount) * block_size);
+            break;
+        }
+        case OpKind::kAdmit: log[op.seq] = tokens_of(op, op.amount); break;
+        case OpKind::kRelease: log.erase(op.seq); break;
+        case OpKind::kBlocksNeeded: case OpKind::kCommit: case OpKind::kMatch: break;
+    }
 }
 
 // Everything observable about a manager, as text, so that two states compare with ==.
@@ -196,7 +316,9 @@ inline std::string snapshot(const KvBlockManager& m, const std::set<SeqId>& ids)
     std::ostringstream os;
     const auto s = m.stats();
     os << "free " << m.free_blocks() << ", stats {" << s.total_blocks << " " << s.free_blocks << " " << s.used_blocks
-       << " " << s.shared_blocks << " " << s.sequences << " " << s.cached_tokens << "}\n";
+       << " " << s.shared_blocks << " " << s.sequences << " " << s.cached_tokens << "}, prefix {indexed "
+       << s.indexed_blocks << ", lookups " << s.prefix_lookups << ", lookup blocks " << s.prefix_lookup_blocks
+       << ", hits " << s.prefix_hit_blocks << "}\n";
     for (const SeqId id : ids) {
         os << "seq " << id << ": ";
         if (!m.contains(id)) {
@@ -213,6 +335,12 @@ inline std::string snapshot(const KvBlockManager& m, const std::set<SeqId>& ids)
     for (BlockId b = 0; b < m.config().num_blocks; ++b) {
         os << " " << m.ref_count(b);
     }
+    if (m.prefix_caching()) {
+        os << "\nindexed";
+        for (BlockId b = 0; b < m.config().num_blocks; ++b) {
+            os << " " << (m.indexed(b) ? 1 : 0);
+        }
+    }
     return os.str();
 }
 
@@ -222,7 +350,9 @@ inline bool same_state(const KvBlockManager& a, const KvBlockManager& b, const s
     const auto sb = b.stats();
     if (a.free_blocks() != b.free_blocks() || sa.total_blocks != sb.total_blocks || sa.free_blocks != sb.free_blocks ||
         sa.used_blocks != sb.used_blocks || sa.shared_blocks != sb.shared_blocks || sa.sequences != sb.sequences ||
-        sa.cached_tokens != sb.cached_tokens) {
+        sa.cached_tokens != sb.cached_tokens || sa.indexed_blocks != sb.indexed_blocks ||
+        sa.prefix_lookups != sb.prefix_lookups || sa.prefix_lookup_blocks != sb.prefix_lookup_blocks ||
+        sa.prefix_hit_blocks != sb.prefix_hit_blocks || a.prefix_caching() != b.prefix_caching()) {
         return false;
     }
     for (const SeqId id : ids) {
@@ -234,7 +364,7 @@ inline bool same_state(const KvBlockManager& a, const KvBlockManager& b, const s
         }
     }
     for (BlockId blk = 0; blk < a.config().num_blocks; ++blk) {
-        if (a.ref_count(blk) != b.ref_count(blk)) {
+        if (a.ref_count(blk) != b.ref_count(blk) || (a.prefix_caching() && a.indexed(blk) != b.indexed(blk))) {
             return false;
         }
     }
@@ -258,17 +388,19 @@ inline std::optional<Divergence> find_divergence(const Factory& make_a, const Fa
     auto a = make_a(p.config);
     auto b = make_b(p.config);
     std::set<SeqId> ids;
+    TokenLog log;
     for (std::size_t i = 0; i < p.ops.size(); ++i) {
         const Op& op = p.ops[i];
         ids.insert(op.seq);
-        const std::string ra = apply(*a, op);
-        const std::string rb = apply(*b, op);
+        const std::string ra = apply(*a, op, log);
+        const std::string rb = apply(*b, op, log);
         if (observe) {
             observe(op, ra);
         }
         if (ra != rb) {
             return Divergence{i, describe(op) + " returned \"" + ra + "\" vs \"" + rb + "\""};
         }
+        record(log, op, ra, p.config.block_size);
         for (const KvBlockManager* m : {a.get(), b.get()}) {
             try {
                 m->check_invariants();
@@ -327,6 +459,10 @@ inline Program shrink(const Factory& make_a, const Factory& make_b, Program p) {
                     continue;
                 }
                 Program c = p;
+                std::vector<TokenId> merged = tokens_of(c.ops[i], c.ops[i].amount);
+                const std::vector<TokenId> second = tokens_of(c.ops[j], c.ops[j].amount);
+                merged.insert(merged.end(), second.begin(), second.end());
+                c.ops[i].tokens = std::move(merged);
                 c.ops[i].amount += c.ops[j].amount;
                 c.ops.erase(c.ops.begin() + static_cast<std::ptrdiff_t>(j));
                 if (fails(c)) {

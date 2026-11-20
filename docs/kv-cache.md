@@ -17,6 +17,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 30 | Per-step checks: the manager's I1–I6, the engine's and the manager's views of every sequence, and the loop's I11–I12, after every engine step (`EngineLoopOptions::check_invariants`); fault injection for each (`tests/unit/test_kv_invariants.cpp`) | done |
 | 31 | Reference counting through the backend and the engine: `share_prefix` and `sequence_pages` on every backend, shared pages in `/health`, preemption planned with a request's own pages, I11 counting a shared page once; tests in every release order and through completion, cancellation and preemption (`tests/unit/test_kv_sharing.cpp`) | done |
 | 32 | Prefix hashing for full blocks (`kv_prefix_hash.hpp`): XXH64, a pinned byte encoding, the chained block hash and its root, the CUDA backend's K/V identity, `kv_cache_key` in `model_info()`; tests against an independent implementation (`tests/unit/test_kv_prefix_hash.cpp`) | done |
+| 33 | Prefix index and lookup at admission: `admit`, `commit`, `match` in the `KvBlockManager` contract (reference and manager), verified hits, hit counters in `/health`, I7 and I8 checked; contract, property and engine tests (`test_kv_prefix_index.cpp`, `test_kv_prefix_cache.cpp`). The CUDA backend turns it on with Day 34's prefill | done |
 
 ## Today (v0.1)
 
@@ -273,6 +274,35 @@ string is a `u32` length followed by its bytes. The length prefixes keep fields 
 hold 16 × 32 = 512 blocks for it. With it they hold 32, which frees 480 blocks (**240 MiB**) and
 skips 7,680 tokens of prefill. That is the shared-prefix test of Day 36.
 
+**Implemented (Day 33)** in the `KvBlockManager` contract, so the reference and the manager are
+compared on it operation by operation (the property tests now admit, commit and match too).
+
+- **`admit(seq, prompt)`** walks, shares the hits and appends the rest, all or nothing. It returns
+  the reused tokens: the prefill starts there.
+- **`commit(seq, tokens)`** indexes a sequence's full blocks once their K/V are written: after the
+  prefill, and after each decode step that fills a block. Generated tokens are indexed too.
+- **`match(prompt)`** counts the blocks `admit` would reuse, and changes nothing.
+- **A hit is verified, not trusted.** The indexed block's stored tokens must equal the prompt's,
+  and its parent must be the block the walk reused just before it. A 64-bit collision then costs a
+  miss, never a wrong reuse. A test corrupts an indexed block's tokens: I8 reports it and the
+  lookup refuses it.
+- **The block holding the last prompt token is never reused,** because its logits must be computed
+  and that writes its K/V. A prompt of exactly 32 tokens reuses 1 block, not 2. Copy-on-write
+  (Day 35) lifts this.
+- **A duplicate is not indexed.** Two blocks with the same prefix happen when the last-token rule
+  made a request compute a block that another already holds. The index keeps the first; the
+  sequence stops indexing there, and a later `commit` retries, so its copy takes over once the
+  original is freed.
+- **Counted:** lookups, the blocks they could have reused (`prefix_lookup_pages`) and the hits
+  (`prefix_hit_pages`), in `KvCacheStats` and `/health`. The hit rate is hits ÷ lookup pages.
+- **Not yet:** an indexed block is freed and unindexed with its last holder. Reusing blocks of
+  requests that have finished needs the `CACHED` state and eviction (Day 37), so today a hit needs
+  a live request with the same prefix.
+- **Where it runs today:** the engine tests run a prefix-caching backend (`FakeBackend` on the
+  real manager) through the engine loop, with every step's invariant checks on. The CUDA backend
+  keeps prefix caching off, and its counters read 0, until its prefill can start at a cached offset
+  (Day 34): today's prefill attends only to the tokens it is given.
+
 ### Prefill from a cached offset (Day 34)
 
 The suffix must attend to the cached positions, which today's prefill cannot do. There are two
@@ -399,6 +429,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 30 | Invariant checker and fault injection | every invariant is checked |
 | 31 | Shared block freed only by its last owner | reference counting |
 | 32 | Same prefix → same chain; any change in model, weights, dtype, block size, RoPE or a token → a different hash, from that block on; XXH64 and the encoding match an independent implementation; no collisions among 200,000 blocks | hash identity |
+| 33 | A second request with the same system prompt reuses its full blocks and the hit is counted; never the last token's block; stops at the first miss; verified hits; duplicates; all-or-nothing admission; the manager equals the reference on 10,000 random programs with admit, commit and match | prefix index |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

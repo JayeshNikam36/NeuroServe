@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <string>
+#include <utility>
 
 namespace neuroserve::core {
 
@@ -12,9 +13,15 @@ std::string seq_name(SeqId seq) { return "sequence " + std::to_string(seq); }
 
 }  // namespace
 
-KVCacheManager::KVCacheManager(KvBlockConfig config) : config_(config) {
+KVCacheManager::KVCacheManager(KvBlockConfig config, std::optional<KvCacheIdentity> prefix_cache) : config_(config) {
     if (config_.num_blocks <= 0 || config_.block_size <= 0 || config_.max_blocks_per_sequence <= 0) {
         throw std::invalid_argument("KV block config: num_blocks, block_size and max_blocks_per_sequence must be positive");
+    }
+    if (prefix_cache) {
+        if (prefix_cache->block_size != config_.block_size) {
+            throw std::invalid_argument("KV block config: the prefix cache identity has another block size");
+        }
+        hasher_.emplace(std::move(*prefix_cache));
     }
     blocks_.resize(static_cast<std::size_t>(config_.num_blocks));
     for (BlockId b = 0; b < config_.num_blocks; ++b) {
@@ -73,14 +80,142 @@ void KVCacheManager::append(SeqId seq, int tokens) {
     }
     s.table.reserve(s.table.size() + static_cast<std::size_t>(needed));  // may throw: before any change
     for (int i = 0; i < needed; ++i) {
-        const BlockId block = *free_.begin();
-        free_.erase(free_.begin());
-        blocks_[static_cast<std::size_t>(block)] = Block{1, seq};
-        s.table.push_back(block);
+        take_free_block(seq, s);
     }
     s.length += tokens;
     cached_tokens_ += tokens;
 }
+
+void KVCacheManager::take_free_block(SeqId seq, Sequence& s) {  // the caller checked capacity and reserved
+    const BlockId block = *free_.begin();
+    free_.erase(free_.begin());
+    Block& b = blocks_[static_cast<std::size_t>(block)];
+    b.refs = 1;
+    b.allocated_by = seq;
+    s.table.push_back(block);
+}
+
+const PrefixHasher& KVCacheManager::hasher(const char* op) const {
+    if (!hasher_) {
+        throw std::logic_error(std::string(op) + ": prefix caching is off");
+    }
+    return *hasher_;
+}
+
+std::vector<BlockId> KVCacheManager::walk(std::span<const TokenId> prompt) const {
+    const std::size_t bs = static_cast<std::size_t>(config_.block_size);
+    const std::size_t reusable = prompt.empty() ? 0 : (prompt.size() - 1) / bs;  // never the last token's block
+    std::vector<BlockId> hits;
+    BlockHash hash = hasher_->root();
+    for (std::size_t i = 0; i < reusable; ++i) {
+        const auto tokens = prompt.subspan(i * bs, bs);
+        hash = hasher_->next(hash, tokens);
+        const auto it = index_.find(hash);
+        if (it == index_.end()) {
+            break;
+        }
+        // Verified, not trusted: the same tokens, after the block reused just before (a 64-bit
+        // collision costs a miss, never a wrong reuse).
+        const Block& b = blocks_[static_cast<std::size_t>(it->second)];
+        if (b.parent != (hits.empty() ? -1 : hits.back()) ||
+            !std::equal(b.tokens.begin(), b.tokens.end(), tokens.begin(), tokens.end())) {
+            break;
+        }
+        hits.push_back(it->second);
+    }
+    return hits;
+}
+
+int KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
+    hasher("admit");
+    Sequence& s = get(seq);
+    if (s.length != 0 || !s.table.empty()) {
+        throw std::invalid_argument("admit: " + seq_name(seq) + " is not empty");
+    }
+    if (prompt.empty()) {
+        throw std::invalid_argument("admit: empty prompt");
+    }
+    const std::vector<BlockId> hits = walk(prompt);
+    const int total = blocks_for(static_cast<long long>(prompt.size()));
+    const int needed = total - static_cast<int>(hits.size());
+    if (total > config_.max_blocks_per_sequence) {
+        throw std::length_error("admit: " + seq_name(seq) + " would need " + std::to_string(total) +
+                                " blocks, the limit is " + std::to_string(config_.max_blocks_per_sequence));
+    }
+    if (needed > free_blocks()) {
+        throw KvCacheExhausted("admit: " + seq_name(seq) + " needs " + std::to_string(needed) + " blocks, " +
+                               std::to_string(free_blocks()) + " free");
+    }
+    s.table.reserve(static_cast<std::size_t>(total));  // may throw: before any change
+    for (const BlockId block : hits) {
+        Block& b = blocks_[static_cast<std::size_t>(block)];
+        if (++b.refs == 2) {
+            ++shared_blocks_;
+        }
+        s.table.push_back(block);
+    }
+    for (int i = 0; i < needed; ++i) {
+        take_free_block(seq, s);
+    }
+    s.length = static_cast<int>(prompt.size());
+    cached_tokens_ += s.length;
+    ++lookups_;
+    lookup_blocks_ += static_cast<std::int64_t>((prompt.size() - 1) / static_cast<std::size_t>(config_.block_size));
+    hit_blocks_ += static_cast<std::int64_t>(hits.size());
+    return static_cast<int>(hits.size()) * config_.block_size;
+}
+
+int KVCacheManager::commit(SeqId seq, std::span<const TokenId> tokens) {
+    const PrefixHasher& h = hasher("commit");
+    const Sequence& s = get(seq);
+    if (static_cast<int>(tokens.size()) != s.length) {
+        throw std::invalid_argument("commit: " + seq_name(seq) + " has " + std::to_string(s.length) + " tokens, got " +
+                                    std::to_string(tokens.size()));
+    }
+    const std::size_t bs = static_cast<std::size_t>(config_.block_size);
+    // Plan first, then change: a bad call changes nothing.
+    std::vector<std::pair<std::size_t, BlockHash>> to_index;  // table position, hash
+    BlockHash parent_hash = h.root();
+    for (std::size_t i = 0; i < tokens.size() / bs; ++i) {
+        const auto block_tokens = tokens.subspan(i * bs, bs);
+        const Block& b = blocks_[static_cast<std::size_t>(s.table[i])];
+        if (b.indexed) {
+            // Every table that lists an indexed block lists its parent just before it, so equal
+            // tokens here mean an equal hash: no need to hash it again.
+            if (!std::equal(b.tokens.begin(), b.tokens.end(), block_tokens.begin(), block_tokens.end())) {
+                throw std::invalid_argument("commit: block " + std::to_string(i) + " of " + seq_name(seq) +
+                                            " is indexed with other tokens");
+            }
+            parent_hash = b.hash;
+            continue;
+        }
+        const BlockHash hash = h.next(parent_hash, block_tokens);
+        if (index_.count(hash) != 0) {
+            break;  // a duplicate: another block holds this prefix; a later commit retries
+        }
+        to_index.emplace_back(i, hash);
+        parent_hash = hash;
+    }
+    index_.reserve(index_.size() + to_index.size());  // may throw: before any change
+    for (const auto& [i, hash] : to_index) {
+        const BlockId block = s.table[i];
+        Block& b = blocks_[static_cast<std::size_t>(block)];
+        index_.emplace(hash, block);
+        b.indexed = true;
+        b.hash = hash;
+        b.parent = i == 0 ? -1 : s.table[i - 1];
+        b.tokens.assign(tokens.begin() + static_cast<std::ptrdiff_t>(i * bs),
+                        tokens.begin() + static_cast<std::ptrdiff_t>((i + 1) * bs));
+    }
+    return static_cast<int>(to_index.size());
+}
+
+int KVCacheManager::match(std::span<const TokenId> prompt) const {
+    hasher("match");
+    return static_cast<int>(walk(prompt).size());
+}
+
+bool KVCacheManager::indexed(BlockId block) const { return block_at(block).indexed; }
 
 void KVCacheManager::share_prefix(SeqId dst, SeqId src, int blocks) {
     if (dst == src) {
@@ -117,6 +252,11 @@ void KVCacheManager::release(SeqId seq) {
         if (--b.refs == 1) {
             --shared_blocks_;
         } else if (b.refs == 0) {
+            if (b.indexed) {  // free again: unindexed (keeping it as CACHED comes with eviction)
+                index_.erase(b.hash);
+                b.indexed = false;
+                b.tokens.clear();
+            }
             free_.insert(block);
         }
     }
@@ -150,6 +290,10 @@ KvBlockStats KVCacheManager::stats() const {
     out.shared_blocks = shared_blocks_;
     out.sequences = static_cast<int>(sequences_.size());
     out.cached_tokens = cached_tokens_;
+    out.indexed_blocks = static_cast<int>(index_.size());
+    out.prefix_lookups = lookups_;
+    out.prefix_lookup_blocks = lookup_blocks_;
+    out.prefix_hit_blocks = hit_blocks_;
     return out;
 }
 
@@ -206,6 +350,38 @@ void KVCacheManager::check_invariants() const {
             throw KvInvariantViolation("I6: block " + std::to_string(b) + " is shared but not full in every table");
         }
         shared += refs >= 2;
+        const Block& blk = blocks_[b];
+        if (!blk.indexed) {
+            continue;
+        }
+        const auto it = index_.find(blk.hash);
+        if (it == index_.end() || it->second != static_cast<BlockId>(b)) {
+            throw KvInvariantViolation("I7: block " + std::to_string(b) + " is marked indexed but the index " +
+                                       (it == index_.end() ? "does not hold its hash" : "maps its hash to block " +
+                                                                                            std::to_string(it->second)));
+        }
+        if (refs == 0 || partial_somewhere[b]) {
+            throw KvInvariantViolation("I7: block " + std::to_string(b) + " is indexed but " +
+                                       (refs == 0 ? "free" : "not full in every table"));
+        }
+        const bool parent_ok = blk.parent == -1 || (blk.parent >= 0 && blk.parent < config_.num_blocks &&
+                                                    static_cast<std::size_t>(blk.parent) != b &&
+                                                    blocks_[static_cast<std::size_t>(blk.parent)].indexed);
+        const BlockHash parent_hash = blk.parent == -1 ? hasher_->root()
+                                      : parent_ok      ? blocks_[static_cast<std::size_t>(blk.parent)].hash
+                                                       : 0;
+        if (!parent_ok || static_cast<int>(blk.tokens.size()) != config_.block_size ||
+            hasher_->next(parent_hash, blk.tokens) != blk.hash) {
+            throw KvInvariantViolation("I8: block " + std::to_string(b) + "'s hash is not H(its parent's hash, its tokens)" +
+                                       (parent_ok ? "" : ": its parent is not an indexed block"));
+        }
+    }
+    for (const auto& [hash, block] : index_) {
+        if (block < 0 || block >= config_.num_blocks || !blocks_[static_cast<std::size_t>(block)].indexed ||
+            blocks_[static_cast<std::size_t>(block)].hash != hash) {
+            throw KvInvariantViolation("I7: the index maps a hash to block " + std::to_string(block) +
+                                       ", which is not indexed under it");
+        }
     }
     if ((!free_.empty() && (*free_.begin() < 0 || *free_.rbegin() >= config_.num_blocks)) ||
         shared != shared_blocks_ || tokens != cached_tokens_) {
