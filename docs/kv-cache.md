@@ -27,6 +27,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 40 | KV-cache metrics: `GET /v1/runtime/state` (occupancy, cached and free pages, hits, misses, hit rate, reused tokens, evictions, preemptions, admission mode); an exact `prefix_reused_tokens` counter in the contract; `engine.prefix_caching` and `engine.kv_admission` in the server config | done |
 | 41 | Compute Sanitizer: `memcheck` and `racecheck` on the unit (KV, scheduler, engine loop), CUDA and GPU integration suites; CMake target `compute_sanitizer`, `scripts/compute_sanitizer.sh`, summary in `tests/logs/compute-sanitizer.md` | done |
 | 42 | Block-size sweep: `ns_block_size_sweep` (benchmarks/block_size) computes capacity and waste at 8, 16 and 32 tokens for a seeded length mix and times the paged decode attention kernel at each, interleaved in one process; results in `benchmarks/results/day42-block-size.md` | done |
+| 43 | Prefix caching on vs off: `neuroserve.bench.prefix_ab` runs the `shared_prefix` and `memory_pressure` profiles (the latter on 25% of the KV pool) paced and as a burst, a fresh server per run, paired rounds, GPU clocks recorded; LRU keeps about 87% of the reuse a cache that never evicted would get; results in `benchmarks/results/day43-prefix-caching.md` | done |
 
 ## Today (v0.1)
 
@@ -411,7 +412,10 @@ holding the last prompt token, whose logits the prefill must compute.
 - **Evicting a block** removes it from the index and the LRU queue, and returns it to `FREE`.
 - **Only count-0 blocks can be evicted.** An `OWNED` block is never touched (KV-008).
 - LRU is the baseline. A cost-aware policy (reuse frequency × recompute cost) is a later
-  experiment, measured against it.
+  experiment, measured against it. Day 43 measured how much it could gain: on `memory_pressure`
+  (16 Zipf-weighted prefixes, a quarter of the pool) LRU reached 66–74% hit rate against an
+  upper bound of 81–82% (every repeat of a prefix a hit), about 87% of the possible reuse. A
+  better policy can recover at most the other 13%, so it waits until a workload shows more.
 
 **Implemented (Day 37)** in the `KvBlockManager` contract, reference and manager, compared by the
 property tests (10,000 programs, invariants checked after every operation).
@@ -617,6 +621,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |
 | 41 | Compute Sanitizer memcheck and racecheck on the KV and scheduler suites | no invalid GPU memory access |
+| 43 | Prefix caching on vs off, paired, on `shared_prefix` and `memory_pressure` (25% of the pool): TTFT, throughput, hit rate against its no-eviction bound, GPU clocks | what the cache buys, and what LRU leaves |
 | 44 | 30 minutes of mixed high-concurrency load: no leaks, no invariant failures | stability |
 
 ## Open questions
@@ -626,8 +631,9 @@ free, a block in two lists, a write into a shared block) and checks that the che
   attention time with both kernels.
 - **Hash width.** 64 bits plus verification is enough for correctness. If verification ever shows
   up in profiles, compare against a 128-bit hash without it.
-- **Eviction policy.** LRU first. A cost-aware policy is tested only with a workload that can tell
-  them apart (Day 43, `shared_prefix` and `memory_pressure`).
+- **Eviction policy.** LRU stays. On Day 43's `memory_pressure` it kept about 87% of the reuse a
+  cache that never evicted would get, so a cost-aware policy could gain at most the remaining
+  13%. Revisit it with a workload whose prefixes differ more in length or popularity.
 
 ## Requirements map
 

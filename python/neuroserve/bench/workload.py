@@ -4,6 +4,9 @@ A schedule is a list of requests, each with the second at which it is sent and i
 body. Arrivals follow a Poisson process (exponential gaps at the profile's rate). Everything is
 derived from (profile, seed) with Python's own seeded generator, so the same seed gives the same
 schedule on every machine, and a shorter run is a prefix of a longer one.
+
+The "prefix" profiles model prompts that start with one of a few shared system prompts, the case
+prefix caching is for: each prompt is a shared prefix followed by a suffix of its own.
 """
 
 from __future__ import annotations
@@ -32,9 +35,15 @@ class Profile:
     description: str
     rate_rps: float           # mean arrival rate (Poisson), requests per second
     num_requests: int
-    kind: str                 # "chat": questions from the dataset; "tokens": synthetic prompts of exact lengths
-    prompt_tokens: tuple[tuple[int, float], ...] = ()       # "tokens": (length, weight) choices
+    kind: str                 # "chat": dataset questions; "tokens": synthetic prompts of exact lengths;
+                              # "prefix": a shared synthetic prefix + a synthetic suffix of its own
+    prompt_tokens: tuple[tuple[int, float], ...] = ()       # "tokens": (length, weight); "prefix": the suffix's
     output_tokens: tuple[tuple[int, float], ...] = ((64, 1.0),)  # (length, weight); forced with ignore_eos
+    # "prefix": prefix_count shared prefixes of prefix_tokens tokens each. A request picks prefix k
+    # with weight 1 / (k + 1) ** prefix_zipf: 0 picks them uniformly, 1 makes a few of them popular.
+    prefix_count: int = 0
+    prefix_tokens: int = 0
+    prefix_zipf: float = 0.0
 
 
 PROFILES: dict[str, Profile] = {
@@ -48,6 +57,18 @@ PROFILES: dict[str, Profile] = {
         rate_rps=2.0, num_requests=120, kind="tokens",
         prompt_tokens=((32, 0.5), (128, 0.3), (480, 0.2)),
         output_tokens=((32, 0.4), (128, 0.4), (384, 0.2))),
+    # Prefix caching (Day 43). Prefix lengths are whole 16-token pages, so a hit reuses all of them.
+    "shared_prefix": Profile(
+        name="shared_prefix",
+        description="4 shared 384-token prefixes (uniform) + a 64-token suffix each, 64 output tokens, 4 requests/s",
+        rate_rps=4.0, num_requests=120, kind="prefix", prompt_tokens=((64, 1.0),), output_tokens=((64, 1.0),),
+        prefix_count=4, prefix_tokens=384),
+    "memory_pressure": Profile(
+        name="memory_pressure",
+        description="16 shared 448-token prefixes (Zipf, s = 1) + a 32-token suffix each, 128 / 256 output "
+                    "tokens, 1.5 requests/s",
+        rate_rps=1.5, num_requests=120, kind="prefix", prompt_tokens=((32, 1.0),),
+        output_tokens=((128, 0.5), (256, 0.5)), prefix_count=16, prefix_tokens=448, prefix_zipf=1.0),
 }
 
 
@@ -80,6 +101,18 @@ def _weighted(rng: random.Random, choices: tuple[tuple[int, float], ...]) -> int
     return rng.choices(values, weights=weights)[0]
 
 
+def shared_prefixes(profile: Profile, seed: int) -> list[list[int]]:
+    """A "prefix" profile's shared prefixes for this seed (from a stream of their own: the arrival and
+    content streams are the same as without them). Other profiles have none."""
+    if profile.kind != "prefix":
+        return []
+    if profile.prefix_count < 1 or profile.prefix_tokens < 1:
+        raise ValueError(f"profile {profile.name!r} needs prefix_count and prefix_tokens >= 1")
+    rng = random.Random(f"neuroserve:{profile.name}:{seed}:prefixes")
+    return [[rng.randrange(*TOKEN_ID_RANGE) for _ in range(profile.prefix_tokens)]
+            for _ in range(profile.prefix_count)]
+
+
 def build_schedule(profile: Profile, seed: int, model: str, *, num_requests: int | None = None,
                    rate_rps: float | None = None) -> list[PlannedRequest]:
     """The requests of one run, in send order. Same arguments, same schedule."""
@@ -92,6 +125,9 @@ def build_schedule(profile: Profile, seed: int, model: str, *, num_requests: int
     arrivals = random.Random(f"neuroserve:{profile.name}:{seed}:arrivals")
     content = random.Random(f"neuroserve:{profile.name}:{seed}:content")
     dataset = load_dataset() if profile.kind == "chat" else []
+    prefixes, prefix_weights = shared_prefixes(profile, seed), []
+    if profile.kind == "prefix":
+        prefix_weights = [1.0 / (k + 1) ** profile.prefix_zipf for k in range(profile.prefix_count)]
 
     schedule = []
     t = 0.0
@@ -109,6 +145,12 @@ def build_schedule(profile: Profile, seed: int, model: str, *, num_requests: int
             length = _weighted(content, profile.prompt_tokens)
             ids = [content.randrange(*TOKEN_ID_RANGE) for _ in range(length)]
             endpoint, prompt_id = "/v1/completions", f"tokens-{length}"
+            body = {**common, "prompt": ids}
+        elif profile.kind == "prefix":
+            k = content.choices(range(profile.prefix_count), weights=prefix_weights)[0]
+            length = _weighted(content, profile.prompt_tokens)
+            ids = prefixes[k] + [content.randrange(*TOKEN_ID_RANGE) for _ in range(length)]
+            endpoint, prompt_id = "/v1/completions", f"prefix-{k}+{length}"
             body = {**common, "prompt": ids}
         else:
             raise ValueError(f"unknown profile kind {profile.kind!r}")
