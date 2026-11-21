@@ -25,6 +25,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 38 | Preemption by recompute: a preempted request keeps its tokens and resumes by prefilling prompt + generated tokens (nothing generated twice), reusing its own `CACHED` pages; chunked prefill in the CUDA backend for inputs longer than the scratch; a resumption counts at most one step's token budget; tests on the CPU and the GPU (Hugging Face, with and without the cache, all four policies) | done |
 | 39 | Memory-aware admission: `kv_memory.hpp` reads layers, KV heads, head dim and dtype from `config.json` (32 KiB/token, 512 KiB/block for Llama-3.2-1B FP16); `on-demand` and `worst-case` admission (`EngineLoopOptions::admission`, `neuroserve.Engine(kv_admission=...)`); the CUDA backend refuses a `config.json` that disagrees with its weights | done |
 | 40 | KV-cache metrics: `GET /v1/runtime/state` (occupancy, cached and free pages, hits, misses, hit rate, reused tokens, evictions, preemptions, admission mode); an exact `prefix_reused_tokens` counter in the contract; `engine.prefix_caching` and `engine.kv_admission` in the server config | done |
+| 41 | Compute Sanitizer: `memcheck` and `racecheck` on the unit (KV, scheduler, engine loop), CUDA and GPU integration suites; CMake target `compute_sanitizer`, `scripts/compute_sanitizer.sh`, summary in `tests/logs/compute-sanitizer.md` | done |
 
 ## Today (v0.1)
 
@@ -510,6 +511,17 @@ The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block
   never preempts, with and without prefix caching. All outputs are correct in both.
 - **The server's config** still uses on-demand; choosing the mode there comes with the KV metrics
   (Day 40), where its effect on preemptions is visible.
+
+## Compute Sanitizer (Day 41)
+
+`cmake --build build/dev-cuda --target compute_sanitizer` runs every test binary under
+`memcheck` (out-of-bounds and misaligned device accesses, invalid frees, CUDA API errors) and
+`racecheck` (shared-memory races). The GPU integration suite runs whole under `memcheck`;
+`racecheck`, which instruments every shared-memory access, runs its smallest test for each kernel
+path: the engine's prefill and decode (single and batched), prefill from a cached offset
+(`attention_prefill_paged`), copy-on-write (`copy_page`) and chunked prefill. A run passes only with
+its tests passing, zero sanitizer errors and at least one test run. The summary,
+`tests/logs/compute-sanitizer.md`, is committed; the full logs are not.
 
 ## Metrics (Day 40)
 
