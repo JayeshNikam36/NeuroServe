@@ -49,6 +49,11 @@ public:
     // (docs/kv-cache.md, "Hashing full blocks"). model_info().kv_cache_key is its hash.
     const core::KvCacheIdentity& kv_identity() const noexcept;
 
+    // Prefix caching on or off (CudaLlmEngineConfig::prefix_caching is the start value). Only with
+    // no live sequences: std::logic_error otherwise. Lets one backend compare both, batch for batch.
+    void set_prefix_caching(bool on);
+    bool prefix_caching() const noexcept;
+
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp
     std::unique_ptr<Impl> impl_;

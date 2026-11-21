@@ -20,6 +20,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 33 | Prefix index and lookup at admission: `admit`, `commit`, `match` in the `KvBlockManager` contract (reference and manager), verified hits, hit counters in `/health`, I7 and I8 checked; contract, property and engine tests (`test_kv_prefix_index.cpp`, `test_kv_prefix_cache.cpp`). The CUDA backend turns it on with Day 34's prefill | done |
 | 34 | Prefill from a cached offset: `attention_prefill_paged` (causal attention over the cached prefix through the block table) and `model_prefill_from` in the CUDA backend; `prefix_caching` in `CudaLlmEngineConfig` and `neuroserve.Engine` (off by default until Day 36); GPU test: the Hugging Face chat references match with and without a prefix hit | done |
 | 35 | Copy-on-write: `admit` reuses the page holding the last prompt token as a private copy (`Admission.copy`), the CUDA backend copies its K/V (`copy_page`) and the prefill computes one token; both implementations, property tests; GPU test: the copy's request and the holder both match Hugging Face | done |
+| 36 | The shared-prefix end-to-end test: 16 requests with a 512-token system prompt, run without and with the cache on one backend in identically shaped batches; outputs identical, hit rate and reused tokens reported; `set_prefix_caching` on the CUDA backend | done |
 
 ## Today (v0.1)
 
@@ -276,6 +277,20 @@ string is a `u32` length followed by its bytes. The length prefixes keep fields 
 hold 16 × 32 = 512 blocks for it. With it they hold 32, which frees 480 blocks (**240 MiB**) and
 skips 7,680 tokens of prefill. That is the shared-prefix test of Day 36.
 
+**Implemented (Day 36)** as `CudaPrefixCacheTest.SixteenRequestsWithA512TokenSystemPromptMatchTheNoCacheRun`.
+
+- **Why on one backend, batch for batch.** Outputs are deterministic but not batch-invariant
+  (ADR-0006): two runs whose batches differ in shape can differ without any bug. So one backend runs
+  the 16 requests twice, switching the cache with `set_prefix_caching` (allowed only with no live
+  sequence), and both runs have the same steps: 16 prefills in order, then 32 decode steps of one
+  batch of 16. The cache is the only difference.
+- **What it checks:** every request's 32 tokens equal the no-cache run's; 15 of 16 requests reuse
+  the 32 system pages (hit rate 480 / 512 full pages, 93.75%); 7,680 of 8,320 prompt tokens are
+  reused, so 640 are prefilled instead of 8,320.
+- **The server keeps prefix caching off** for now. Without the `CACHED` state, only requests that
+  overlap in time share pages; Day 37 keeps finished requests' pages, and that is when serving
+  benefits from turning it on.
+
 **Implemented (Day 33)** in the `KvBlockManager` contract, so the reference and the manager are
 compared on it operation by operation (the property tests now admit, commit and match too).
 
@@ -476,6 +491,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 33 | A second request with the same system prompt reuses its full blocks and the hit is counted; never the last token's block; stops at the first miss; verified hits; duplicates; all-or-nothing admission; the manager equals the reference on 10,000 random programs with admit, commit and match | prefix index |
 | 34 | With a prefix hit, the chat references still equal Hugging Face's greedy tokens, case by case, at batch size 1; an identical prompt reusing all but its last page too | prefill from a cached offset |
 | 35 | An identical whole-page prompt copies its last page and prefills one token; the copy needs a free block or nothing changes; both requests match Hugging Face | copy-on-write |
+| 36 | 16 requests, one 512-token system prompt: outputs identical to the no-cache run in identically shaped batches; hit rate and reused tokens reported | shared prefix end to end |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |
