@@ -106,4 +106,32 @@ TEST(KvPrefixCache, DecodedPagesAreIndexedAsTheyFill) {
     EXPECT_FALSE(loop.stop_requested());
 }
 
+TEST(KvPrefixCache, AnIdenticalPromptCopiesItsLastPageAndPrefillsOneToken) {
+    // Copy-on-write (Day 35): a 64-token prompt is 4 full pages. The second request reuses all 4,
+    // but the 4th holds the last prompt token, whose logits must be computed: it gets a private copy
+    // of that page and its prefill computes that one token.
+    FakeBackend backend;
+    backend.prefix_caching = true;
+    FirstPrefillGate gate(backend);
+    EngineLoop loop(backend, checked());
+    GenerationParams p;
+    for (int i = 0; i < 64; ++i) {
+        p.prompt.push_back(200 + i);
+    }
+    p.max_new_tokens = 20;
+    auto a = loop.submit(p);
+    auto b = loop.submit(p);
+    gate.open();
+    ASSERT_TRUE(a.wait_for(10s));
+    ASSERT_TRUE(b.wait_for(10s));
+    EXPECT_EQ(a.wait().tokens, expected(p));
+    EXPECT_EQ(b.wait().tokens, expected(p));
+    EXPECT_EQ(backend.block_copies(), 1);
+    EXPECT_EQ(backend.prefilled_tokens(), 64 + 1);
+    const auto kv = loop.kv_stats();
+    EXPECT_EQ(kv.prefix_hit_pages, 4);
+    EXPECT_EQ(kv.free_pages, kv.total_pages);
+    EXPECT_FALSE(loop.stop_requested()) << "every step's invariant checks passed";
+}
+
 }  // namespace

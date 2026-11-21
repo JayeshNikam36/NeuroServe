@@ -37,7 +37,7 @@ const PrefixHasher& ReferenceBlockManager::hasher(const char* op) const {
 std::vector<BlockId> ReferenceBlockManager::walk(std::span<const TokenId> prompt) const {
     const PrefixHasher& h = *hasher_;
     const std::size_t bs = static_cast<std::size_t>(config_.block_size);
-    const std::size_t reusable = prompt.empty() ? 0 : (prompt.size() - 1) / bs;  // never the last token's block
+    const std::size_t reusable = prompt.size() / bs;  // every full block (the last one by copy-on-write)
     std::vector<BlockId> hits;
     BlockHash hash = h.root();
     for (std::size_t i = 0; i < reusable; ++i) {
@@ -146,7 +146,7 @@ void ReferenceBlockManager::release(SeqId seq) {
     sequences_.erase(seq);
 }
 
-int ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> prompt) {
+Admission ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     hasher("admit");
     Sequence& s = get(seq);
     if (s.length != 0 || !s.table.empty()) {
@@ -155,8 +155,14 @@ int ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     if (prompt.empty()) {
         throw std::invalid_argument("admit: empty prompt");
     }
-    const std::vector<BlockId> hits = walk(prompt);
+    std::vector<BlockId> hits = walk(prompt);
     const int total = blocks_for(static_cast<long long>(prompt.size()));
+    const std::size_t bs = static_cast<std::size_t>(config_.block_size);
+    std::optional<BlockId> copied;  // the last hit, if it holds the last prompt token: copied, not shared
+    if (!hits.empty() && hits.size() * bs == prompt.size()) {
+        copied = hits.back();
+        hits.pop_back();
+    }
     const int needed = total - static_cast<int>(hits.size());
     if (total > config_.max_blocks_per_sequence) {
         throw std::length_error("admit: " + seq_name(seq) + " would need " + std::to_string(total) +
@@ -177,9 +183,17 @@ int ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     }
     s.length = static_cast<int>(prompt.size());
     ++lookups_;
-    lookup_blocks_ += static_cast<std::int64_t>((prompt.size() - 1) / static_cast<std::size_t>(config_.block_size));
-    hit_blocks_ += static_cast<std::int64_t>(hits.size());
-    return static_cast<int>(hits.size()) * config_.block_size;
+    lookup_blocks_ += static_cast<std::int64_t>(prompt.size() / bs);
+    hit_blocks_ += static_cast<std::int64_t>(hits.size() + (copied ? 1 : 0));
+    Admission out;
+    if (copied) {
+        ++copied_blocks_;
+        out.copy = BlockCopy{*copied, s.table[hits.size()]};  // the first new block, in its place
+        out.cached_tokens = static_cast<int>(prompt.size()) - 1;
+    } else {
+        out.cached_tokens = static_cast<int>(hits.size() * bs);
+    }
+    return out;
 }
 
 int ReferenceBlockManager::commit(SeqId seq, std::span<const TokenId> tokens) {
@@ -265,6 +279,7 @@ KvBlockStats ReferenceBlockManager::stats() const {
     out.prefix_lookups = lookups_;
     out.prefix_lookup_blocks = lookup_blocks_;
     out.prefix_hit_blocks = hit_blocks_;
+    out.copied_blocks = copied_blocks_;
     return out;
 }
 

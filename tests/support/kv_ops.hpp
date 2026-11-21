@@ -264,7 +264,11 @@ inline std::string apply(KvBlockManager& m, const Op& op, const TokenLog& log = 
             case OpKind::kShare: m.share_prefix(op.seq, op.src, op.amount); return "ok";
             case OpKind::kRelease: m.release(op.seq); return "ok";
             case OpKind::kBlocksNeeded: return "ok " + std::to_string(m.blocks_needed(op.seq, op.amount));
-            case OpKind::kAdmit: return "ok " + std::to_string(m.admit(op.seq, tokens_of(op, op.amount)));
+            case OpKind::kAdmit: {
+                const neuroserve::core::Admission a = m.admit(op.seq, tokens_of(op, op.amount));
+                return "ok " + std::to_string(a.cached_tokens) +
+                       (a.copy ? " copy " + std::to_string(a.copy->from) + "->" + std::to_string(a.copy->to) : "");
+            }
             case OpKind::kMatch: return "ok " + std::to_string(m.match(tokens_of(op, op.amount)));
             case OpKind::kCommit: {
                 const auto it = log.find(op.seq);

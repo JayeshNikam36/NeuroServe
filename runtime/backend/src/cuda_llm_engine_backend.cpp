@@ -250,8 +250,12 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
     const std::vector<int> ids(prompt.begin(), prompt.end());
     int cached = 0;
     if (im.kv->prefix_caching()) {
-        cached = im.kv->admit(id, prompt);  // reuses indexed full pages, takes the rest; throws, changing
-                                            // nothing, when the pages run out
+        const core::Admission a = im.kv->admit(id, prompt);  // reuses indexed full pages, takes the rest;
+                                                             // throws, changing nothing, if pages run out
+        cached = a.cached_tokens;
+        if (a.copy) {  // copy-on-write: the prefill will write the last token into this page
+            backend_detail::copy_page(im.model, *im.cache, a.copy->from, a.copy->to);
+        }
     } else {
         const int pages = im.kv->blocks_needed(id, n);
         if (pages > im.kv->free_blocks()) {

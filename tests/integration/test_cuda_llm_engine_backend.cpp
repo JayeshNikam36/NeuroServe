@@ -425,3 +425,39 @@ TEST_F(CudaPrefixCacheTest, AnIdenticalPromptReusesEveryPageButTheLastAndMatches
     EXPECT_EQ(hits, static_cast<std::int64_t>((prompt.size() - 1) / 16));
     EXPECT_EQ(out, greedy_.at(0));
 }
+
+TEST_F(CudaPrefixCacheTest, CopyOnWriteKeepsBothRequestsCorrect) {
+    // Copy-on-write (Day 35): a prompt that fills whole pages, reused by an identical request. The
+    // page holding the last prompt token is copied, not shared, and the prefill computes only that
+    // token, writing into the copy. Both requests must then match Hugging Face: the new one, and
+    // the holder whose page the copy came from.
+    std::size_t c = 0;
+    while (c < prompts_.size() && prompts_[c].size() % 16 != 0) {
+        ++c;
+    }
+    if (c == prompts_.size()) {
+        GTEST_SKIP() << "no reference prompt fills whole pages";
+    }
+    const std::vector<TokenId>& prompt = prompts_[c];
+    const std::vector<TokenId>& expected = greedy_[c];
+    const SeqId holder = backend_->create_sequence();
+    std::vector<TokenId> held{backend_->prefill(holder, prompt)};
+
+    std::int64_t hits = 0;
+    const std::vector<TokenId> out = generate(prompt, expected.size(), hits);
+    std::cout << "case " << c << ": " << prompt.size() << " prompt tokens, " << hits
+              << " pages reused (the last one copied), prefill of 1 token\n";
+    EXPECT_EQ(hits, static_cast<std::int64_t>(prompt.size() / 16));
+    EXPECT_EQ(out, expected) << "the request that prefilled one token into the copy";
+
+    while (held.size() < expected.size()) {  // the holder decodes only now: its pages must be intact
+        const SeqId ids[] = {holder};
+        const TokenId last[] = {held.back()};
+        held.push_back(backend_->decode_step(ids, last).at(0));
+    }
+    EXPECT_EQ(held, expected) << "the holder whose page was copied";
+    backend_->free_sequence(holder);
+    backend_->check_kv_invariants();
+    const auto kv = backend_->kv_stats();
+    EXPECT_EQ(kv.free_pages, kv.total_pages) << "KV pages leaked";
+}

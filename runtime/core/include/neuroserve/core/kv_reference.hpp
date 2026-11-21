@@ -31,7 +31,7 @@ public:
     int free_blocks() const override;
     KvBlockStats stats() const override;
     bool prefix_caching() const noexcept override { return hasher_.has_value(); }
-    int admit(SeqId seq, std::span<const TokenId> prompt) override;
+    Admission admit(SeqId seq, std::span<const TokenId> prompt) override;
     int commit(SeqId seq, std::span<const TokenId> tokens) override;
     int match(std::span<const TokenId> prompt) const override;
     bool indexed(BlockId block) const override;
@@ -63,6 +63,7 @@ private:
     std::int64_t lookups_ = 0;
     std::int64_t lookup_blocks_ = 0;
     std::int64_t hit_blocks_ = 0;
+    std::int64_t copied_blocks_ = 0;
 };
 
 }  // namespace neuroserve::core

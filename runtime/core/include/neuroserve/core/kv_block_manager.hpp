@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -30,6 +31,21 @@ struct KvBlockStats {
     std::int64_t prefix_lookups = 0;      // successful admit() calls
     std::int64_t prefix_lookup_blocks = 0;  // full prompt blocks they could have reused
     std::int64_t prefix_hit_blocks = 0;   // of those, the blocks they did reuse
+    std::int64_t copied_blocks = 0;       // hits copied, not shared (copy-on-write)
+};
+
+// A block whose K/V the caller must copy before the first write: `to` is the private copy now in
+// the sequence's table where `from` was matched (copy-on-write, docs/kv-cache.md).
+struct BlockCopy {
+    BlockId from = -1;
+    BlockId to = -1;
+    bool operator==(const BlockCopy&) const = default;
+};
+
+// What admit() did: the prefill starts at cached_tokens, after doing `copy` if there is one.
+struct Admission {
+    int cached_tokens = 0;
+    std::optional<BlockCopy> copy;
 };
 
 // A broken internal invariant of a block manager (see docs/kv-cache.md, "Invariants").
@@ -95,13 +111,17 @@ public:
 
     // Admits the empty sequence `seq` with `prompt`: walks the prompt's full blocks in order, reusing
     // each one the index holds (reference count + 1) and stopping at the first miss, then appends the
-    // rest of the prompt. Returns the tokens it reused (a multiple of block_size): the prefill starts
-    // there. The block that holds the last prompt token is never reused, because computing that
-    // token's logits writes its K/V (copy-on-write, Day 35, lifts this), so at most
-    // prompt.size() - 1 tokens are reused. Counts the lookup, the blocks it could have reused and the
-    // hits. Throws like append (nothing reused, nothing counted); std::invalid_argument for an
-    // unknown or non-empty sequence or an empty prompt.
-    virtual int admit(SeqId seq, std::span<const TokenId> prompt) = 0;
+    // rest of the prompt. The prefill starts at the returned cached_tokens.
+    // Copy-on-write: when every full block hits and the last one holds the last prompt token, that
+    // token must still be computed (its logits are the output), which writes its K/V into that
+    // block. So that block is not shared: the sequence gets a private block in its place, returned
+    // as `copy` for the caller to fill with the original's K/V before the prefill, and
+    // cached_tokens is prompt.size() - 1 (the prefill computes one token). Otherwise cached_tokens
+    // is a multiple of block_size and no copy is needed.
+    // Counts the lookup, the full blocks it could have reused, the hits and the copies. Throws like
+    // append (nothing reused, nothing counted); std::invalid_argument for an unknown or non-empty
+    // sequence or an empty prompt.
+    virtual Admission admit(SeqId seq, std::span<const TokenId> prompt) = 0;
 
     // Indexes the sequence's full blocks, now that their K/V are written. `tokens` are all its tokens
     // (tokens.size() == length(seq)). Block by block, in order: a block already indexed must hold
