@@ -86,6 +86,7 @@ private:
     std::int64_t lookup_blocks_ = 0;
     std::int64_t hit_blocks_ = 0;
     std::int64_t copied_blocks_ = 0;
+    std::int64_t reused_tokens_ = 0;
     std::set<std::pair<std::uint64_t, BlockId>> lru_;  // CACHED blocks, least recently released first
     std::uint64_t release_clock_ = 0;
     std::int64_t evicted_blocks_ = 0;

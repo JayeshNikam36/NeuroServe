@@ -51,6 +51,7 @@ public:
         s.prefix_hit_pages = kv.prefix_hit_blocks;
         s.cached_pages = kv.cached_blocks;
         s.evicted_pages = kv.evicted_blocks;
+        s.prefix_reused_tokens = kv.prefix_reused_tokens;
         return s;
     }
 

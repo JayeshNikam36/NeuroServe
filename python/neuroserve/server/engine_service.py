@@ -155,6 +155,8 @@ class EngineService:
             max_queue=e.max_queue,
             queue_timeout_ms=e.queue_timeout_ms,
             decision_log_capacity=e.decision_log_capacity,
+            prefix_caching=e.prefix_caching,
+            kv_admission=e.kv_admission,
         )
         tokenizer = ChatTokenizer(config.model.tokenizer_dir)
         return cls(config, engine, tokenizer, device_info(e.device_index)["name"])
@@ -175,6 +177,47 @@ class EngineService:
 
     def latency(self) -> dict[str, Any]:
         return self._engine.latency()
+
+    def runtime_state(self) -> dict[str, Any]:
+        """The KV cache's state and counters, for GET /v1/runtime/state (docs/kv-cache.md, Day 40).
+
+        Occupancy counts pages held by live requests. CACHED pages (released, still reusable) are
+        reclaimed on demand, so they are neither used nor plainly free; both are shown. Prefix
+        counters cover full pages: a lookup could reuse lookup_pages, it reused hit_pages and
+        missed the rest; reused_tokens are the prompt tokens that were not prefilled.
+        """
+        kv = self._engine.kv_stats()
+        stats = self._engine.stats()
+        total = kv["total_pages"]
+        reclaimable = kv["free_pages"]  # FREE + CACHED
+        used = total - reclaimable
+        lookup = kv["prefix_lookup_pages"]
+        hits = kv["prefix_hit_pages"]
+        return {
+            "kv_cache": {
+                "page_size_tokens": kv["page_size_tokens"],
+                "total_pages": total,
+                "used_pages": used,
+                "cached_pages": kv["cached_pages"],
+                "free_pages": reclaimable - kv["cached_pages"],
+                "occupancy": round(used / total, 4) if total else 0.0,
+                "shared_pages": kv["shared_pages"],
+                "indexed_pages": kv["indexed_pages"],
+                "evicted_pages": kv["evicted_pages"],
+            },
+            "prefix_cache": {
+                "enabled": self._config.engine.prefix_caching,
+                "lookups": kv["prefix_lookups"],
+                "lookup_pages": lookup,
+                "hit_pages": hits,
+                "miss_pages": lookup - hits,
+                "hit_rate": round(hits / lookup, 4) if lookup else 0.0,
+                "reused_tokens": kv["prefix_reused_tokens"],
+            },
+            "admission": self._config.engine.kv_admission,
+            "preemptions": stats["preemptions"],
+            "policy": stats["policy"],
+        }
 
     def decisions(self, since: int, limit: int) -> dict[str, Any]:
         return self._engine.decisions(since=since, limit=limit)

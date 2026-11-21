@@ -24,6 +24,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 37 | `CACHED` blocks and LRU eviction: released indexed blocks stay reusable, a new block is a FREE one or the least recently released CACHED one, released leaves first; `evict_cached`; I1, I2 and I10 checked; both implementations, property tests; GPU: a finished request's pages reused, evicted oldest first under pressure, outputs equal Hugging Face | done |
 | 38 | Preemption by recompute: a preempted request keeps its tokens and resumes by prefilling prompt + generated tokens (nothing generated twice), reusing its own `CACHED` pages; chunked prefill in the CUDA backend for inputs longer than the scratch; a resumption counts at most one step's token budget; tests on the CPU and the GPU (Hugging Face, with and without the cache, all four policies) | done |
 | 39 | Memory-aware admission: `kv_memory.hpp` reads layers, KV heads, head dim and dtype from `config.json` (32 KiB/token, 512 KiB/block for Llama-3.2-1B FP16); `on-demand` and `worst-case` admission (`EngineLoopOptions::admission`, `neuroserve.Engine(kv_admission=...)`); the CUDA backend refuses a `config.json` that disagrees with its weights | done |
+| 40 | KV-cache metrics: `GET /v1/runtime/state` (occupancy, cached and free pages, hits, misses, hit rate, reused tokens, evictions, preemptions, admission mode); an exact `prefix_reused_tokens` counter in the contract; `engine.prefix_caching` and `engine.kv_admission` in the server config | done |
 
 ## Today (v0.1)
 
@@ -509,6 +510,25 @@ The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block
   never preempts, with and without prefix caching. All outputs are correct in both.
 - **The server's config** still uses on-demand; choosing the mode there comes with the KV metrics
   (Day 40), where its effect on preemptions is visible.
+
+## Metrics (Day 40)
+
+`GET /v1/runtime/state` reports the KV cache:
+
+| Field | Meaning |
+| --- | --- |
+| `kv_cache.used_pages`, `occupancy` | pages held by live requests, and their share of the pool |
+| `kv_cache.cached_pages` | released pages still indexed: reusable, reclaimed on demand |
+| `kv_cache.free_pages` | pages holding nothing |
+| `kv_cache.shared_pages`, `indexed_pages`, `evicted_pages` | pages held by two or more requests; in the prefix index; cached pages reclaimed so far |
+| `prefix_cache.lookups`, `lookup_pages`, `hit_pages`, `miss_pages`, `hit_rate` | admissions looked up; full prompt pages they could have reused; reused; not; hits ÷ lookup pages |
+| `prefix_cache.reused_tokens` | prompt tokens not prefilled. Exact: a copied last page counts its tokens but the last |
+| `admission`, `preemptions`, `policy` | the KV admission mode, preemptions so far, the scheduling policy |
+
+The server config's `engine.prefix_caching` (default off) and `engine.kv_admission`
+(`on-demand` or `worst-case`) choose the behaviour these numbers describe. The counters are
+cumulative since the engine started. Exporting them to a telemetry backend comes with the metrics
+endpoint in Phase 4; until then this is where they are read.
 
 ## Invariants
 

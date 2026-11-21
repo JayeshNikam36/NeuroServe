@@ -32,6 +32,7 @@ struct KvBlockStats {
     std::int64_t prefix_lookup_blocks = 0;  // full prompt blocks they could have reused
     std::int64_t prefix_hit_blocks = 0;   // of those, the blocks they did reuse
     std::int64_t copied_blocks = 0;       // hits copied, not shared (copy-on-write)
+    std::int64_t prefix_reused_tokens = 0;  // prompt tokens admit() did not have to prefill
     int cached_blocks = 0;                // CACHED: indexed, reference count 0, reusable or evictable
     std::int64_t evicted_blocks = 0;      // CACHED blocks reclaimed (LRU) or dropped (evict_cached)
 };

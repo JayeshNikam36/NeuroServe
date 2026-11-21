@@ -90,6 +90,7 @@ TEST_P(KvPrefixIndex, ASecondRequestWithTheSameSystemPromptReusesItsFullBlocks) 
     EXPECT_EQ(s.prefix_lookups, 2);
     EXPECT_EQ(s.prefix_lookup_blocks, 8);
     EXPECT_EQ(s.prefix_hit_blocks, 4) << "the hit is counted";
+    EXPECT_EQ(s.prefix_reused_tokens, 64);
 }
 
 TEST_P(KvPrefixIndex, TheBlockHoldingTheLastPromptTokenIsCopiedNotShared) {
@@ -118,6 +119,7 @@ TEST_P(KvPrefixIndex, TheBlockHoldingTheLastPromptTokenIsCopiedNotShared) {
     EXPECT_EQ(s.prefix_lookup_blocks, 4) << "each lookup could reuse both blocks";
     EXPECT_EQ(s.prefix_hit_blocks, 2) << "the copied block counts as a hit";
     EXPECT_EQ(s.copied_blocks, 1);
+    EXPECT_EQ(s.prefix_reused_tokens, 31) << "the copied block's last token is prefilled: not reused";
 
     // A hit that stops before the last block needs no copy.
     kv->create(3);

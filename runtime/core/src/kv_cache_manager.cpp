@@ -214,6 +214,7 @@ Admission KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     } else {
         out.cached_tokens = static_cast<int>(hits.size() * bs);
     }
+    reused_tokens_ += out.cached_tokens;
     return out;
 }
 
@@ -349,6 +350,7 @@ KvBlockStats KVCacheManager::stats() const {
     out.prefix_lookup_blocks = lookup_blocks_;
     out.prefix_hit_blocks = hit_blocks_;
     out.copied_blocks = copied_blocks_;
+    out.prefix_reused_tokens = reused_tokens_;
     out.cached_blocks = static_cast<int>(lru_.size());
     out.evicted_blocks = evicted_blocks_;
     return out;

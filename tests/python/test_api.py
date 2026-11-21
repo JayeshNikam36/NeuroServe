@@ -152,11 +152,11 @@ class FakeEngine:
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64,
                 "shared_pages": 0, "indexed_pages": 0, "prefix_lookups": 0, "prefix_lookup_pages": 0,
-                "prefix_hit_pages": 0, "cached_pages": 0, "evicted_pages": 0}
+                "prefix_hit_pages": 0, "cached_pages": 0, "evicted_pages": 0, "prefix_reused_tokens": 0}
 
     def stats(self):
         return {"submitted": len(self.calls), "completed": len(self.calls), "pending": 0, "active": 0,
-                "policy": self.policy}
+                "policy": self.policy, "preemptions": 0}
 
     def set_scheduling_policy(self, name):
         if name not in neuroserve.scheduling_policies:
@@ -706,3 +706,40 @@ def test_a_bad_policy_change_is_400_and_changes_nothing(tok, payload, code):
         policy = {"policy": state["policy"], "pending": state["pending"]}
     assert resp.status_code == 400 and resp.json()["error"]["code"] == code
     assert policy == {"policy": "fcfs", "pending": None} and engine.policy_history == []
+
+
+def test_kv_settings_have_safe_defaults_and_are_checked():
+    engine = make_config().engine
+    assert engine.prefix_caching is False and engine.kv_admission == "on-demand"
+    assert make_config(prefix_caching=True, kv_admission="worst-case").engine.kv_admission == "worst-case"
+    with pytest.raises(ValueError):
+        make_config(kv_admission="greedy")
+
+
+def test_runtime_state_reports_the_kv_cache_metrics(tok):
+    app, engine, _ = make_app(tok)
+    # 64 pages: 10 held by live requests, 6 CACHED, 48 FREE; 2 lookups could reuse 8 pages, 5 hit.
+    engine.kv_stats = lambda: {
+        "page_size_tokens": 16, "total_pages": 64, "free_pages": 54, "max_pages_per_sequence": 64,
+        "shared_pages": 3, "indexed_pages": 9, "prefix_lookups": 2, "prefix_lookup_pages": 8,
+        "prefix_hit_pages": 5, "cached_pages": 6, "evicted_pages": 4, "prefix_reused_tokens": 79}
+    base_stats = engine.stats
+    engine.stats = lambda: {**base_stats(), "preemptions": 7}
+    with TestClient(app) as client:
+        state = client.get("/v1/runtime/state").json()
+    assert state["object"] == "runtime.state"
+    assert state["kv_cache"] == {"page_size_tokens": 16, "total_pages": 64, "used_pages": 10, "cached_pages": 6,
+                                 "free_pages": 48, "occupancy": 0.1562, "shared_pages": 3, "indexed_pages": 9,
+                                 "evicted_pages": 4}
+    assert state["prefix_cache"] == {"enabled": False, "lookups": 2, "lookup_pages": 8, "hit_pages": 5,
+                                     "miss_pages": 3, "hit_rate": 0.625, "reused_tokens": 79}
+    assert state["admission"] == "on-demand" and state["preemptions"] == 7 and state["policy"] == "fcfs"
+
+
+def test_runtime_state_of_an_idle_engine(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        state = client.get("/v1/runtime/state").json()
+    assert state["kv_cache"]["occupancy"] == 0.0 and state["kv_cache"]["free_pages"] == 64
+    assert state["prefix_cache"]["hit_rate"] == 0.0 and state["prefix_cache"]["miss_pages"] == 0
+
