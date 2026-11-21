@@ -34,6 +34,13 @@ struct EngineLoop::Entry {
     GenerationParams params;
     std::shared_ptr<RequestHandle::State> state;
     std::uint64_t order = 0;  // arrival order; preempted requests re-enter the queue in this order
+    // What a prefill must compute: the prompt, then every token generated so far. A preempted
+    // request keeps its tokens and resumes from them (recompute, Day 38): nothing is generated twice.
+    std::vector<TokenId> prefill_input() const {
+        std::vector<TokenId> input = params.prompt;
+        input.insert(input.end(), tokens.begin(), tokens.end());
+        return input;
+    }
     int cached = 0;           // tokens in the KV cache (prompt + fed-back generated tokens)
     int waited_steps = 0;     // engine steps spent in the queue since it was (re)queued
     SeqId seq = 0;
@@ -356,7 +363,7 @@ void EngineLoop::loop() {
         std::vector<EntryPtr> joining;
         for (auto& entry : admitted) {
             ++step.prefill_requests;
-            step.prefill_tokens += static_cast<int>(entry->params.prompt.size());
+            step.prefill_tokens += static_cast<int>(entry->params.prompt.size() + entry->tokens.size());
             start(std::move(entry), joining);
         }
         step.decode_tokens = static_cast<int>(active_.size());
@@ -617,9 +624,14 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     };
     input.queued.reserve(pending_.size());
     for (const auto& entry : pending_) {
-        const auto prompt = static_cast<long long>(entry->params.prompt.size());
-        input.queued.push_back({entry->request.id(), static_cast<int>(prompt), entry->params.max_new_tokens,
-                                pages_for_tokens(prompt), entry->waited_steps,  // prefill; decodes next step
+        // A resumed request's prefill covers its prompt and the tokens it kept: all of its pages.
+        // Its prefill counts as at most one step's budget, so it can always be admitted (alone, at
+        // worst); that step then exceeds max_batch_tokens by the recompute (chunked prefill,
+        // Days 52-53, will spread it). A new request's prompt is within the budget (submit checks).
+        const auto input_tokens = static_cast<long long>(entry->params.prompt.size() + entry->tokens.size());
+        const auto counted = std::min<long long>(input_tokens, options_.max_batch_tokens);
+        input.queued.push_back({entry->request.id(), static_cast<int>(counted), entry->params.max_new_tokens,
+                                pages_for_tokens(input_tokens), entry->waited_steps,  // prefill; decodes next step
                                 entry->params.priority, age_ms(*entry)});
     }
     input.running.reserve(active_.size());
@@ -656,17 +668,16 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
         return;
     }
     for (auto& entry : victims) {
-        const auto discarded = entry->tokens.size();
-        release(*entry);  // frees the sequence and its KV pages
-        entry->tokens.clear();  // restart from the prompt (usually the same tokens again; see ADR-0006)
-        entry->cached = 0;
+        const auto kept = entry->tokens.size();
+        release(*entry);  // frees the sequence; its indexed pages stay CACHED for the resumption
+        entry->cached = 0;  // its tokens are kept: it resumes from prompt + tokens, never regenerating
         entry->waited_steps = 0;
         entry->last_defer_reason.clear();  // back in the queue: its next deferral is news again
         entry->request.transition_to(RequestState::kPreempted);
         entry->request.transition_to(RequestState::kQueued);
         log::write(log::Level::kInfo, kLogger, "request preempted",
                    {{"engine_request_id", entry->request.id()}, {"request_id", entry->params.client_request_id},
-                    {"discarded_tokens", discarded}});
+                    {"kept_tokens", kept}});
     }
     // Back to the front of the queue, in arrival order: they were waiting before anything queued now.
     std::sort(victims.begin(), victims.end(),
@@ -683,8 +694,11 @@ void EngineLoop::start(EntryPtr entry, std::vector<EntryPtr>& joining) {
         entry->seq = backend_.create_sequence();
         entry->has_seq = true;
         entry->request.transition_to(RequestState::kPrefill);
-        const TokenId first = backend_.prefill(entry->seq, entry->params.prompt);
-        entry->cached = static_cast<int>(entry->params.prompt.size());
+        // A resumed request recomputes its prompt and the tokens it already generated (the client
+        // has them); the prefill's output is its next new token.
+        const std::vector<TokenId> input = entry->prefill_input();
+        const TokenId first = backend_.prefill(entry->seq, input);
+        entry->cached = static_cast<int>(input.size());
         if (entry->first_token_at == Request::Clock::time_point{}) {
             entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
         }
@@ -788,9 +802,8 @@ void EngineLoop::publish_token(Entry& entry, TokenId token) {
         if (index == streamed.size()) {
             streamed.push_back(token);
         } else {
-            // A preempted request is generating again from its prompt. Its reader already has
-            // this token. Decoding is deterministic but not batch-invariant (ADR-0006): in another
-            // batch a near-tie can flip, which is logged below.
+            // Unreachable since Day 38: a resumed request recomputes the tokens its reader has and
+            // only generates new ones. Kept as a check: a token published twice is logged.
             regenerated_differently = streamed[index] != token;
         }
     }

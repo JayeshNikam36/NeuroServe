@@ -149,8 +149,9 @@ void model_prefill_from(Model& m, PagedKVCache& c, Sequence& seq, const std::vec
                         std::vector<float>& logits) {
     const int total = static_cast<int>(ids.size());
     const int T = total - start;  // the uncached tokens
-    if (seq.len != 0 || start <= 0 || T <= 0) {
-        fprintf(stderr, "model_prefill_from: needs an empty sequence and 0 < start < %d, got start %d\n", total, start);
+    if ((seq.len != 0 && seq.len != start) || start <= 0 || T <= 0) {  // cached prefix, or the next chunk
+        fprintf(stderr, "model_prefill_from: needs 0 < start < %d and the sequence at 0 or start, got start %d, len %d\n",
+                total, start, seq.len);
         exit(1);
     }
     if (T > m.max_T || static_cast<int>(seq.pages.size()) * c.page_size < total ||

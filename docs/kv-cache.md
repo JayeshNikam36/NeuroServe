@@ -22,6 +22,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 35 | Copy-on-write: `admit` reuses the page holding the last prompt token as a private copy (`Admission.copy`), the CUDA backend copies its K/V (`copy_page`) and the prefill computes one token; both implementations, property tests; GPU test: the copy's request and the holder both match Hugging Face | done |
 | 36 | The shared-prefix end-to-end test: 16 requests with a 512-token system prompt, run without and with the cache on one backend in identically shaped batches; outputs identical, hit rate and reused tokens reported; `set_prefix_caching` on the CUDA backend | done |
 | 37 | `CACHED` blocks and LRU eviction: released indexed blocks stay reusable, a new block is a FREE one or the least recently released CACHED one, released leaves first; `evict_cached`; I1, I2 and I10 checked; both implementations, property tests; GPU: a finished request's pages reused, evicted oldest first under pressure, outputs equal Hugging Face | done |
+| 38 | Preemption by recompute: a preempted request keeps its tokens and resumes by prefilling prompt + generated tokens (nothing generated twice), reusing its own `CACHED` pages; chunked prefill in the CUDA backend for inputs longer than the scratch; a resumption counts at most one step's token budget; tests on the CPU and the GPU (Hugging Face, with and without the cache, all four policies) | done |
 
 ## Today (v0.1)
 
@@ -434,9 +435,9 @@ property tests (10,000 programs, invariants checked after every operation).
 
 ## Preemption (Day 38)
 
-Today a preempted request restarts from its prompt and regenerates its tokens. ADR-0006 showed this
-can diverge from what it already streamed: decoding is deterministic, not batch-invariant, and the
-restart runs in another batch.
+Until Day 38 a preempted request restarted from its prompt and regenerated its tokens. ADR-0006
+showed this can diverge from what it already streamed: decoding is deterministic, not
+batch-invariant, and the restart runs in another batch.
 
 **With the manager, a preemption becomes cheap and safe:**
 - **The release is cheap.** The request's full blocks stay indexed as `CACHED`. Its prompt and
@@ -451,6 +452,30 @@ restart runs in another batch.
 
 So the cache that serves shared prefixes also makes preemption cost close to nothing when memory
 is only briefly short.
+
+**Implemented (Day 38)** in the engine loop and the CUDA backend.
+
+- **Preemption keeps the tokens.** `preempt` frees the sequence (its indexed pages become
+  `CACHED`), keeps `tokens`, and requeues the request at the front in arrival order. The victim is
+  still the policy's choice (lowest priority, latest arrival). `preemptions` counts them.
+- **Resumption prefills prompt + tokens,** and the prefill's output is the next new token. Nothing
+  is generated twice: the test counts every token the backend produces, and it equals the tokens
+  requested. With prefix caching, the request's own pages that survived are reused.
+- **How much survives depends on how long memory stays short.** On a pool that stays short, the
+  others evict the victim's pages before it returns and it recomputes everything; when the
+  shortage eases first, it reuses what is left. Both are correct; the tests cover both.
+- **Long resumptions are prefilled in chunks.** Prompt + generated tokens can exceed the prefill
+  scratch (`max_prompt_tokens`), so the CUDA backend's `prefill` takes up to a sequence's capacity
+  and computes chunks of at most `max_prompt_tokens`, each attending to everything before it
+  (`model_prefill_from` from the chunk's start). A GPU test runs every chat reference in 16-token
+  chunks and matches Hugging Face.
+- **A resumption counts at most one step's token budget,** so a request whose recompute exceeds
+  `max_batch_tokens` is still admitted (alone, at worst) instead of waiting forever; that step's
+  tokens then exceed the budget by the recompute. Chunked prefill across steps (Days 52–53) removes
+  the overshoot.
+- **Tested on the GPU** by the existing preemption test (24 concurrent requests on a tiny cache,
+  all four policies, every output equal to Hugging Face), now resuming from tokens, and by the same
+  test with prefix caching on (`tests/python/test_preemption_cached.py`).
 
 ## Memory-aware admission (Day 39)
 
@@ -517,6 +542,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 35 | An identical whole-page prompt copies its last page and prefills one token; the copy needs a free block or nothing changes; both requests match Hugging Face | copy-on-write |
 | 36 | 16 requests, one 512-token system prompt: outputs identical to the no-cache run in identically shaped batches; hit rate and reused tokens reported | shared prefix end to end |
 | 37 | Released indexed blocks stay CACHED and are reused; eviction takes the least recently released first, leaves first, only count-0 blocks; a copy's source is not evicted for its copy; outputs stay equal to Hugging Face under memory pressure | CACHED and LRU eviction |
+| 38 | A preempted request resumes from prompt + generated tokens: every token generated exactly once, outputs correct; its own cached pages reused when they survive; an over-budget resumption still admitted; chunked prefill equals Hugging Face | preemption by recompute |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

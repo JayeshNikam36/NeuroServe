@@ -59,6 +59,13 @@ public:
     // how many pages were evicted.
     int evict_cached_pages();
 
+    // Prefill() takes up to a sequence's capacity (max_pages_per_sequence * page_size_tokens) and
+    // computes it in chunks of at most max_prompt_tokens (the scratch size), each chunk attending to
+    // all before it: a resumed request's prompt + generated tokens can exceed max_prompt_tokens.
+    // Fewer tokens per chunk (1 .. max_prompt_tokens) let tests run the chunked path on short
+    // prompts; std::invalid_argument outside that range.
+    void set_prefill_chunk_tokens(int tokens);
+
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp
     std::unique_ptr<Impl> impl_;
