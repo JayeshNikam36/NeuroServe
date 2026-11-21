@@ -104,7 +104,7 @@ const PrefixHasher& KVCacheManager::hasher(const char* op) const {
 
 std::vector<BlockId> KVCacheManager::walk(std::span<const TokenId> prompt) const {
     const std::size_t bs = static_cast<std::size_t>(config_.block_size);
-    const std::size_t reusable = prompt.empty() ? 0 : (prompt.size() - 1) / bs;  // never the last token's block
+    const std::size_t reusable = prompt.size() / bs;  // every full block (the last one by copy-on-write)
     std::vector<BlockId> hits;
     BlockHash hash = hasher_->root();
     for (std::size_t i = 0; i < reusable; ++i) {
@@ -126,7 +126,7 @@ std::vector<BlockId> KVCacheManager::walk(std::span<const TokenId> prompt) const
     return hits;
 }
 
-int KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
+Admission KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     hasher("admit");
     Sequence& s = get(seq);
     if (s.length != 0 || !s.table.empty()) {
@@ -137,7 +137,10 @@ int KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
     }
     const std::vector<BlockId> hits = walk(prompt);
     const int total = blocks_for(static_cast<long long>(prompt.size()));
-    const int needed = total - static_cast<int>(hits.size());
+    const std::size_t bs = static_cast<std::size_t>(config_.block_size);
+    const bool copy = hits.size() * bs == prompt.size();  // the last hit holds the last prompt token
+    const int shared = static_cast<int>(hits.size()) - (copy ? 1 : 0);
+    const int needed = total - shared;
     if (total > config_.max_blocks_per_sequence) {
         throw std::length_error("admit: " + seq_name(seq) + " would need " + std::to_string(total) +
                                 " blocks, the limit is " + std::to_string(config_.max_blocks_per_sequence));
@@ -147,22 +150,30 @@ int KVCacheManager::admit(SeqId seq, std::span<const TokenId> prompt) {
                                std::to_string(free_blocks()) + " free");
     }
     s.table.reserve(static_cast<std::size_t>(total));  // may throw: before any change
-    for (const BlockId block : hits) {
-        Block& b = blocks_[static_cast<std::size_t>(block)];
+    for (int i = 0; i < shared; ++i) {
+        Block& b = blocks_[static_cast<std::size_t>(hits[static_cast<std::size_t>(i)])];
         if (++b.refs == 2) {
             ++shared_blocks_;
         }
-        s.table.push_back(block);
+        s.table.push_back(hits[static_cast<std::size_t>(i)]);
     }
-    for (int i = 0; i < needed; ++i) {
+    for (int i = 0; i < needed; ++i) {  // with a copy, the first of these takes the last hit's place
         take_free_block(seq, s);
     }
     s.length = static_cast<int>(prompt.size());
     cached_tokens_ += s.length;
     ++lookups_;
-    lookup_blocks_ += static_cast<std::int64_t>((prompt.size() - 1) / static_cast<std::size_t>(config_.block_size));
+    lookup_blocks_ += static_cast<std::int64_t>(prompt.size() / bs);
     hit_blocks_ += static_cast<std::int64_t>(hits.size());
-    return static_cast<int>(hits.size()) * config_.block_size;
+    Admission out;
+    if (copy) {
+        ++copied_blocks_;
+        out.copy = BlockCopy{hits.back(), s.table[hits.size() - 1]};
+        out.cached_tokens = static_cast<int>(prompt.size()) - 1;
+    } else {
+        out.cached_tokens = static_cast<int>(hits.size() * bs);
+    }
+    return out;
 }
 
 int KVCacheManager::commit(SeqId seq, std::span<const TokenId> tokens) {
@@ -294,6 +305,7 @@ KvBlockStats KVCacheManager::stats() const {
     out.prefix_lookups = lookups_;
     out.prefix_lookup_blocks = lookup_blocks_;
     out.prefix_hit_blocks = hit_blocks_;
+    out.copied_blocks = copied_blocks_;
     return out;
 }
 

@@ -59,7 +59,7 @@ protected:
     // Admits `p` as a new sequence, as a backend does: admit, then (K/V written) commit.
     static int admit_and_commit(KvBlockManager& kv, neuroserve::SeqId seq, const std::vector<TokenId>& p) {
         kv.create(seq);
-        const int cached = kv.admit(seq, p);
+        const int cached = kv.admit(seq, p).cached_tokens;
         kv.commit(seq, p);
         kv.check_invariants();
         return cached;
@@ -92,17 +92,53 @@ TEST_P(KvPrefixIndex, ASecondRequestWithTheSameSystemPromptReusesItsFullBlocks) 
     EXPECT_EQ(s.prefix_hit_blocks, 4) << "the hit is counted";
 }
 
-TEST_P(KvPrefixIndex, TheBlockHoldingTheLastPromptTokenIsNeverReused) {
+TEST_P(KvPrefixIndex, TheBlockHoldingTheLastPromptTokenIsCopiedNotShared) {
+    // Copy-on-write (Day 35): the last prompt token's logits must be computed, which writes its K/V,
+    // so the block holding it is reused as a private copy, and the prefill computes one token.
     auto kv = make(16);
     const auto p = prompt(32);  // exactly 2 full blocks
     admit_and_commit(*kv, 1, p);
     EXPECT_EQ(kv->stats().indexed_blocks, 2);
-    EXPECT_EQ(admit_and_commit(*kv, 2, p), 16) << "block 1 holds the last token: its logits must be computed";
-    EXPECT_EQ(kv->table(2)[0], kv->table(1)[0]);
-    EXPECT_NE(kv->table(2)[1], kv->table(1)[1]);
-    EXPECT_FALSE(kv->indexed(kv->table(2)[1])) << "a duplicate of an indexed block is not indexed";
-    EXPECT_EQ(kv->stats().indexed_blocks, 2);
-    EXPECT_EQ(kv->stats().prefix_lookup_blocks, 2) << "each lookup could reuse 1 block";
+    kv->create(2);
+    const auto a = kv->admit(2, p);
+    EXPECT_EQ(a.cached_tokens, 31) << "every token but the last is reused";
+    ASSERT_TRUE(a.copy.has_value());
+    EXPECT_EQ(a.copy->from, kv->table(1)[1]);
+    EXPECT_EQ(a.copy->to, kv->table(2)[1]) << "the copy sits where the original was matched";
+    EXPECT_NE(a.copy->to, a.copy->from);
+    EXPECT_EQ(kv->table(2)[0], kv->table(1)[0]) << "the first block is shared";
+    EXPECT_EQ(kv->ref_count(a.copy->from), 1) << "the original stays its writer's alone";
+    EXPECT_EQ(kv->ref_count(a.copy->to), 1);
+    kv->commit(2, p);
+    kv->check_invariants();
+    EXPECT_FALSE(kv->indexed(a.copy->to)) << "a copy duplicates an indexed block: not indexed";
+    const auto s = kv->stats();
+    EXPECT_EQ(s.indexed_blocks, 2);
+    EXPECT_EQ(s.shared_blocks, 1);
+    EXPECT_EQ(s.prefix_lookup_blocks, 4) << "each lookup could reuse both blocks";
+    EXPECT_EQ(s.prefix_hit_blocks, 2) << "the copied block counts as a hit";
+    EXPECT_EQ(s.copied_blocks, 1);
+
+    // A hit that stops before the last block needs no copy.
+    kv->create(3);
+    auto other = p;
+    other[20] = 9;
+    const auto b = kv->admit(3, other);
+    EXPECT_EQ(b.cached_tokens, 16);
+    EXPECT_FALSE(b.copy.has_value());
+}
+
+TEST_P(KvPrefixIndex, ACopyNeedsAFreeBlockOrNothingHappens) {
+    auto kv = make(3);
+    admit_and_commit(*kv, 1, prompt(32));  // 2 blocks; 1 free
+    admit_and_commit(*kv, 2, prompt(32));  // shares 1, copies 1: no block free now
+    kv->create(3);
+    const auto before = kv->stats();
+    EXPECT_THROW(kv->admit(3, prompt(32)), KvCacheExhausted) << "the copy needs a block";
+    EXPECT_EQ(kv->stats().copied_blocks, before.copied_blocks);
+    EXPECT_EQ(kv->stats().shared_blocks, before.shared_blocks);
+    EXPECT_TRUE(kv->table(3).empty());
+    kv->check_invariants();
 }
 
 TEST_P(KvPrefixIndex, LookupStopsAtTheFirstMiss) {
@@ -182,7 +218,7 @@ TEST_P(KvPrefixIndex, AdmitIsAllOrNothing) {
     EXPECT_EQ(after.prefix_lookups, before.prefix_lookups) << "a failed admission is not counted";
     EXPECT_EQ(after.prefix_hit_blocks, before.prefix_hit_blocks);
     kv->check_invariants();
-    EXPECT_EQ(kv->admit(2, prompt(64, 2, 8)), 64) << "one that fits is admitted";
+    EXPECT_EQ(kv->admit(2, prompt(64, 2, 8)).cached_tokens, 64) << "one that fits is admitted";
 
     kv->create(3);
     EXPECT_THROW(kv->admit(3, prompt(16 * 17)), std::length_error);  // over max_blocks_per_sequence
@@ -209,7 +245,7 @@ TEST_P(KvPrefixIndex, MatchChangesNothing) {
     const auto before = kv->stats();
     EXPECT_EQ(kv->match(prompt(40)), 2);
     EXPECT_EQ(kv->match(prompt(33)), 2);
-    EXPECT_EQ(kv->match(prompt(32)), 1) << "never the last token's block";
+    EXPECT_EQ(kv->match(prompt(32)), 2) << "the last token's block too (copied on admission)";
     const auto after = kv->stats();
     EXPECT_EQ(after.prefix_lookups, before.prefix_lookups);
     EXPECT_EQ(after.shared_blocks, before.shared_blocks);

@@ -63,7 +63,7 @@ public:
     int free_blocks() const override { return inner_.free_blocks(); }
     neuroserve::core::KvBlockStats stats() const override { return inner_.stats(); }
     bool prefix_caching() const noexcept override { return inner_.prefix_caching(); }
-    int admit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> p) override { return inner_.admit(s, p); }
+    neuroserve::core::Admission admit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> p) override { return inner_.admit(s, p); }
     int commit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> t) override { return inner_.commit(s, t); }
     int match(std::span<const neuroserve::TokenId> p) const override { return inner_.match(p); }
     bool indexed(neuroserve::core::BlockId b) const override { return inner_.indexed(b); }
@@ -98,7 +98,10 @@ TEST(KvProperty, ManagerMatchesTheReferenceOnRandomPrograms) {
         const bool counted = (op.kind == kvt::OpKind::kAdmit || op.kind == kvt::OpKind::kCommit ||
                               op.kind == kvt::OpKind::kMatch) && result == "ok";
         const std::string detail = sharing ? " (blocks shared)"
-                                   : counted ? (outcome == "ok 0" ? " (none)" : op.kind == kvt::OpKind::kCommit ? " (indexed)" : " (hit)")
+                                   : counted ? (outcome == "ok 0" ? " (none)"
+                                                : op.kind == kvt::OpKind::kCommit ? " (indexed)"
+                                                : outcome.find("copy") != std::string::npos ? " (hit, copy)"
+                                                                                            : " (hit)")
                                              : "";
         ++coverage[std::string(names[static_cast<int>(op.kind)]) + detail + " -> " + result];
         ++ops;
@@ -127,6 +130,7 @@ TEST(KvProperty, ManagerMatchesTheReferenceOnRandomPrograms) {
         EXPECT_GE(coverage["release -> ok"], 20'000);
         EXPECT_GE(coverage["admit (hit) -> ok"], 5'000);
         EXPECT_GE(coverage["admit (none) -> ok"], 10'000);
+        EXPECT_GE(coverage["admit (hit, copy) -> ok"], 500);
         EXPECT_GE(coverage["admit -> KvCacheExhausted"], 1'000);
         EXPECT_GE(coverage["admit -> invalid_argument"], 1'000);
         EXPECT_GE(coverage["commit (indexed) -> ok"], 10'000);

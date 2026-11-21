@@ -76,7 +76,9 @@ public:
         const int n = static_cast<int>(prompt.size());
         int cached = 0;
         if (prefix_caching) {
-            cached = kv_.admit(id, prompt);  // KvCacheExhausted (changing nothing) if pages are short
+            const core::Admission a = kv_.admit(id, prompt);  // KvCacheExhausted (changing nothing) if short
+            cached = a.cached_tokens;
+            block_copies_ += a.copy ? 1 : 0;  // a GPU backend copies the block's K/V here
         } else {
             const int pages = (n + page_size_ - 1) / page_size_;
             if (pages > kv_.free_blocks()) {
@@ -183,6 +185,7 @@ public:
     // Prefill looks prompts up in the prefix index and commits written pages to it.
     bool prefix_caching = false;
     std::int64_t prefilled_tokens() const { return prefilled_tokens_; }  // prompt tokens computed
+    int block_copies() const { return block_copies_; }                   // copy-on-write copies
     const core::KVCacheManager& kv() const { return kv_; }
     // Injected bookkeeping faults, for the engine loop's invariant checks:
     bool leak_on_free = false;   // free_sequence() succeeds but keeps the sequence (a leak)
@@ -231,6 +234,7 @@ private:
     std::unordered_map<SeqId, int> lengths_;             // the backend's lengths (drift_after_decode bends them)
     std::unordered_map<SeqId, std::vector<TokenId>> tokens_;  // every token each live sequence holds
     std::int64_t prefilled_tokens_ = 0;
+    int block_copies_ = 0;
     SeqId next_id_ = 1;
     int decode_calls_ = 0;
     int prefill_calls_ = 0;

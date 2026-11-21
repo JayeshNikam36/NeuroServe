@@ -19,6 +19,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 32 | Prefix hashing for full blocks (`kv_prefix_hash.hpp`): XXH64, a pinned byte encoding, the chained block hash and its root, the CUDA backend's K/V identity, `kv_cache_key` in `model_info()`; tests against an independent implementation (`tests/unit/test_kv_prefix_hash.cpp`) | done |
 | 33 | Prefix index and lookup at admission: `admit`, `commit`, `match` in the `KvBlockManager` contract (reference and manager), verified hits, hit counters in `/health`, I7 and I8 checked; contract, property and engine tests (`test_kv_prefix_index.cpp`, `test_kv_prefix_cache.cpp`). The CUDA backend turns it on with Day 34's prefill | done |
 | 34 | Prefill from a cached offset: `attention_prefill_paged` (causal attention over the cached prefix through the block table) and `model_prefill_from` in the CUDA backend; `prefix_caching` in `CudaLlmEngineConfig` and `neuroserve.Engine` (off by default until Day 36); GPU test: the Hugging Face chat references match with and without a prefix hit | done |
+| 35 | Copy-on-write: `admit` reuses the page holding the last prompt token as a private copy (`Admission.copy`), the CUDA backend copies its K/V (`copy_page`) and the prefill computes one token; both implementations, property tests; GPU test: the copy's request and the holder both match Hugging Face | done |
 
 ## Today (v0.1)
 
@@ -287,9 +288,8 @@ compared on it operation by operation (the property tests now admit, commit and 
   and its parent must be the block the walk reused just before it. A 64-bit collision then costs a
   miss, never a wrong reuse. A test corrupts an indexed block's tokens: I8 reports it and the
   lookup refuses it.
-- **The block holding the last prompt token is never reused,** because its logits must be computed
-  and that writes its K/V. A prompt of exactly 32 tokens reuses 1 block, not 2. Copy-on-write
-  (Day 35) lifts this.
+- **The block holding the last prompt token was not reused on Day 33,** because its logits must be
+  computed and that writes its K/V. Since Day 35 it is reused as a private copy (below).
 - **A duplicate is not indexed.** Two blocks with the same prefix happen when the last-token rule
   made a request compute a block that another already holds. The index keeps the first; the
   sequence stops indexing there, and a later `commit` retries, so its copy takes over once the
@@ -365,6 +365,24 @@ recomputes the last token into the copy. The alternative (never reusing the bloc
 last prompt token) costs up to 15 tokens of prefill per request and needs no copy. Copy-on-write
 also stays the guard for every later feature that writes after sharing (parallel sampling,
 forked sequences).
+
+**Implemented (Day 35).** A write can reach a shared block in one place only: decode always writes
+into a sequence's own partial block or a new one, so the only shared block written is the one
+holding the last prompt token, whose logits the prefill must compute.
+
+- **`admit` now reuses every full block,** the last one too. When the hit covers the last prompt
+  token, that block is not shared: the sequence gets a free block in its place, and `admit` returns
+  it as `Admission.copy = {from, to}` with `cached_tokens = prompt.size() - 1`.
+- **The CUDA backend copies the block** (`copy_page`: K and V of every layer, device to device)
+  before the prefill, which then computes the one remaining token into the copy. The original
+  keeps its single owner and is never written.
+- **The copy needs a free block.** If none is free, `admit` throws `KvCacheExhausted` and changes
+  nothing. Hit counters count the copied block as a hit; `copied_blocks` counts copies.
+- **The copy is not indexed:** it duplicates an indexed block. It takes over if the original goes
+  (the duplicate rule of Day 33).
+- **Tested on the GPU** with the Hugging Face chat reference whose prompt fills whole pages
+  (48 tokens): the request that prefilled one token into the copy and the holder it was copied from
+  both match Hugging Face.
 
 ### Eviction (Day 37)
 
@@ -457,6 +475,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 32 | Same prefix → same chain; any change in model, weights, dtype, block size, RoPE or a token → a different hash, from that block on; XXH64 and the encoding match an independent implementation; no collisions among 200,000 blocks | hash identity |
 | 33 | A second request with the same system prompt reuses its full blocks and the hit is counted; never the last token's block; stops at the first miss; verified hits; duplicates; all-or-nothing admission; the manager equals the reference on 10,000 random programs with admit, commit and match | prefix index |
 | 34 | With a prefix hit, the chat references still equal Hugging Face's greedy tokens, case by case, at batch size 1; an identical prompt reusing all but its last page too | prefill from a cached offset |
+| 35 | An identical whole-page prompt copies its last page and prefills one token; the copy needs a free block or nothing changes; both requests match Hugging Face | copy-on-write |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

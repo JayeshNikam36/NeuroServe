@@ -131,6 +131,20 @@ void attention_prefill_paged(const __half* q, const __half* k_pool, const __half
                                                                  page_size, n_heads, n_kv_heads, head_dim);
 }
 
+void copy_page(const Model& m, PagedKVCache& c, int from, int to) {
+    const size_t bytes = static_cast<size_t>(c.page_size) * m.cfg.n_kv_heads * m.cfg.head_dim * sizeof(__half);
+    const size_t offset_from = static_cast<size_t>(from) * bytes;
+    const size_t offset_to = static_cast<size_t>(to) * bytes;
+    for (size_t l = 0; l < c.k_pool.size(); ++l) {
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<char*>(c.k_pool[l]) + offset_to,
+                                   reinterpret_cast<const char*>(c.k_pool[l]) + offset_from, bytes,
+                                   cudaMemcpyDeviceToDevice, 0));
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<char*>(c.v_pool[l]) + offset_to,
+                                   reinterpret_cast<const char*>(c.v_pool[l]) + offset_from, bytes,
+                                   cudaMemcpyDeviceToDevice, 0));
+    }
+}
+
 void model_prefill_from(Model& m, PagedKVCache& c, Sequence& seq, const std::vector<int>& ids, int start,
                         std::vector<float>& logits) {
     const int total = static_cast<int>(ids.size());
