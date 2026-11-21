@@ -3,6 +3,7 @@
 import asyncio
 import json
 import statistics
+from collections import Counter
 
 import pytest
 
@@ -47,6 +48,32 @@ def test_mixed_prompts_have_exact_lengths_and_forced_outputs():
         assert all(TOKEN_ID_RANGE[0] <= t < TOKEN_ID_RANGE[1] for t in p.body["prompt"])
         assert p.body["max_tokens"] == p.max_tokens in (32, 128, 384)
         assert p.body["neuroserve"] == {"ignore_eos": True} and p.body["stream"] is True
+
+
+@pytest.mark.parametrize("name", ["shared_prefix", "memory_pressure"])
+def test_prefix_prompts_share_a_prefix_and_have_suffixes_of_their_own(name):
+    profile = PROFILES[name]
+    schedule = build_schedule(profile, 1, MODEL_NAME, num_requests=2000)
+    prefixes = {}
+    for p in schedule:
+        prefix, suffix = p.prompt_id.split("+")
+        ids = p.body["prompt"]
+        assert p.endpoint == "/v1/completions" and len(ids) == profile.prefix_tokens + int(suffix)
+        assert len(ids) <= 512 and all(TOKEN_ID_RANGE[0] <= t < TOKEN_ID_RANGE[1] for t in ids)
+        assert prefixes.setdefault(prefix, ids[:profile.prefix_tokens]) == ids[:profile.prefix_tokens]
+        assert p.body["neuroserve"] == {"ignore_eos": True} and p.body["stream"] is True
+    assert len(prefixes) == profile.prefix_count
+    assert len({tuple(v) for v in prefixes.values()}) == profile.prefix_count       # all distinct
+    assert len({tuple(p.body["prompt"]) for p in schedule}) > 1990                  # suffixes differ
+    assert profile.prefix_tokens % 16 == 0                                          # whole pages
+    counts = Counter(p.prompt_id.split("+")[0] for p in schedule)
+    if profile.prefix_zipf:  # weights 1 / (k + 1): prefix 0 about twice as often as prefix 1
+        assert counts["prefix-0"] / counts["prefix-1"] == pytest.approx(2.0, rel=0.2)
+    else:
+        assert max(counts.values()) / min(counts.values()) < 1.3
+    # Another seed, other prefixes.
+    other = build_schedule(profile, 2, MODEL_NAME, num_requests=1)[0].body["prompt"][:profile.prefix_tokens]
+    assert tuple(other) not in {tuple(v) for v in prefixes.values()}
 
 
 def test_the_prompt_dataset_is_versioned():
