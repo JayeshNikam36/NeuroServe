@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <iterator>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,7 @@
 #include "batched.h"
 
 #include "neuroserve/core/kv_cache_manager.hpp"
+#include "neuroserve/core/kv_memory.hpp"
 #include "neuroserve/core/kv_prefix_hash.hpp"
 #include "neuroserve/cuda/device_info.hpp"
 #include "prefill_from_offset.cuh"
@@ -199,6 +202,22 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     info.vocab_size = impl_->model.vocab;
     info.max_prompt_tokens = config.max_prompt_tokens;
     info.kv_bytes_per_token = kv_bytes_per_token(impl_->model);
+    // The model directory's config.json, when the export kept it, must describe the weights just
+    // loaded: the KV memory per token (Day 39) comes from the same numbers either way.
+    const fs::path config_json = fs::path(config.model_dir) / "config.json";
+    if (fs::exists(config_json)) {
+        std::ifstream in(config_json);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const core::ModelShape declared = core::parse_model_config(text);  // std::invalid_argument if broken
+        const std::int64_t from_config = core::kv_bytes_per_token(declared, "fp16");
+        if (declared.num_layers != impl_->model.n_layers || declared.num_kv_heads != impl_->model.cfg.n_kv_heads ||
+            declared.head_dim != impl_->model.cfg.head_dim ||
+            from_config != static_cast<std::int64_t>(info.kv_bytes_per_token)) {
+            throw std::invalid_argument("config.json describes another model than the weights in " + config.model_dir +
+                                        " (" + std::to_string(from_config) + " KV bytes per token vs " +
+                                        std::to_string(info.kv_bytes_per_token) + ")");
+        }
+    }
     info.kv_cache_key = core::hash_hex(impl_->hasher->root());
 }
 

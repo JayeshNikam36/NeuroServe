@@ -170,6 +170,7 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     log::write(log::Level::kInfo, kLogger, "engine loop started",
                {{"backend", std::string(backend.name())}, {"policy", std::string(policy_->name())},
                 {"max_batch", options_.max_batch}, {"max_batch_tokens", options_.max_batch_tokens},
+                {"kv_admission", std::string(admission_name(options_.admission))},
                 {"total_pages", total_pages_}, {"page_size_tokens", page_size_}});
     thread_ = std::thread([this] { run(); });
 }
@@ -616,6 +617,19 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
     SchedulerInput input;
     input.max_batch = options_.max_batch;
     input.free_pages = free_pages;
+    // Worst-case admission reserves every running request's remaining growth up to prompt +
+    // max_new_tokens: only what is left is free for admissions. This step's growth stays in
+    // free_pages, where the policy counts it as next_step_pages, so it is not reserved twice.
+    const bool worst_case = options_.admission == KvAdmission::kWorstCase;
+    if (worst_case) {
+        long long reserved = 0;
+        for (const auto& entry : active_) {
+            const long long whole = static_cast<long long>(entry->params.prompt.size()) + entry->params.max_new_tokens;
+            const int growth = pages_for_tokens(entry->cached + 1) - pages_for_tokens(entry->cached);
+            reserved += pages_for_tokens(whole) - pages_for_tokens(entry->cached) - growth;
+        }
+        input.free_pages = static_cast<int>(std::max<long long>(0, free_pages - reserved));
+    }
     input.max_step_tokens = options_.max_batch_tokens;
     const auto now = Request::Clock::now();
     const auto age_ms = [now](const Entry& entry) {  // since arrival; preemption does not reset it
@@ -630,8 +644,10 @@ void EngineLoop::schedule_locked(int free_pages, std::vector<EntryPtr>& admitted
         // Days 52-53, will spread it). A new request's prompt is within the budget (submit checks).
         const auto input_tokens = static_cast<long long>(entry->params.prompt.size() + entry->tokens.size());
         const auto counted = std::min<long long>(input_tokens, options_.max_batch_tokens);
+        // On demand it needs its prefill's pages; worst case, every page it can ever hold.
+        const long long whole = static_cast<long long>(entry->params.prompt.size()) + entry->params.max_new_tokens;
         input.queued.push_back({entry->request.id(), static_cast<int>(counted), entry->params.max_new_tokens,
-                                pages_for_tokens(input_tokens), entry->waited_steps,  // prefill; decodes next step
+                                pages_for_tokens(worst_case ? whole : input_tokens), entry->waited_steps,
                                 entry->params.priority, age_ms(*entry)});
     }
     input.running.reserve(active_.size());

@@ -23,6 +23,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 36 | The shared-prefix end-to-end test: 16 requests with a 512-token system prompt, run without and with the cache on one backend in identically shaped batches; outputs identical, hit rate and reused tokens reported; `set_prefix_caching` on the CUDA backend | done |
 | 37 | `CACHED` blocks and LRU eviction: released indexed blocks stay reusable, a new block is a FREE one or the least recently released CACHED one, released leaves first; `evict_cached`; I1, I2 and I10 checked; both implementations, property tests; GPU: a finished request's pages reused, evicted oldest first under pressure, outputs equal Hugging Face | done |
 | 38 | Preemption by recompute: a preempted request keeps its tokens and resumes by prefilling prompt + generated tokens (nothing generated twice), reusing its own `CACHED` pages; chunked prefill in the CUDA backend for inputs longer than the scratch; a resumption counts at most one step's token budget; tests on the CPU and the GPU (Hugging Face, with and without the cache, all four policies) | done |
+| 39 | Memory-aware admission: `kv_memory.hpp` reads layers, KV heads, head dim and dtype from `config.json` (32 KiB/token, 512 KiB/block for Llama-3.2-1B FP16); `on-demand` and `worst-case` admission (`EngineLoopOptions::admission`, `neuroserve.Engine(kv_admission=...)`); the CUDA backend refuses a `config.json` that disagrees with its weights | done |
 
 ## Today (v0.1)
 
@@ -484,11 +485,30 @@ Bytes per token come from the model's `config.json`:
     2 (K and V) × num_hidden_layers × num_key_value_heads × head_dim × sizeof(dtype)
 
 Two modes, chosen in the config:
-- **`on_demand`** (today): blocks are taken as requests grow, and preemption handles shortage.
-- **`worst_case`:** each request reserves `prompt + max_tokens` at admission, so it never preempts,
+- **`on-demand`** (the default): blocks are taken as requests grow, and preemption handles shortage.
+- **`worst-case`:** each request reserves `prompt + max_tokens` at admission, so it never preempts,
   but fewer requests run at once.
 
 The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block.
+
+**Implemented (Day 39).**
+
+- **`kv_memory.hpp`** parses a Hugging Face `config.json` (top-level keys only; nested objects
+  such as `rope_scaling` are skipped): `num_hidden_layers`, `num_key_value_heads` (default:
+  `num_attention_heads`), `head_dim` (default: `hidden_size / num_attention_heads`), `torch_dtype`.
+  A missing or non-integer field is an error with its name. K/V bytes use the engine's K/V dtype,
+  FP16, whatever the weights' dtype: Llama-3.2-1B ships as `bfloat16`, 2 bytes either way.
+- **The CUDA backend checks the model directory's `config.json`** when the export kept one: its
+  layers, KV heads and head dim must be the loaded weights', or the engine refuses to start.
+- **`EngineLoopOptions::admission`** (`neuroserve.Engine(..., kv_admission="worst-case")`) picks
+  the mode. Worst case gives each queued request the pages of `prompt + max_new_tokens` and
+  subtracts every running request's remaining growth from the free pages the policy sees, so a
+  running request can always grow: the policies need no change, and none ever preempts.
+- **Tested through the engine:** four requests of 5 pages each on a 10-page pool. On demand, more
+  than two start together and they preempt as they grow; worst case runs exactly two at a time and
+  never preempts, with and without prefix caching. All outputs are correct in both.
+- **The server's config** still uses on-demand; choosing the mode there comes with the KV metrics
+  (Day 40), where its effect on preemptions is visible.
 
 ## Invariants
 
@@ -543,6 +563,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 36 | 16 requests, one 512-token system prompt: outputs identical to the no-cache run in identically shaped batches; hit rate and reused tokens reported | shared prefix end to end |
 | 37 | Released indexed blocks stay CACHED and are reused; eviction takes the least recently released first, leaves first, only count-0 blocks; a copy's source is not evicted for its copy; outputs stay equal to Hugging Face under memory pressure | CACHED and LRU eviction |
 | 38 | A preempted request resumes from prompt + generated tokens: every token generated exactly once, outputs correct; its own cached pages reused when they survive; an over-budget resumption still admitted; chunked prefill equals Hugging Face | preemption by recompute |
+| 39 | Llama-3.2-1B FP16 from its `config.json`: 32 KiB per token, 512 KiB per block; broken configs rejected; on-demand preempts, worst-case never does, both correct | memory-aware admission |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

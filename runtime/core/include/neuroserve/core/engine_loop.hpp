@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "neuroserve/core/kv_memory.hpp"
 #include "neuroserve/core/decision_log.hpp"
 #include "neuroserve/core/inference_backend.hpp"
 #include "neuroserve/core/latency_histogram.hpp"
@@ -124,6 +125,7 @@ inline constexpr bool kCheckInvariantsByDefault = false;
 struct EngineLoopOptions {
     int max_batch = 8;             // most sequences in one decode step
     int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
+    KvAdmission admission = KvAdmission::kOnDemand;  // how much KV memory a request needs to start (kv_memory.hpp)
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
     PolicyOptions policy_options{};  // settings for the policy named in `policy`
     int max_queue = 1024;          // most requests waiting in the queue; submit() throws QueueFull beyond it
