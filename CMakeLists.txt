@@ -68,6 +68,7 @@ if(NS_ENABLE_CUDA)
 
     add_subdirectory(cuda)
     add_subdirectory(tools)
+    add_subdirectory(benchmarks/block_size)
 
     if(NS_BUILD_PYTHON)
         add_subdirectory(bindings)
