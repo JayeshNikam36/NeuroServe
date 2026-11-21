@@ -514,9 +514,12 @@ The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block
 
 ## Compute Sanitizer (Day 41)
 
-`cmake --build build/dev-cuda --target compute_sanitizer` runs every test binary under
+`cmake --build build/dev-cuda --target compute_sanitizer` runs the GPU test binaries under
 `memcheck` (out-of-bounds and misaligned device accesses, invalid frees, CUDA API errors) and
-`racecheck` (shared-memory races). The GPU integration suite runs whole under `memcheck`;
+`racecheck` (shared-memory races). The unit tests make no CUDA calls, so there is nothing for
+Compute Sanitizer to check there; they run under ASan, UBSan and TSan. On WSL the GPU debugger
+interface must be enabled once (`EnableDebuggerInterface.bat` as administrator on Windows, then
+`wsl --shutdown`), or nothing is instrumented. The GPU integration suite runs whole under `memcheck`;
 `racecheck`, which instruments every shared-memory access, runs its smallest test for each kernel
 path: the engine's prefill and decode (single and batched), prefill from a cached offset
 (`attention_prefill_paged`), copy-on-write (`copy_page`) and chunked prefill. A run passes only with

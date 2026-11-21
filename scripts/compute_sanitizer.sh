@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Compute Sanitizer over the KV, scheduler and GPU suites (Day 41, KV-004): memcheck (out-of-bounds
-# and misaligned device memory accesses, invalid frees, CUDA API errors) and racecheck (shared-memory
-# data races), each test binary under each tool. Full logs go to LOGS/*.log (the tool) and *.out
-# (the tests); LOGS/compute-sanitizer.md summarizes them and is committed.
+# Compute Sanitizer over the GPU suites (Day 41, KV-004): memcheck (out-of-bounds and misaligned
+# device memory accesses, invalid frees, CUDA API errors) and racecheck (shared-memory data races).
+# Full logs go to LOGS/*.log (the tool) and *.out (the tests); LOGS/compute-sanitizer.md summarizes
+# them and is committed.
+#
+# The unit tests (KV manager, scheduler, engine loop on the fake backend) make no CUDA calls, so
+# Compute Sanitizer has nothing to check there ("terminated before first instrumented API call");
+# they run under ASan, UBSan and TSan instead (NS_SANITIZER). The GPU suites below drive the KV and
+# scheduler code on the real backend: that is where device memory and kernels are checked.
+#
+# On WSL the GPU debugger interface must be enabled once, on Windows, as administrator:
+# EnableDebuggerInterface.bat (shipped in the CUDA toolkit's compute-sanitizer directory), then
+# `wsl --shutdown`. Without it every run reports "Failed to initialize WDDM debugger interface" and
+# checks nothing; this script reports that as "could not attach", never as a pass or a code error.
 #
 # Run it through CMake, which passes the paths:  cmake --build build/dev-cuda --target compute_sanitizer
 # Exit status: 0 when every run passed its tests with zero sanitizer errors, 1 otherwise.
@@ -20,15 +30,18 @@ mkdir -p "$LOGS"
 # cached offset, copy-on-write and chunked prefill. memcheck runs everything.
 RACECHECK_GPU='CudaLlmEngineBackendTest.SinglePromptMatchesHuggingFace:CudaLlmEngineBackendTest.AllPromptsDecodedTogetherMatchHuggingFace:CudaPrefixCacheTest.AnIdenticalPromptReusesEveryPageButTheLastAndMatches:CudaPrefixCacheTest.CopyOnWriteKeepsBothRequestsCorrect:CudaPrefixCacheTest.ChunkedPrefillReproducesHuggingFace'
 
+# CudaCheck.ThrowsCudaErrorWithCodeAndExpression calls cudaSetDevice with a bad ordinal on purpose,
+# to test error reporting: memcheck would report that intended API error.
+CUDA_FILTER='*:-CudaCheck.ThrowsCudaErrorWithCodeAndExpression'
+
 # tool | suite | binary | gtest filter
 RUNS=(
-    "memcheck|unit|$UNIT|*"
-    "memcheck|cuda|$CUDA|*"
+    "memcheck|cuda|$CUDA|$CUDA_FILTER"
     "memcheck|integration|$INTEGRATION|*"
-    "racecheck|unit|$UNIT|*"
-    "racecheck|cuda|$CUDA|*"
+    "racecheck|cuda|$CUDA|$CUDA_FILTER"
     "racecheck|integration|$INTEGRATION|$RACECHECK_GPU"
 )
+: "$UNIT"  # accepted for the CMake target's interface; see above for why it is not run here
 
 SUMMARY="$LOGS/compute-sanitizer.md"
 {
@@ -63,7 +76,10 @@ for run in "${RUNS[@]}"; do
     fi
     tests=$(grep -oE '\[==========\] [0-9]+ tests? from' "$out" | tail -1 | grep -oE '[0-9]+')
     failed_tests=$(grep -c '^\[  FAILED  \]' "$out")
-    if [[ "${tests:-0}" == 0 ]]; then
+    if grep -qE 'Failed to initialize WDDM debugger interface|Device not supported|terminated before first instrumented' "$log" 2>/dev/null; then
+        result="**sanitizer could not attach** (see the script's header)"  # nothing was checked
+        failed=1
+    elif [[ "${tests:-0}" == 0 ]]; then
         result="**ran no tests** (exit $status)"  # a filter that matches nothing proves nothing
         failed=1
     elif [[ $status -eq 0 && "${errors:-x}" == 0 ]]; then
