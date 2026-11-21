@@ -98,6 +98,8 @@ public:
             kv_.commit(id, tokens_[id]);  // its full pages are written now
         }
         len = n;
+        prefill_sizes_.push_back(n);
+        ++generated_;
         return next(prompt.back());
     }
 
@@ -134,6 +136,7 @@ public:
                 kv_.commit(ids[i], tokens_[ids[i]]);  // indexes the page this token filled, if any
             }
             out.push_back(next(tokens[i]));
+            ++generated_;
         }
         length(ids[0]) += drift_after_decode;
         return out;
@@ -188,6 +191,8 @@ public:
     bool prefix_caching = false;
     std::int64_t prefilled_tokens() const { return prefilled_tokens_; }  // prompt tokens computed
     int block_copies() const { return block_copies_; }                   // copy-on-write copies
+    const std::vector<int>& prefill_sizes() const { return prefill_sizes_; }  // tokens of each prefill
+    std::int64_t generated() const { return generated_; }  // tokens produced (prefill + decode outputs)
     const core::KVCacheManager& kv() const { return kv_; }
     // Injected bookkeeping faults, for the engine loop's invariant checks:
     bool leak_on_free = false;   // free_sequence() succeeds but keeps the sequence (a leak)
@@ -237,6 +242,8 @@ private:
     std::unordered_map<SeqId, std::vector<TokenId>> tokens_;  // every token each live sequence holds
     std::int64_t prefilled_tokens_ = 0;
     int block_copies_ = 0;
+    std::vector<int> prefill_sizes_;
+    std::int64_t generated_ = 0;
     SeqId next_id_ = 1;
     int decode_calls_ = 0;
     int prefill_calls_ = 0;

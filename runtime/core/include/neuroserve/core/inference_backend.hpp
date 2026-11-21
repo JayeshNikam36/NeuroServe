@@ -19,7 +19,8 @@ struct ModelInfo {
     int n_kv_heads = 0;
     int head_dim = 0;
     int vocab_size = 0;
-    int max_prompt_tokens = 0;          // longest prompt prefill() accepts
+    int max_prompt_tokens = 0;          // longest prompt a client may send; prefill() itself also takes
+                                        // a resumed request's prompt + generated tokens (Day 38)
     std::size_t kv_bytes_per_token = 0; // K + V for all layers
     std::string kv_cache_key;           // root of the KV prefix hash chain (16 hex digits); empty if the
                                         // backend has no prefix hashing. Equal keys: compatible K/V

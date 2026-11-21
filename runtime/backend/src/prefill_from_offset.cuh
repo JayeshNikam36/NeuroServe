@@ -24,8 +24,9 @@ void attention_prefill_paged(const __half* q, const __half* k_pool, const __half
 // Prefills ids[start ..] for a sequence whose first `start` positions are already in its pages
 // (reused from the prefix cache): positions and RoPE start at `start`, the new K/V go into the
 // sequence's pages, and attention covers the whole prefix. seq.pages must already cover ids.size()
-// tokens (the backend gives it the manager's blocks); 0 < start < ids.size(). Sets seq.len and
-// returns the last token's logits, like model_prefill_paged.
+// tokens (the backend gives it the manager's blocks); 0 < start < ids.size(). The sequence's length
+// is 0 (a prefix from the cache) or start (the next chunk of a chunked prefill). At most m.max_T new
+// tokens. Sets seq.len and returns the last token's logits, like model_prefill_paged.
 // Copies page `from`'s K and V, in every layer, into page `to` (copy-on-write: a reused page the
 // prefill is about to write into). Stream-ordered before the prefill's kernels.
 void copy_page(const Model& m, PagedKVCache& c, int from, int to);

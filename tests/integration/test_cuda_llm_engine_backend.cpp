@@ -188,7 +188,7 @@ TEST_F(CudaLlmEngineBackendTest, RejectsBadRequestsWithoutSideEffects) {
 
     const SeqId id = backend_->create_sequence();
     EXPECT_THROW(backend_->prefill(id, std::vector<TokenId>{}), std::invalid_argument);         // empty
-    EXPECT_THROW(backend_->prefill(id, std::vector<TokenId>(600, 1000)), std::length_error);    // too long
+    EXPECT_THROW(backend_->prefill(id, std::vector<TokenId>(1100, 1000)), std::length_error);   // over 64 pages
     EXPECT_THROW(backend_->prefill(id, std::vector<TokenId>{1, -5}), std::invalid_argument);    // bad token
     {
         const SeqId ids[] = {id};
@@ -587,6 +587,25 @@ TEST_F(CudaPrefixCacheTest, CachedPagesAreReusedAfterTheirRequestAndEvictedOldes
     EXPECT_EQ(hits, 0) << "the oldest pages were evicted first";
     EXPECT_EQ(generate(prompts_.at(0), greedy_.at(0).size(), hits), greedy_.at(0)) << "from its own CACHED pages";
     EXPECT_GT(hits, 0);
+    backend_->check_kv_invariants();
+}
+
+// Chunked prefill (Day 38): a resumed request's prompt + generated tokens can exceed the prefill
+// scratch (max_prompt_tokens), so prefill() runs in chunks, each attending to everything before it.
+// With 16-token chunks every chat reference is prefilled in 3 or 4 chunks; all must still equal
+// Hugging Face exactly.
+TEST_F(CudaPrefixCacheTest, ChunkedPrefillReproducesHuggingFace) {
+    backend_->set_prefix_caching(false);  // chunking alone: no cached prefix
+    backend_->set_prefill_chunk_tokens(16);
+    for (std::size_t c = 0; c < prompts_.size(); ++c) {
+        std::int64_t hits = 0;
+        EXPECT_EQ(generate(prompts_[c], greedy_[c].size(), hits), greedy_[c])
+            << "case " << c << ": " << prompts_[c].size() << " tokens in chunks of 16";
+    }
+    EXPECT_THROW(backend_->set_prefill_chunk_tokens(0), std::invalid_argument);
+    EXPECT_THROW(backend_->set_prefill_chunk_tokens(641), std::invalid_argument);
+    backend_->set_prefill_chunk_tokens(640);
+    backend_->set_prefix_caching(true);
     backend_->check_kv_invariants();
 }
 

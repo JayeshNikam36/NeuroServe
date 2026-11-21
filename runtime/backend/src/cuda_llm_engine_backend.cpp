@@ -86,6 +86,7 @@ struct CudaLlmEngineBackend::Impl {
     std::unordered_map<SeqId, ::Sequence> sequences;
     std::unordered_map<SeqId, std::vector<TokenId>> tokens;  // with prefix caching: each sequence's tokens
     bool prefix_caching = false;
+    int prefill_chunk = 0;  // tokens per prefill chunk: max_prompt_tokens unless a test sets fewer
     SeqId next_id = 1;
 
     ~Impl() { release(); }
@@ -186,6 +187,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->kv.emplace(core::KvBlockConfig{config.num_pages, config.page_size_tokens, config.max_pages_per_sequence},
                       impl_->hasher->identity());  // the index is there; prefix_caching decides if it is used
     impl_->prefix_caching = config.prefix_caching;
+    impl_->prefill_chunk = config.max_prompt_tokens;
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
 
@@ -215,6 +217,14 @@ void CudaLlmEngineBackend::set_prefix_caching(bool on) {
 }
 
 int CudaLlmEngineBackend::evict_cached_pages() { return impl_->kv->evict_cached(); }
+
+void CudaLlmEngineBackend::set_prefill_chunk_tokens(int tokens) {
+    if (tokens < 1 || tokens > impl_->config.max_prompt_tokens) {
+        throw std::invalid_argument("prefill chunk must be 1 .. max_prompt_tokens (" +
+                                    std::to_string(impl_->config.max_prompt_tokens) + ") tokens");
+    }
+    impl_->prefill_chunk = tokens;
+}
 
 bool CudaLlmEngineBackend::prefix_caching() const noexcept { return impl_->prefix_caching; }
 
@@ -256,9 +266,10 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
         throw std::invalid_argument("prefill: empty prompt");
     }
     const int n = static_cast<int>(prompt.size());
-    if (n > im.config.max_prompt_tokens) {
-        throw std::length_error("prefill: prompt has " + std::to_string(n) + " tokens, limit is " +
-                                std::to_string(im.config.max_prompt_tokens));
+    const int capacity = im.config.max_pages_per_sequence * im.config.page_size_tokens;
+    if (n > capacity) {  // longer than max_prompt_tokens is fine: it is prefilled in chunks
+        throw std::length_error("prefill: " + std::to_string(n) + " tokens, a sequence holds at most " +
+                                std::to_string(capacity));
     }
     for (const TokenId t : prompt) {
         im.check_token(t);
@@ -283,11 +294,26 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
     im.sync_pages(id, seq);
     // The engine reports GPU errors by exiting (CUDA_CHECK), never by throwing, so nothing below
     // can leave the manager ahead of the engine.
+    // In chunks of at most prefill_chunk tokens (the scratch holds max_prompt_tokens): a client's
+    // prompt is one chunk; a resumed request's prompt + generated tokens can be several (Day 38).
     std::vector<float> logits;
-    if (cached == 0) {
-        model_prefill_paged(im.model, *im.cache, seq, ids, logits);
-    } else {
-        backend_detail::model_prefill_from(im.model, *im.cache, seq, ids, cached, logits);
+    const int chunk = im.prefill_chunk;
+    int done = cached;
+    if (done == 0) {
+        const int first = std::min(n, chunk);
+        if (first == n) {
+            model_prefill_paged(im.model, *im.cache, seq, ids, logits);
+        } else {
+            model_prefill_paged(im.model, *im.cache, seq, std::vector<int>(ids.begin(), ids.begin() + first), logits);
+        }
+        done = first;
+    }
+    while (done < n) {  // each later chunk attends to everything before it, as a cached prefix
+        const int end = std::min(n, done + chunk);
+        backend_detail::model_prefill_from(im.model, *im.cache, seq,
+                                           end == n ? ids : std::vector<int>(ids.begin(), ids.begin() + end), done,
+                                           logits);
+        done = end;
     }
     im.check_in_sync(id, seq);
     if (im.prefix_caching) {

@@ -154,7 +154,7 @@ struct EngineLoopStats {
     std::uint64_t completed = 0;
     std::uint64_t failed = 0;
     std::uint64_t cancelled = 0;
-    std::uint64_t preemptions = 0;  // times a running request was preempted (and later restarted)
+    std::uint64_t preemptions = 0;  // times a running request was preempted (it resumes from its tokens)
     std::uint64_t decode_steps = 0;
     std::uint64_t prefill_tokens = 0;  // prompt tokens processed (including restarts after preemption)
     std::uint64_t decode_tokens = 0;
