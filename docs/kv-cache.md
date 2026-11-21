@@ -26,6 +26,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 39 | Memory-aware admission: `kv_memory.hpp` reads layers, KV heads, head dim and dtype from `config.json` (32 KiB/token, 512 KiB/block for Llama-3.2-1B FP16); `on-demand` and `worst-case` admission (`EngineLoopOptions::admission`, `neuroserve.Engine(kv_admission=...)`); the CUDA backend refuses a `config.json` that disagrees with its weights | done |
 | 40 | KV-cache metrics: `GET /v1/runtime/state` (occupancy, cached and free pages, hits, misses, hit rate, reused tokens, evictions, preemptions, admission mode); an exact `prefix_reused_tokens` counter in the contract; `engine.prefix_caching` and `engine.kv_admission` in the server config | done |
 | 41 | Compute Sanitizer: `memcheck` and `racecheck` on the unit (KV, scheduler, engine loop), CUDA and GPU integration suites; CMake target `compute_sanitizer`, `scripts/compute_sanitizer.sh`, summary in `tests/logs/compute-sanitizer.md` | done |
+| 42 | Block-size sweep: `ns_block_size_sweep` (benchmarks/block_size) computes capacity and waste at 8, 16 and 32 tokens for a seeded length mix and times the paged decode attention kernel at each, interleaved in one process; results in `benchmarks/results/day42-block-size.md` | done |
 
 ## Today (v0.1)
 
@@ -511,6 +512,19 @@ The Day 39 test pins Llama-3.2-1B FP16 at 32 KiB per token and 512 KiB per block
   never preempts, with and without prefix caching. All outputs are correct in both.
 - **The server's config** still uses on-demand; choosing the mode there comes with the KV metrics
   (Day 40), where its effect on preemptions is visible.
+
+## Block size (Day 42)
+
+`ns_block_size_sweep` measures what the block size costs and buys at 8, 16 and 32 tokens, in one
+process and on one workload: capacity and padding waste, exactly, for 10,000 sequences of a seeded
+chat-like length mix, and decode attention time with the engine's paged kernel
+(`attention_decode_paged`, which takes the block size as a parameter) for a batch of 8 whose block
+tables point at shuffled pages, the block sizes interleaved in rotating order every round. The
+results and their reading are in `benchmarks/results/day42-block-size.md`.
+
+16 stays the default: the engine's fast batched decode kernel is written for 16-token pages, and
+the sweep shows what 8 or 32 would change against it (waste, capacity, attention time and how much
+of a prefix can be shared, which is whole blocks only).
 
 ## Compute Sanitizer (Day 41)
 
