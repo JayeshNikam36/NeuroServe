@@ -353,7 +353,9 @@ protected:
         CudaLlmEngineConfig config;
         config.model_dir = model_dir;
         config.model_name = "llama-3.2-1b-instruct";
-        config.num_pages = 512;
+        config.num_pages = 1024;          // 16 requests of 520 + 32 tokens without the cache: 560 pages
+        config.max_prompt_tokens = 640;   // a 512-token system prompt and a user turn
+        config.max_batch = 16;
         config.prefix_caching = true;
         backend_ = std::make_unique<CudaLlmEngineBackend>(config);
     }
@@ -461,3 +463,92 @@ TEST_F(CudaPrefixCacheTest, CopyOnWriteKeepsBothRequestsCorrect) {
     const auto kv = backend_->kv_stats();
     EXPECT_EQ(kv.free_pages, kv.total_pages) << "KV pages leaked";
 }
+
+// The shared-prefix end-to-end test (Day 36, KV-007): 16 requests with the same 512-token system
+// prompt and their own user turns. Run once without the cache and once with it, on one backend,
+// with every step shaped the same (all 16 prefilled, then decoded together in one batch of 16), so
+// that the cache is the only difference (outputs are deterministic but not batch-invariant,
+// ADR-0006). The outputs must be identical; the hit rate and the reused tokens are reported.
+TEST_F(CudaPrefixCacheTest, SixteenRequestsWithA512TokenSystemPromptMatchTheNoCacheRun) {
+    constexpr int kRequests = 16;
+    constexpr std::size_t kNewTokens = 32;
+    std::vector<TokenId> system = prompts_.at(0);  // the chat header, then a long instruction
+    for (TokenId t = 0; system.size() < 512; ++t) {
+        system.push_back(1000 + (t * 37) % 20000);
+    }
+    std::vector<std::vector<TokenId>> prompts;
+    for (int r = 0; r < kRequests; ++r) {
+        std::vector<TokenId> p = system;
+        for (int i = 0; i < 8; ++i) {
+            p.push_back(30000 + r * 100 + i);  // the request's own user turn
+        }
+        prompts.push_back(std::move(p));
+    }
+
+    // All 16 prefilled in order, then decoded together; returns each request's tokens and sets
+    // `reused` to the prompt tokens taken from the cache.
+    auto run = [&](bool cache, std::int64_t& reused) {
+        backend_->set_prefix_caching(cache);
+        const std::int64_t hits_before = backend_->kv_stats().prefix_hit_pages;
+        std::vector<SeqId> ids;
+        std::vector<std::vector<TokenId>> out(kRequests);
+        for (int r = 0; r < kRequests; ++r) {
+            ids.push_back(backend_->create_sequence());
+            out[static_cast<std::size_t>(r)].push_back(backend_->prefill(ids.back(), prompts[static_cast<std::size_t>(r)]));
+        }
+        reused = (backend_->kv_stats().prefix_hit_pages - hits_before) * 16;
+        while (out[0].size() < kNewTokens) {  // one batch of 16, every step
+            std::vector<TokenId> last;
+            for (const auto& o : out) {
+                last.push_back(o.back());
+            }
+            const std::vector<TokenId> next = backend_->decode_step(ids, last);
+            for (int r = 0; r < kRequests; ++r) {
+                out[static_cast<std::size_t>(r)].push_back(next.at(static_cast<std::size_t>(r)));
+            }
+        }
+        backend_->check_kv_invariants();
+        for (const SeqId id : ids) {
+            backend_->free_sequence(id);
+        }
+        const auto kv = backend_->kv_stats();
+        EXPECT_EQ(kv.free_pages, kv.total_pages) << "KV pages leaked";
+        return out;
+    };
+
+    std::int64_t reused_without = 0;
+    std::int64_t reused_with = 0;
+    const auto start = backend_->kv_stats();
+    const auto without = run(false, reused_without);
+    const auto mid = backend_->kv_stats();
+    const auto with = run(true, reused_with);
+    const auto end = backend_->kv_stats();
+    backend_->set_prefix_caching(true);
+
+    EXPECT_EQ(reused_without, 0);
+    EXPECT_EQ(mid.prefix_lookups, start.prefix_lookups) << "no lookups with the cache off";
+    const std::int64_t lookup_pages = end.prefix_lookup_pages - mid.prefix_lookup_pages;
+    const std::int64_t hit_pages = end.prefix_hit_pages - mid.prefix_hit_pages;
+    EXPECT_EQ(end.prefix_lookups - mid.prefix_lookups, kRequests);
+    EXPECT_EQ(hit_pages, (kRequests - 1) * 32) << "every request after the first reuses the 32 system pages";
+    EXPECT_EQ(reused_with, (kRequests - 1) * 512);
+    const std::int64_t prompt_tokens = kRequests * static_cast<std::int64_t>(prompts[0].size());
+    std::cout << "shared prefix: " << kRequests << " requests x " << prompts[0].size() << " prompt tokens; hit rate "
+              << hit_pages << "/" << lookup_pages << " full pages ("
+              << (lookup_pages > 0 ? 100.0 * static_cast<double>(hit_pages) / static_cast<double>(lookup_pages) : 0.0)
+              << "%); " << reused_with << " of " << prompt_tokens << " prompt tokens reused, "
+              << prompt_tokens - reused_with << " prefilled\n";
+
+    int differing = 0;
+    for (int r = 0; r < kRequests; ++r) {
+        const auto& a = without[static_cast<std::size_t>(r)];
+        const auto& b = with[static_cast<std::size_t>(r)];
+        if (a != b) {
+            ++differing;
+            const auto first = std::mismatch(a.begin(), a.end(), b.begin()).first - a.begin();
+            ADD_FAILURE() << "request " << r << ": first difference at generated token " << first << " of " << a.size();
+        }
+    }
+    std::cout << "outputs identical to the no-cache run: " << kRequests - differing << "/" << kRequests << "\n";
+}
+

@@ -85,6 +85,7 @@ struct CudaLlmEngineBackend::Impl {
     bool batch_allocated = false;
     std::unordered_map<SeqId, ::Sequence> sequences;
     std::unordered_map<SeqId, std::vector<TokenId>> tokens;  // with prefix caching: each sequence's tokens
+    bool prefix_caching = false;
     SeqId next_id = 1;
 
     ~Impl() { release(); }
@@ -183,7 +184,8 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     // the manager has already given to another sequence.
     impl_->cache->alloc.free_list.clear();
     impl_->kv.emplace(core::KvBlockConfig{config.num_pages, config.page_size_tokens, config.max_pages_per_sequence},
-                      config.prefix_caching ? std::optional(impl_->hasher->identity()) : std::nullopt);
+                      impl_->hasher->identity());  // the index is there; prefix_caching decides if it is used
+    impl_->prefix_caching = config.prefix_caching;
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
 
@@ -203,6 +205,15 @@ CudaLlmEngineBackend::~CudaLlmEngineBackend() = default;
 std::string_view CudaLlmEngineBackend::name() const noexcept { return "cuda-llm-engine"; }
 
 const ModelInfo& CudaLlmEngineBackend::model_info() const noexcept { return impl_->info; }
+
+void CudaLlmEngineBackend::set_prefix_caching(bool on) {
+    if (!impl_->sequences.empty()) {
+        throw std::logic_error("set_prefix_caching: only with no live sequences");
+    }
+    impl_->prefix_caching = on;
+}
+
+bool CudaLlmEngineBackend::prefix_caching() const noexcept { return impl_->prefix_caching; }
 
 const core::KvCacheIdentity& CudaLlmEngineBackend::kv_identity() const noexcept {
     return impl_->hasher->identity();
@@ -249,7 +260,7 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
     }
     const std::vector<int> ids(prompt.begin(), prompt.end());
     int cached = 0;
-    if (im.kv->prefix_caching()) {
+    if (im.prefix_caching) {
         const core::Admission a = im.kv->admit(id, prompt);  // reuses indexed full pages, takes the rest;
                                                              // throws, changing nothing, if pages run out
         cached = a.cached_tokens;
@@ -274,7 +285,7 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
         backend_detail::model_prefill_from(im.model, *im.cache, seq, ids, cached, logits);
     }
     im.check_in_sync(id, seq);
-    if (im.kv->prefix_caching()) {
+    if (im.prefix_caching) {
         std::vector<TokenId>& held = im.tokens[id];
         held.assign(prompt.begin(), prompt.end());
         im.kv->commit(id, held);  // the prompt's full pages are written: index them
@@ -332,7 +343,7 @@ std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> id
     model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         im.check_in_sync(ids[i], *seqs[i]);
-        if (im.kv->prefix_caching()) {
+        if (im.prefix_caching) {
             std::vector<TokenId>& held = im.tokens[ids[i]];
             held.push_back(tokens[i]);
             im.kv->commit(ids[i], held);  // indexes the page this token filled, if any
@@ -392,7 +403,7 @@ void CudaLlmEngineBackend::share_prefix(SeqId dst, SeqId src, int pages) {
     im.sync_pages(dst, to);
     to.len = pages * im.config.page_size_tokens;  // the shared positions are cached: decode continues after them
     im.check_in_sync(dst, to);
-    if (im.kv->prefix_caching()) {
+    if (im.prefix_caching) {
         const std::vector<TokenId>& from = im.tokens[src];
         im.tokens[dst].assign(from.begin(), from.begin() + std::min<std::ptrdiff_t>(to.len, static_cast<std::ptrdiff_t>(from.size())));
     }
