@@ -21,7 +21,7 @@ struct KvBlockConfig {
 
 struct KvBlockStats {
     int total_blocks = 0;
-    int free_blocks = 0;    // reference count 0
+    int free_blocks = 0;    // reference count 0: FREE or CACHED (a CACHED block is reclaimed on demand)
     int used_blocks = 0;    // reference count >= 1
     int shared_blocks = 0;  // reference count >= 2
     int sequences = 0;
@@ -32,6 +32,8 @@ struct KvBlockStats {
     std::int64_t prefix_lookup_blocks = 0;  // full prompt blocks they could have reused
     std::int64_t prefix_hit_blocks = 0;   // of those, the blocks they did reuse
     std::int64_t copied_blocks = 0;       // hits copied, not shared (copy-on-write)
+    int cached_blocks = 0;                // CACHED: indexed, reference count 0, reusable or evictable
+    std::int64_t evicted_blocks = 0;      // CACHED blocks reclaimed (LRU) or dropped (evict_cached)
 };
 
 // A block whose K/V the caller must copy before the first write: `to` is the private copy now in
@@ -61,6 +63,11 @@ public:
 // - A sequence's block table lists its blocks in logical order: position p is in
 //   table[p / block_size], slot p % block_size. It has exactly ceil(length / block_size) entries.
 // - New blocks are taken lowest id first, so the same operations give the same tables everywhere.
+//   With prefix caching, a released indexed block is kept as CACHED (still indexed, reusable by a
+//   later admit) instead of FREE; a new block is then a FREE one, lowest id first, or, when none is
+//   free, the least recently released CACHED one, evicted (unindexed) on the spot. Blocks are
+//   released last block of the table first, so a block is never older in the LRU than a cached
+//   block after it in a chain: eviction takes leaves first and never orphans a cached block.
 // - A block's reference count is the number of tables that list it; at 0 it is free.
 // - Only full blocks are shared (share_prefix), so a shared block is never written again.
 // - Every operation either succeeds or throws and leaves the state unchanged.
@@ -102,7 +109,7 @@ public:
     virtual std::vector<BlockId> table(SeqId seq) const = 0;
     virtual int length(SeqId seq) const = 0;      // tokens (positions) the sequence holds
     virtual int ref_count(BlockId block) const = 0;
-    virtual int free_blocks() const = 0;
+    virtual int free_blocks() const = 0;  // reference count 0: FREE + CACHED
     virtual KvBlockStats stats() const = 0;
 
     // ---- Prefix caching (docs/kv-cache.md, "Prefix caching"). Without a KvCacheIdentity,
@@ -136,6 +143,10 @@ public:
 
     // Whether the block is in the prefix index. std::invalid_argument outside the pool.
     virtual bool indexed(BlockId block) const = 0;
+
+    // Evicts every CACHED block (returns how many): what is cached is forgotten, nothing live
+    // changes. Without prefix caching there is nothing cached and it returns 0.
+    virtual int evict_cached() = 0;
 
     // Checks every invariant this implementation can see; KvInvariantViolation names the first
     // one broken, with the block or sequence and both sides of the equation.

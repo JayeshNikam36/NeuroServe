@@ -103,10 +103,8 @@ void ReferenceBlockManager::append(SeqId seq, int tokens) {
         throw KvCacheExhausted("append: " + seq_name(seq) + " needs " + std::to_string(needed) + " blocks, " +
                                std::to_string(free_blocks()) + " free");
     }
-    for (int i = 0; i < needed; ++i) {  // lowest free id first; checked above, so this cannot fail
-        const auto block = static_cast<BlockId>(std::find(refs_.begin(), refs_.end(), 0) - refs_.begin());
-        refs_[static_cast<std::size_t>(block)] = 1;
-        s.table.push_back(block);
+    for (int i = 0; i < needed; ++i) {  // checked above, so this cannot fail
+        s.table.push_back(take_block());
     }
     s.length += tokens;
 }
@@ -138,12 +136,45 @@ void ReferenceBlockManager::share_prefix(SeqId dst, SeqId src, int blocks) {
 
 void ReferenceBlockManager::release(SeqId seq) {
     const Sequence& s = get(seq);
-    for (const BlockId block : s.table) {
-        if (--refs_[static_cast<std::size_t>(block)] == 0) {
-            records_[static_cast<std::size_t>(block)] = Record{};  // free again: unindexed
+    for (std::size_t i = s.table.size(); i-- > 0;) {  // last block first
+        const auto b = static_cast<std::size_t>(s.table[i]);
+        if (--refs_[b] == 0 && records_[b].indexed) {
+            records_[b].released_at = ++release_clock_;  // CACHED
         }
     }
     sequences_.erase(seq);
+}
+
+BlockId ReferenceBlockManager::take_block(BlockId keep) {
+    for (std::size_t b = 0; b < refs_.size(); ++b) {  // a FREE block, lowest id first
+        if (refs_[b] == 0 && !records_[b].indexed) {
+            refs_[b] = 1;
+            return static_cast<BlockId>(b);
+        }
+    }
+    std::size_t oldest = refs_.size();  // none: the least recently released CACHED block
+    for (std::size_t b = 0; b < refs_.size(); ++b) {
+        if (refs_[b] == 0 && records_[b].indexed && static_cast<BlockId>(b) != keep &&
+            (oldest == refs_.size() || records_[b].released_at < records_[oldest].released_at)) {
+            oldest = b;
+        }
+    }
+    records_[oldest] = Record{};  // evicted: unindexed
+    ++evicted_blocks_;
+    refs_[oldest] = 1;
+    return static_cast<BlockId>(oldest);
+}
+
+int ReferenceBlockManager::evict_cached() {
+    int n = 0;
+    for (std::size_t b = 0; b < refs_.size(); ++b) {
+        if (refs_[b] == 0 && records_[b].indexed) {
+            records_[b] = Record{};
+            ++n;
+        }
+    }
+    evicted_blocks_ += n;
+    return n;
 }
 
 Admission ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> prompt) {
@@ -168,18 +199,22 @@ Admission ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> promp
         throw std::length_error("admit: " + seq_name(seq) + " would need " + std::to_string(total) +
                                 " blocks, the limit is " + std::to_string(config_.max_blocks_per_sequence));
     }
-    if (needed > free_blocks()) {
-        throw KvCacheExhausted("admit: " + seq_name(seq) + " needs " + std::to_string(needed) + " blocks, " +
-                               std::to_string(free_blocks()) + " free");
-    }
+    // Reused CACHED blocks, and a CACHED copy source, cannot also be evicted to make room.
+    int pinned = 0;
     for (const BlockId block : hits) {
+        pinned += refs_[static_cast<std::size_t>(block)] == 0;
+    }
+    pinned += copied && refs_[static_cast<std::size_t>(*copied)] == 0;
+    if (needed > free_blocks() - pinned) {
+        throw KvCacheExhausted("admit: " + seq_name(seq) + " needs " + std::to_string(needed) + " blocks, " +
+                               std::to_string(free_blocks() - pinned) + " free");
+    }
+    for (const BlockId block : hits) {  // a CACHED one is revived: count 1, OWNED again
         ++refs_[static_cast<std::size_t>(block)];
         s.table.push_back(block);
     }
     for (int i = 0; i < needed; ++i) {
-        const auto block = static_cast<BlockId>(std::find(refs_.begin(), refs_.end(), 0) - refs_.begin());
-        refs_[static_cast<std::size_t>(block)] = 1;
-        s.table.push_back(block);
+        s.table.push_back(take_block(copied ? *copied : -1));
     }
     s.length = static_cast<int>(prompt.size());
     ++lookups_;
@@ -280,6 +315,10 @@ KvBlockStats ReferenceBlockManager::stats() const {
     out.prefix_lookup_blocks = lookup_blocks_;
     out.prefix_hit_blocks = hit_blocks_;
     out.copied_blocks = copied_blocks_;
+    for (std::size_t b = 0; b < refs_.size(); ++b) {
+        out.cached_blocks += refs_[b] == 0 && records_[b].indexed;
+    }
+    out.evicted_blocks = evicted_blocks_;
     return out;
 }
 
@@ -330,9 +369,14 @@ void ReferenceBlockManager::check_invariants() const {
         if (!r.indexed) {
             continue;
         }
-        if (refs_[b] == 0 || written_after[b]) {  // I7
-            throw KvInvariantViolation("I7: block " + std::to_string(b) + " is indexed but " +
-                                       (refs_[b] == 0 ? "free" : "not full in every table"));
+        if (written_after[b]) {  // I7
+            throw KvInvariantViolation("I7: block " + std::to_string(b) + " is indexed but not full in every table");
+        }
+        if (refs_[b] == 0 && r.parent >= 0 && r.parent < config_.num_blocks &&
+            refs_[static_cast<std::size_t>(r.parent)] == 0 &&
+            records_[static_cast<std::size_t>(r.parent)].released_at < r.released_at) {  // I10
+            throw KvInvariantViolation("I10: cached block " + std::to_string(b) + " is newer in the LRU queue than its parent " +
+                                       std::to_string(r.parent));
         }
         for (std::size_t o = 0; o < b; ++o) {
             if (records_[o].indexed && records_[o].hash == r.hash) {  // I7

@@ -35,6 +35,7 @@ public:
     int commit(SeqId seq, std::span<const TokenId> tokens) override;
     int match(std::span<const TokenId> prompt) const override;
     bool indexed(BlockId block) const override;
+    int evict_cached() override;
     void check_invariants() const override;
 
 private:
@@ -43,6 +44,7 @@ private:
         BlockHash hash = 0;
         BlockId parent = -1;  // the block before it in the table that indexed it; -1 for the first
         std::vector<TokenId> tokens;
+        std::uint64_t released_at = 0;  // CACHED (indexed, count 0): when it was released
     };
     struct Sequence {
         std::vector<BlockId> table;
@@ -54,6 +56,7 @@ private:
     int blocks_for(long long tokens) const;
     const PrefixHasher& hasher(const char* op) const;
     std::vector<BlockId> walk(std::span<const TokenId> prompt) const;  // the blocks admit() would reuse
+    BlockId take_block(BlockId keep = -1);  // a FREE block, lowest id; else evicts the oldest CACHED
 
     KvBlockConfig config_;
     std::vector<int> refs_;               // reference count per block
@@ -64,6 +67,8 @@ private:
     std::int64_t lookup_blocks_ = 0;
     std::int64_t hit_blocks_ = 0;
     std::int64_t copied_blocks_ = 0;
+    std::uint64_t release_clock_ = 0;
+    std::int64_t evicted_blocks_ = 0;
 };
 
 }  // namespace neuroserve::core

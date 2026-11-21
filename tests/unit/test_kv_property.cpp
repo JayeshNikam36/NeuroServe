@@ -67,6 +67,7 @@ public:
     int commit(neuroserve::SeqId s, std::span<const neuroserve::TokenId> t) override { return inner_.commit(s, t); }
     int match(std::span<const neuroserve::TokenId> p) const override { return inner_.match(p); }
     bool indexed(neuroserve::core::BlockId b) const override { return inner_.indexed(b); }
+    int evict_cached() override { return inner_.evict_cached(); }
     void check_invariants() const override { inner_.check_invariants(); }
 
 private:

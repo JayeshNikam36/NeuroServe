@@ -152,7 +152,7 @@ class FakeEngine:
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64,
                 "shared_pages": 0, "indexed_pages": 0, "prefix_lookups": 0, "prefix_lookup_pages": 0,
-                "prefix_hit_pages": 0}
+                "prefix_hit_pages": 0, "cached_pages": 0, "evicted_pages": 0}
 
     def stats(self):
         return {"submitted": len(self.calls), "completed": len(self.calls), "pending": 0, "active": 0,

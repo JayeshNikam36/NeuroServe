@@ -79,7 +79,7 @@ TEST(KvInvariants, AnOffByOneReferenceCountIsNamed) {
 TEST(KvInvariants, AFreedBlockStillInUseIsNamed) {
     auto m = two_sharers();
     Peer::put_in_free_set(*m, 0);  // a double free: block 0 is free and still in two tables
-    expect_violation(*m, {"I1", "block 0", "reference count 2", "but is in the free set"});
+    expect_violation(*m, {"I1", "block 0", "reference count 2", "is in the free set"});
 }
 
 TEST(KvInvariants, ALostBlockIsNamed) {

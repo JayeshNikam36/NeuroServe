@@ -151,7 +151,7 @@ TEST_P(KvPrefixIndex, LookupStopsAtTheFirstMiss) {
     EXPECT_EQ(kv->stats().indexed_blocks, 4 + 3) << "its own blocks 1..3 are a different prefix";
 }
 
-TEST_P(KvPrefixIndex, IndexedBlocksStayWhileAnyHolderRemainsAndGoWithTheLast) {
+TEST_P(KvPrefixIndex, IndexedBlocksOutliveTheirLastHolderAsCached) {
     auto kv = make(16);
     admit_and_commit(*kv, 1, prompt(64, 1, 4));
     admit_and_commit(*kv, 2, prompt(64, 2, 4));
@@ -163,9 +163,18 @@ TEST_P(KvPrefixIndex, IndexedBlocksStayWhileAnyHolderRemainsAndGoWithTheLast) {
     kv->release(2);
     kv->release(3);
     kv->check_invariants();
-    EXPECT_EQ(kv->stats().indexed_blocks, 0) << "free again: no longer indexed (CACHED comes on Day 37)";
-    EXPECT_EQ(kv->free_blocks(), 16);
-    EXPECT_EQ(kv->match(prompt(64, 4, 4)), 0);
+    auto s = kv->stats();
+    EXPECT_EQ(s.indexed_blocks, 4) << "CACHED (Day 37): still indexed with no holder";
+    EXPECT_EQ(s.cached_blocks, 4);
+    EXPECT_EQ(kv->free_blocks(), 16) << "a CACHED block counts as free: it is reclaimed on demand";
+    EXPECT_EQ(s.used_blocks, 0);
+    EXPECT_EQ(kv->match(prompt(64, 4, 4)), 4) << "a later request with the same system prompt can reuse them";
+    EXPECT_EQ(admit_and_commit(*kv, 4, prompt(64, 4, 4)), 64);
+    s = kv->stats();
+    EXPECT_EQ(s.cached_blocks, 0) << "reused: OWNED again";
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(kv->ref_count(kv->table(4)[static_cast<std::size_t>(i)]), 1);
+    }
 }
 
 TEST_P(KvPrefixIndex, CommitIndexesEachBlockOnceAsItFills) {
@@ -191,17 +200,97 @@ TEST_P(KvPrefixIndex, CommitIndexesEachBlockOnceAsItFills) {
 TEST_P(KvPrefixIndex, ADuplicateIsIndexedOnceTheOriginalIsGone) {
     auto kv = make(16);
     const auto p = prompt(32);
-    admit_and_commit(*kv, 1, p);  // blocks A0, A1 indexed
-    admit_and_commit(*kv, 2, p);  // reuses A0; its own block 1 duplicates A1
-    const BlockId own = kv->table(2)[1];
-    EXPECT_FALSE(kv->indexed(own));
-    kv->release(1);  // A1 is freed and unindexed; A0 stays (sequence 2 holds it)
-    EXPECT_EQ(kv->commit(2, p), 1) << "the retry indexes sequence 2's copy";
-    EXPECT_TRUE(kv->indexed(own));
+    auto with_tail = p;
+    with_tail.push_back(5);
+    admit_and_commit(*kv, 1, with_tail);  // blocks A0, A1 indexed
+    auto other = p;
+    other[20] = 9;  // block 1 differs from A1
+    admit_and_commit(*kv, 2, other);      // reuses A0, its own block 1
+    kv->release(2);
+    kv->create(3);
+    kv->append(3, 32);                    // no admit: a sequence that computed the same 32 tokens
+    EXPECT_EQ(kv->commit(3, p), 0) << "A0 holds that prefix: a duplicate, not indexed";
+    kv->release(1);                       // A0 and A1 are CACHED, still holding the prefix
+    EXPECT_EQ(kv->commit(3, p), 0);
+    EXPECT_EQ(kv->evict_cached(), 3) << "A0, A1 and sequence 2's block 1";
+    EXPECT_EQ(kv->commit(3, p), 2) << "the retry indexes sequence 3's copies";
     kv->check_invariants();
-    auto longer = p;
-    longer.push_back(5);
-    EXPECT_EQ(kv->match(longer), 2);
+    EXPECT_EQ(kv->match(with_tail), 2);
+}
+
+TEST_P(KvPrefixIndex, EvictionTakesTheLeastRecentlyReleasedFirstLeavesFirst) {
+    auto kv = make(6);
+    const auto a = prompt(48, 0, 1);       // 4 blocks, 3 indexed
+    std::vector<TokenId> b(33, 7);         // 3 blocks, 2 indexed
+    admit_and_commit(*kv, 1, a);
+    kv->release(1);                        // released first: A2, A1, A0 (leaves first)
+    admit_and_commit(*kv, 2, b);           // takes FREE blocks only
+    kv->release(2);
+    EXPECT_EQ(kv->stats().cached_blocks, 5);
+    EXPECT_EQ(kv->stats().evicted_blocks, 0);
+
+    // 6 blocks, 5 CACHED, 1 FREE: a 3-block request takes the FREE one and evicts the two oldest.
+    kv->create(3);
+    kv->append(3, 40);
+    kv->check_invariants();
+    auto s = kv->stats();
+    EXPECT_EQ(s.evicted_blocks, 2);
+    EXPECT_EQ(kv->match(a), 1) << "A's last two blocks went first; A0, released after them, stays";
+    EXPECT_EQ(kv->match(b), 2) << "B, released later, is untouched";
+
+    kv->release(3);
+    kv->create(4);
+    EXPECT_THROW(kv->append(4, 7 * 16), KvCacheExhausted) << "7 blocks: more than the pool";
+    kv->append(4, 6 * 16);                 // the whole pool: every CACHED block is evicted
+    EXPECT_EQ(kv->stats().cached_blocks, 0);
+    EXPECT_EQ(kv->stats().indexed_blocks, 0);
+    EXPECT_EQ(kv->match(b), 0);
+    kv->check_invariants();
+}
+
+TEST_P(KvPrefixIndex, OnlyUnreferencedBlocksAreEvicted) {
+    auto kv = make(4);
+    admit_and_commit(*kv, 1, prompt(32, 0, 1));  // 3 blocks, held
+    admit_and_commit(*kv, 2, std::vector<TokenId>(16, 3));  // 1 block, indexed
+    kv->release(2);                              // 1 CACHED
+    kv->create(3);
+    EXPECT_THROW(kv->append(3, 32), KvCacheExhausted) << "1 reclaimable block, 2 needed";
+    EXPECT_EQ(kv->stats().cached_blocks, 1) << "a failed allocation evicts nothing";
+    kv->append(3, 16);                           // evicts the CACHED block, never an OWNED one
+    EXPECT_EQ(kv->stats().evicted_blocks, 1);
+    EXPECT_EQ(kv->match(prompt(32, 0, 1)), 2) << "the held blocks are untouched";
+    kv->check_invariants();
+}
+
+TEST_P(KvPrefixIndex, ACopysSourceIsNotEvictedToMakeItsCopy) {
+    auto kv = make(3);
+    const auto p = prompt(32);                   // 2 full blocks
+    admit_and_commit(*kv, 1, p);
+    kv->release(1);                              // CACHED: block 1 oldest, then block 0
+    admit_and_commit(*kv, 2, std::vector<TokenId>(16, 3));
+    kv->release(2);                              // CACHED, newest
+    kv->create(3);
+    const auto a = kv->admit(3, p);              // revives block 0; copies block 1 into a new block
+    ASSERT_TRUE(a.copy.has_value());
+    EXPECT_EQ(a.cached_tokens, 31);
+    EXPECT_NE(a.copy->to, a.copy->from) << "the oldest CACHED block is the source: the newest was evicted instead";
+    EXPECT_TRUE(kv->indexed(a.copy->from)) << "the source is still there to copy from";
+    EXPECT_EQ(kv->ref_count(a.copy->from), 0);
+    EXPECT_EQ(kv->stats().evicted_blocks, 1);
+    kv->check_invariants();
+}
+
+TEST_P(KvPrefixIndex, EvictCachedForgetsOnlyWhatIsCached) {
+    auto kv = make(8);
+    admit_and_commit(*kv, 1, prompt(32, 0, 1));
+    admit_and_commit(*kv, 2, std::vector<TokenId>(33, 4));
+    kv->release(2);
+    EXPECT_EQ(kv->evict_cached(), 2);
+    EXPECT_EQ(kv->stats().cached_blocks, 0);
+    EXPECT_EQ(kv->stats().indexed_blocks, 2) << "sequence 1's blocks are held, so they stay";
+    EXPECT_EQ(kv->match(std::vector<TokenId>(33, 4)), 0);
+    EXPECT_EQ(kv->evict_cached(), 0);
+    kv->check_invariants();
 }
 
 TEST_P(KvPrefixIndex, AdmitIsAllOrNothing) {

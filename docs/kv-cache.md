@@ -21,6 +21,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 34 | Prefill from a cached offset: `attention_prefill_paged` (causal attention over the cached prefix through the block table) and `model_prefill_from` in the CUDA backend; `prefix_caching` in `CudaLlmEngineConfig` and `neuroserve.Engine` (off by default until Day 36); GPU test: the Hugging Face chat references match with and without a prefix hit | done |
 | 35 | Copy-on-write: `admit` reuses the page holding the last prompt token as a private copy (`Admission.copy`), the CUDA backend copies its K/V (`copy_page`) and the prefill computes one token; both implementations, property tests; GPU test: the copy's request and the holder both match Hugging Face | done |
 | 36 | The shared-prefix end-to-end test: 16 requests with a 512-token system prompt, run without and with the cache on one backend in identically shaped batches; outputs identical, hit rate and reused tokens reported; `set_prefix_caching` on the CUDA backend | done |
+| 37 | `CACHED` blocks and LRU eviction: released indexed blocks stay reusable, a new block is a FREE one or the least recently released CACHED one, released leaves first; `evict_cached`; I1, I2 and I10 checked; both implementations, property tests; GPU: a finished request's pages reused, evicted oldest first under pressure, outputs equal Hugging Face | done |
 
 ## Today (v0.1)
 
@@ -311,9 +312,8 @@ compared on it operation by operation (the property tests now admit, commit and 
   original is freed.
 - **Counted:** lookups, the blocks they could have reused (`prefix_lookup_pages`) and the hits
   (`prefix_hit_pages`), in `KvCacheStats` and `/health`. The hit rate is hits ÷ lookup pages.
-- **Not yet:** an indexed block is freed and unindexed with its last holder. Reusing blocks of
-  requests that have finished needs the `CACHED` state and eviction (Day 37), so today a hit needs
-  a live request with the same prefix.
+- **Day 33 freed an indexed block with its last holder,** so a hit needed a live request with the
+  same prefix. Since Day 37 it stays `CACHED` (below).
 - **Where it runs today:** the engine tests run a prefix-caching backend (`FakeBackend` on the
   real manager) through the engine loop, with every step's invariant checks on. The CUDA backend
   keeps prefix caching off, and its counters read 0, until its prefill can start at a cached offset
@@ -408,6 +408,30 @@ holding the last prompt token, whose logits the prefill must compute.
 - LRU is the baseline. A cost-aware policy (reuse frequency × recompute cost) is a later
   experiment, measured against it.
 
+**Implemented (Day 37)** in the `KvBlockManager` contract, reference and manager, compared by the
+property tests (10,000 programs, invariants checked after every operation).
+
+- **Release:** a block whose count reaches 0 becomes `CACHED` if it is indexed (still in the
+  index, reusable by `admit`), `FREE` otherwise. A table is released last block first.
+- **Allocation:** a `FREE` block, lowest id first; if none is free, the least recently released
+  `CACHED` block, evicted (unindexed) on the spot. A request is deferred only when neither is left.
+- **Leaves first.** Every table that lists a block lists its parent before it, and a table is
+  released from the end, so a cached block is never older in the LRU queue than a cached block
+  after it in a chain. Eviction then takes leaves first and never orphans a cached block. I10
+  checks this ordering.
+- **A hit on a `CACHED` block revives it** (`OWNED`, out of the LRU queue). Revived hits, and a
+  `CACHED` copy-on-write source, are pinned during the admission: they cannot be evicted to make
+  room for the same request.
+- **`free_blocks` counts `FREE + CACHED`:** a cached block is reclaimable on demand, so admission
+  and the scheduler see it as free. `/health` shows `cached_pages` and `evicted_pages`.
+- **`evict_cached`** forgets every `CACHED` block (the CUDA backend's `evict_cached_pages`, also
+  run by `set_prefix_caching`).
+- **Tested on the GPU:** a finished chat request's pages are reused by the next one; 27 prompts of
+  640 tokens then overfill the 1,024-page pool, the oldest pages go first, and the chat references
+  still equal Hugging Face before and after.
+- **The server keeps prefix caching off** until preemption by recompute (Day 38), which changes how
+  preempted requests come back and is the last change to how pages are released.
+
 ## Preemption (Day 38)
 
 Today a preempted request restarts from its prompt and regenerates its tokens. ADR-0006 showed this
@@ -492,6 +516,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 34 | With a prefix hit, the chat references still equal Hugging Face's greedy tokens, case by case, at batch size 1; an identical prompt reusing all but its last page too | prefill from a cached offset |
 | 35 | An identical whole-page prompt copies its last page and prefills one token; the copy needs a free block or nothing changes; both requests match Hugging Face | copy-on-write |
 | 36 | 16 requests, one 512-token system prompt: outputs identical to the no-cache run in identically shaped batches; hit rate and reused tokens reported | shared prefix end to end |
+| 37 | Released indexed blocks stay CACHED and are reused; eviction takes the least recently released first, leaves first, only count-0 blocks; a copy's source is not evicted for its copy; outputs stay equal to Hugging Face under memory pressure | CACHED and LRU eviction |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

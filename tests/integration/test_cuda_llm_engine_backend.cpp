@@ -366,6 +366,7 @@ protected:
         if (!backend_) {
             GTEST_SKIP() << skip_reason_;
         }
+        backend_->evict_cached_pages();  // each test starts from an empty cache (CACHED pages, Day 37)
     }
 
     // Greedy generation at batch size 1; `hit_pages` gets how many pages its prefill reused.
@@ -395,8 +396,9 @@ TEST_F(CudaPrefixCacheTest, PrefixHitsReproduceHuggingFaceExactly) {
     std::int64_t total_hits = 0;
     for (std::size_t c = 0; c < prompts_.size(); ++c) {
         std::int64_t hits = 0;
+        backend_->evict_cached_pages();  // nothing to reuse: the earlier cases' pages are CACHED
         EXPECT_EQ(generate(prompts_[c], greedy_[c].size(), hits), greedy_[c]) << "case " << c << " without a hit";
-        EXPECT_EQ(hits, 0) << "nothing was live to reuse";
+        EXPECT_EQ(hits, 0) << "nothing to reuse";
 
         // A holder keeps case 0's pages (the shared system header) live; it is never decoded.
         const SeqId holder = backend_->create_sequence();
@@ -412,7 +414,7 @@ TEST_F(CudaPrefixCacheTest, PrefixHitsReproduceHuggingFaceExactly) {
     EXPECT_GT(total_hits, 0) << "no case shared a full page with the holder: nothing was tested";
     const auto kv = backend_->kv_stats();
     EXPECT_EQ(kv.free_pages, kv.total_pages) << "KV pages leaked";
-    EXPECT_EQ(kv.indexed_pages, 0) << "freed pages are unindexed";
+    EXPECT_EQ(kv.indexed_pages, kv.cached_pages) << "released pages stay indexed as CACHED, nothing else";
 }
 
 TEST_F(CudaPrefixCacheTest, AnIdenticalPromptReusesEveryPageButTheLastAndMatches) {
@@ -550,5 +552,41 @@ TEST_F(CudaPrefixCacheTest, SixteenRequestsWithA512TokenSystemPromptMatchTheNoCa
         }
     }
     std::cout << "outputs identical to the no-cache run: " << kRequests - differing << "/" << kRequests << "\n";
+}
+
+// CACHED pages and LRU eviction (Day 37, KV-008): a request's pages outlive it and are reused by a
+// later request with no overlap in time; under memory pressure the least recently released pages
+// are evicted first, their pages rewritten by other requests, and outputs stay equal to Hugging Face.
+TEST_F(CudaPrefixCacheTest, CachedPagesAreReusedAfterTheirRequestAndEvictedOldestFirst) {
+    std::int64_t hits = 0;
+    EXPECT_EQ(generate(prompts_.at(0), greedy_.at(0).size(), hits), greedy_.at(0));
+    EXPECT_EQ(hits, 0);
+    EXPECT_GT(backend_->kv_stats().cached_pages, 0) << "its pages stay CACHED";
+    EXPECT_EQ(generate(prompts_.at(1), greedy_.at(1).size(), hits), greedy_.at(1));
+    EXPECT_GT(hits, 0) << "case 1 reuses case 0's system header pages, although case 0 has finished";
+
+    // Fill the pool with other prompts: once no page is FREE, each new page evicts the least
+    // recently released CACHED one, cases 0 and 1 first.
+    const std::int64_t evicted_before = backend_->kv_stats().evicted_pages;
+    for (int f = 0; f < 27; ++f) {  // 27 x 40 pages > 1024
+        std::vector<TokenId> filler;
+        for (int i = 0; i < 640; ++i) {
+            filler.push_back(2000 + f * 700 + i);
+        }
+        const SeqId id = backend_->create_sequence();
+        backend_->prefill(id, filler);
+        backend_->free_sequence(id);
+    }
+    const auto kv = backend_->kv_stats();
+    std::cout << "evicted " << kv.evicted_pages - evicted_before << " pages; " << kv.cached_pages
+              << " cached, " << kv.free_pages << " of " << kv.total_pages << " reclaimable\n";
+    EXPECT_GT(kv.evicted_pages, evicted_before);
+    backend_->check_kv_invariants();
+
+    EXPECT_EQ(generate(prompts_.at(0), greedy_.at(0).size(), hits), greedy_.at(0)) << "after its pages were evicted";
+    EXPECT_EQ(hits, 0) << "the oldest pages were evicted first";
+    EXPECT_EQ(generate(prompts_.at(0), greedy_.at(0).size(), hits), greedy_.at(0)) << "from its own CACHED pages";
+    EXPECT_GT(hits, 0);
+    backend_->check_kv_invariants();
 }
 
