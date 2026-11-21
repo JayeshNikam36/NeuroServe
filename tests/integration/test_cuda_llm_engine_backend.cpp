@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -297,4 +299,129 @@ TEST_F(CudaLlmEngineBackendTest, SharedPrefixPagesAreReusedAndFreedByTheirLastHo
     backend_->free_sequence(b);  // the last holder: everything is free
     expect_no_leaked_pages();
     backend_->check_kv_invariants();
+}
+
+// ---- Prefix caching (Day 34): prefill from a cached offset must reproduce Hugging Face exactly.
+// Llama-3.2-1B-Instruct's chat prompts all start with the same system header, so one request that
+// holds its pages turns every other chat prompt into a prefix hit. Each reference case runs twice at
+// batch size 1: once with nothing to reuse, once with the header's pages reused, its prefill
+// starting at the first uncached token (positions and RoPE from there). Both must equal the
+// Hugging Face greedy tokens.
+namespace {
+
+// The integer arrays named `key` in the reference JSON, in order (the file is ours: flat cases of
+// "name", "prompt_ids" and "greedy_ids"; no JSON library needed).
+std::vector<std::vector<TokenId>> json_int_arrays(const std::string& text, const std::string& key) {
+    std::vector<std::vector<TokenId>> out;
+    const std::string needle = "\"" + key + "\"";
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        const std::size_t open = text.find('[', at);
+        const std::size_t close = text.find(']', open);
+        std::vector<TokenId> values;
+        std::size_t i = open + 1;
+        while (i < close) {
+            while (i < close && (text[i] < '0' || text[i] > '9') && text[i] != '-') {
+                ++i;
+            }
+            if (i >= close) {
+                break;
+            }
+            std::size_t used = 0;
+            values.push_back(static_cast<TokenId>(std::stol(text.substr(i, close - i), &used)));
+            i += used;
+        }
+        out.push_back(std::move(values));
+    }
+    return out;
+}
+
+}  // namespace
+
+class CudaPrefixCacheTest : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        const std::string model_dir = env_or("NS_INSTRUCT_MODEL_DIR", "/models/llama-3.2-1b-instruct-fp16");
+        const std::string ref = env_or("NS_INSTRUCT_REF", "/models/llama-3.2-1b-ref/instruct_greedy.json");
+        if (!fs::exists(fs::path(model_dir) / "weights.bin") || !fs::exists(ref)) {
+            skip_reason_ = "instruct weights or reference not found (" + model_dir + ", " + ref + ")";
+            return;
+        }
+        std::ifstream in(ref);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        prompts_ = json_int_arrays(text, "prompt_ids");
+        greedy_ = json_int_arrays(text, "greedy_ids");
+        CudaLlmEngineConfig config;
+        config.model_dir = model_dir;
+        config.model_name = "llama-3.2-1b-instruct";
+        config.num_pages = 512;
+        config.prefix_caching = true;
+        backend_ = std::make_unique<CudaLlmEngineBackend>(config);
+    }
+
+    static void TearDownTestSuite() { backend_.reset(); }
+
+    void SetUp() override {
+        if (!backend_) {
+            GTEST_SKIP() << skip_reason_;
+        }
+    }
+
+    // Greedy generation at batch size 1; `hit_pages` gets how many pages its prefill reused.
+    static std::vector<TokenId> generate(const std::vector<TokenId>& prompt, std::size_t n, std::int64_t& hit_pages) {
+        const std::int64_t hits_before = backend_->kv_stats().prefix_hit_pages;
+        const SeqId id = backend_->create_sequence();
+        std::vector<TokenId> out{backend_->prefill(id, prompt)};
+        hit_pages = backend_->kv_stats().prefix_hit_pages - hits_before;
+        while (out.size() < n) {
+            const SeqId ids[] = {id};
+            const TokenId last[] = {out.back()};
+            out.push_back(backend_->decode_step(ids, last).at(0));
+        }
+        backend_->free_sequence(id);
+        return out;
+    }
+
+    static inline std::unique_ptr<CudaLlmEngineBackend> backend_;
+    static inline std::vector<std::vector<TokenId>> prompts_;
+    static inline std::vector<std::vector<TokenId>> greedy_;
+    static inline std::string skip_reason_;
+};
+
+TEST_F(CudaPrefixCacheTest, PrefixHitsReproduceHuggingFaceExactly) {
+    ASSERT_EQ(prompts_.size(), 5u);
+    ASSERT_EQ(greedy_.size(), 5u);
+    std::int64_t total_hits = 0;
+    for (std::size_t c = 0; c < prompts_.size(); ++c) {
+        std::int64_t hits = 0;
+        EXPECT_EQ(generate(prompts_[c], greedy_[c].size(), hits), greedy_[c]) << "case " << c << " without a hit";
+        EXPECT_EQ(hits, 0) << "nothing was live to reuse";
+
+        // A holder keeps case 0's pages (the shared system header) live; it is never decoded.
+        const SeqId holder = backend_->create_sequence();
+        backend_->prefill(holder, prompts_[0]);
+        const std::vector<TokenId> out = generate(prompts_[c], greedy_[c].size(), hits);
+        backend_->free_sequence(holder);
+        std::cout << "case " << c << ": " << prompts_[c].size() << " prompt tokens, " << hits * 16
+                  << " reused, prefill from position " << hits * 16 << "\n";
+        EXPECT_EQ(out, greedy_[c]) << "case " << c << " with " << hits << " pages reused";
+        total_hits += hits;
+        backend_->check_kv_invariants();
+    }
+    EXPECT_GT(total_hits, 0) << "no case shared a full page with the holder: nothing was tested";
+    const auto kv = backend_->kv_stats();
+    EXPECT_EQ(kv.free_pages, kv.total_pages) << "KV pages leaked";
+    EXPECT_EQ(kv.indexed_pages, 0) << "freed pages are unindexed";
+}
+
+TEST_F(CudaPrefixCacheTest, AnIdenticalPromptReusesEveryPageButTheLastAndMatches) {
+    // The longest reuse: the same prompt as the holder, all its full pages but the one holding the
+    // last token (whose logits must be computed). The prefill then computes only the last 1..16 tokens.
+    const std::vector<TokenId>& prompt = prompts_.at(0);
+    const SeqId holder = backend_->create_sequence();
+    backend_->prefill(holder, prompt);
+    std::int64_t hits = 0;
+    const std::vector<TokenId> out = generate(prompt, greedy_.at(0).size(), hits);
+    backend_->free_sequence(holder);
+    EXPECT_EQ(hits, static_cast<std::int64_t>((prompt.size() - 1) / 16));
+    EXPECT_EQ(out, greedy_.at(0));
 }
