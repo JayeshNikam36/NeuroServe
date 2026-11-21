@@ -47,6 +47,20 @@ endif()
 
 # ---- Python binding tests (GPU + model, run with pytest) ----
 if(NS_BUILD_PYTHON)
+    # Compute Sanitizer (Day 41): memcheck and racecheck on the KV, scheduler and GPU suites.
+    #   cmake --build build/dev-cuda --target compute_sanitizer   (logs and summary in tests/logs)
+    find_program(NS_COMPUTE_SANITIZER compute-sanitizer HINTS "${CUDAToolkit_BIN_DIR}" /usr/local/cuda/bin)
+    if(NS_COMPUTE_SANITIZER)
+        add_custom_target(compute_sanitizer
+            COMMAND bash "${PROJECT_SOURCE_DIR}/scripts/compute_sanitizer.sh" "${NS_COMPUTE_SANITIZER}"
+                    $<TARGET_FILE:ns_unit_tests> $<TARGET_FILE:ns_cuda_tests> $<TARGET_FILE:ns_integration_tests>
+                    "${PROJECT_SOURCE_DIR}/tests/logs"
+            DEPENDS ns_unit_tests ns_cuda_tests ns_integration_tests
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            USES_TERMINAL
+            COMMENT "Compute Sanitizer: memcheck and racecheck (see tests/logs)")
+    endif()
+
     add_test(NAME python_bindings
         COMMAND ${Python_EXECUTABLE} -m pytest -q -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/python)
     set_tests_properties(python_bindings PROPERTIES
