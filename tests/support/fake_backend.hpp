@@ -49,6 +49,8 @@ public:
         s.prefix_lookups = kv.prefix_lookups;
         s.prefix_lookup_pages = kv.prefix_lookup_blocks;
         s.prefix_hit_pages = kv.prefix_hit_blocks;
+        s.cached_pages = kv.cached_blocks;
+        s.evicted_pages = kv.evicted_blocks;
         return s;
     }
 

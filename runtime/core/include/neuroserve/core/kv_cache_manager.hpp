@@ -39,6 +39,7 @@ public:
     int commit(SeqId seq, std::span<const TokenId> tokens) override;
     int match(std::span<const TokenId> prompt) const override;
     bool indexed(BlockId block) const override;
+    int evict_cached() override;
     void check_invariants() const override;
 
     // The sequence that took a used block from the free list (and so wrote its K/V). Sharers do not
@@ -57,6 +58,7 @@ private:
         BlockHash hash = 0;
         BlockId parent = -1;           // the block before it in the table that indexed it; -1 first
         std::vector<TokenId> tokens;   // its tokens, to verify a hit (only while indexed)
+        std::uint64_t released_at = 0; // CACHED: its place in the LRU queue
     };
     struct Sequence {
         std::vector<BlockId> table;
@@ -69,7 +71,8 @@ private:
     const Block& block_at(BlockId block) const;
     const PrefixHasher& hasher(const char* op) const;
     std::vector<BlockId> walk(std::span<const TokenId> prompt) const;  // the blocks admit() would reuse
-    void take_free_block(SeqId seq, Sequence& s);
+    void take_free_block(SeqId seq, Sequence& s, BlockId keep = -1);  // FREE first, else evicts LRU
+    void unindex(BlockId block);
 
     KvBlockConfig config_;
     std::vector<Block> blocks_;
@@ -83,6 +86,9 @@ private:
     std::int64_t lookup_blocks_ = 0;
     std::int64_t hit_blocks_ = 0;
     std::int64_t copied_blocks_ = 0;
+    std::set<std::pair<std::uint64_t, BlockId>> lru_;  // CACHED blocks, least recently released first
+    std::uint64_t release_clock_ = 0;
+    std::int64_t evicted_blocks_ = 0;
 };
 
 }  // namespace neuroserve::core

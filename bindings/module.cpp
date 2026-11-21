@@ -146,6 +146,8 @@ public:
         out["prefix_lookups"] = s.prefix_lookups;
         out["prefix_lookup_pages"] = s.prefix_lookup_pages;
         out["prefix_hit_pages"] = s.prefix_hit_pages;
+        out["cached_pages"] = s.cached_pages;
+        out["evicted_pages"] = s.evicted_pages;
         return out;
     }
 

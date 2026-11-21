@@ -36,6 +36,8 @@ struct KvCacheStats {
     std::int64_t prefix_lookups = 0;      // prompts looked up at admission
     std::int64_t prefix_lookup_pages = 0; // full prompt pages they could have reused
     std::int64_t prefix_hit_pages = 0;    // of those, the pages they did reuse
+    int cached_pages = 0;                 // CACHED: released, still indexed, reclaimed on demand
+    std::int64_t evicted_pages = 0;       // CACHED pages reclaimed, least recently released first
 };
 
 // The pages one sequence lists, and how many of them no other sequence lists: the pages that

@@ -51,8 +51,13 @@ public:
 
     // Prefix caching on or off (CudaLlmEngineConfig::prefix_caching is the start value). Only with
     // no live sequences: std::logic_error otherwise. Lets one backend compare both, batch for batch.
+    // Evicts every CACHED page, so either setting starts from an empty cache.
     void set_prefix_caching(bool on);
     bool prefix_caching() const noexcept;
+
+    // Forgets every CACHED page (released, still indexed); live sequences are untouched. Returns
+    // how many pages were evicted.
+    int evict_cached_pages();
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

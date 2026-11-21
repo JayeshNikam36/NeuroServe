@@ -75,10 +75,9 @@ TEST(KvPrefixCache, ASecondRequestWithTheSameSystemPromptReusesItsFullPages) {
     EXPECT_EQ(kv.free_pages, kv.total_pages);
 }
 
-TEST(KvPrefixCache, PagesOfAFinishedRequestAreFreedNotKeptYet) {
-    // Keeping a finished request's pages for later requests is the CACHED state, with eviction
-    // (Day 37). Until then, an indexed page is freed with its last holder, and a later request with
-    // the same system prompt computes it again.
+TEST(KvPrefixCache, AFinishedRequestsPagesAreReusedByALaterOne) {
+    // CACHED pages (Day 37): the first request finishes before the second arrives, and its pages,
+    // released but still indexed, are reused.
     FakeBackend backend;
     backend.prefix_caching = true;
     EngineLoop loop(backend, checked());
@@ -86,10 +85,43 @@ TEST(KvPrefixCache, PagesOfAFinishedRequestAreFreedNotKeptYet) {
     EXPECT_EQ(loop.submit(request(2)).wait().tokens, expected(request(2)));
     const auto kv = loop.kv_stats();
     EXPECT_EQ(kv.prefix_lookups, 2);
-    EXPECT_EQ(kv.prefix_hit_pages, 0);
-    EXPECT_EQ(kv.indexed_pages, 0);
-    EXPECT_EQ(backend.prefilled_tokens(), 2 * 72);
+    EXPECT_EQ(kv.prefix_hit_pages, 4);
+    EXPECT_EQ(backend.prefilled_tokens(), 72 + 8);
+    EXPECT_EQ(kv.free_pages, kv.total_pages) << "cached pages count as free";
     EXPECT_FALSE(loop.stop_requested());
+}
+
+TEST(KvPrefixCache, UnderMemoryPressureTheOldestCachedPagesGoAndOutputsStayCorrect) {
+    // 12 pages, 5 per request (72 prompt + 8 new tokens): five system prompts in turn fill the
+    // pool with CACHED pages, so later ones evict the oldest. Then the newest and the oldest again.
+    FakeBackend backend(1000, 12);
+    backend.prefix_caching = true;
+    EngineLoop loop(backend, checked());
+    auto with_system = [](TokenId system, TokenId user) {
+        GenerationParams p;
+        for (int i = 0; i < 64; ++i) {
+            p.prompt.push_back(system * 100 + i % 50);
+        }
+        for (int i = 0; i < 8; ++i) {
+            p.prompt.push_back(user);
+        }
+        p.max_new_tokens = 8;  // 80 positions: 5 pages
+        return p;
+    };
+    for (TokenId system = 1; system <= 5; ++system) {
+        const auto p = with_system(system, 1);
+        EXPECT_EQ(loop.submit(p).wait().tokens, expected(p)) << "system prompt " << system;
+    }
+    const auto before = loop.kv_stats();
+    const auto again = with_system(5, 2);  // the most recent system prompt: still cached
+    EXPECT_EQ(loop.submit(again).wait().tokens, expected(again));
+    const auto after = loop.kv_stats();
+    EXPECT_EQ(after.prefix_hit_pages - before.prefix_hit_pages, 4) << "the newest cached pages survived";
+    const auto old = with_system(1, 2);    // the oldest: evicted long ago
+    EXPECT_EQ(loop.submit(old).wait().tokens, expected(old));
+    EXPECT_EQ(loop.kv_stats().prefix_hit_pages, after.prefix_hit_pages) << "evicted, so computed again";
+    EXPECT_GT(backend.kv().stats().evicted_blocks, 0);
+    EXPECT_FALSE(loop.stop_requested()) << "every step's invariant checks passed";
 }
 
 TEST(KvPrefixCache, DecodedPagesAreIndexedAsTheyFill) {

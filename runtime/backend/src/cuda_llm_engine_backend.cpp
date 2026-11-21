@@ -210,8 +210,11 @@ void CudaLlmEngineBackend::set_prefix_caching(bool on) {
     if (!impl_->sequences.empty()) {
         throw std::logic_error("set_prefix_caching: only with no live sequences");
     }
+    impl_->kv->evict_cached();  // what was cached under the old setting is forgotten
     impl_->prefix_caching = on;
 }
+
+int CudaLlmEngineBackend::evict_cached_pages() { return impl_->kv->evict_cached(); }
 
 bool CudaLlmEngineBackend::prefix_caching() const noexcept { return impl_->prefix_caching; }
 
@@ -231,6 +234,8 @@ KvCacheStats CudaLlmEngineBackend::kv_stats() const {
     s.prefix_lookups = kv.prefix_lookups;
     s.prefix_lookup_pages = kv.prefix_lookup_blocks;
     s.prefix_hit_pages = kv.prefix_hit_blocks;
+    s.cached_pages = kv.cached_blocks;
+    s.evicted_pages = kv.evicted_blocks;
     return s;
 }
 
