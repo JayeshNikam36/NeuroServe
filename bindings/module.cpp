@@ -148,6 +148,7 @@ public:
         out["prefix_hit_pages"] = s.prefix_hit_pages;
         out["cached_pages"] = s.cached_pages;
         out["evicted_pages"] = s.evicted_pages;
+        out["prefix_reused_tokens"] = s.prefix_reused_tokens;
         return out;
     }
 

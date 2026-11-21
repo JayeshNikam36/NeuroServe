@@ -39,6 +39,7 @@ struct KvCacheStats {
     std::int64_t prefix_hit_pages = 0;    // of those, the pages they did reuse
     int cached_pages = 0;                 // CACHED: released, still indexed, reclaimed on demand
     std::int64_t evicted_pages = 0;       // CACHED pages reclaimed, least recently released first
+    std::int64_t prefix_reused_tokens = 0;  // prompt tokens taken from the cache instead of prefilled
 };
 
 // The pages one sequence lists, and how many of them no other sequence lists: the pages that

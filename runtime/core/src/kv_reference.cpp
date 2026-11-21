@@ -228,6 +228,7 @@ Admission ReferenceBlockManager::admit(SeqId seq, std::span<const TokenId> promp
     } else {
         out.cached_tokens = static_cast<int>(hits.size() * bs);
     }
+    reused_tokens_ += out.cached_tokens;
     return out;
 }
 
@@ -315,6 +316,7 @@ KvBlockStats ReferenceBlockManager::stats() const {
     out.prefix_lookup_blocks = lookup_blocks_;
     out.prefix_hit_blocks = hit_blocks_;
     out.copied_blocks = copied_blocks_;
+    out.prefix_reused_tokens = reused_tokens_;
     for (std::size_t b = 0; b < refs_.size(); ++b) {
         out.cached_blocks += refs_[b] == 0 && records_[b].indexed;
     }

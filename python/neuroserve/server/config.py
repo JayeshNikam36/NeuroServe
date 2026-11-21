@@ -42,6 +42,11 @@ class EngineSection(_Strict):
     queue_timeout_ms: int = Field(default=30000, ge=0)
     # Scheduling explanations kept for GET /v1/runtime/decisions (the newest; older ones are dropped).
     decision_log_capacity: int = Field(default=4096, ge=1)
+    # KV cache (docs/kv-cache.md). prefix_caching: requests reuse the cached pages of earlier ones
+    # with the same prefix. kv_admission: "on-demand" admits a request for its prefill's pages and
+    # preempts when memory runs short; "worst-case" reserves prompt + max_tokens and never preempts.
+    prefix_caching: bool = False
+    kv_admission: Literal["on-demand", "worst-case"] = "on-demand"
 
 
 class LimitsSection(_Strict):

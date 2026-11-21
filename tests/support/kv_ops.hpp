@@ -356,7 +356,9 @@ inline bool same_state(const KvBlockManager& a, const KvBlockManager& b, const s
         sa.used_blocks != sb.used_blocks || sa.shared_blocks != sb.shared_blocks || sa.sequences != sb.sequences ||
         sa.cached_tokens != sb.cached_tokens || sa.indexed_blocks != sb.indexed_blocks ||
         sa.prefix_lookups != sb.prefix_lookups || sa.prefix_lookup_blocks != sb.prefix_lookup_blocks ||
-        sa.prefix_hit_blocks != sb.prefix_hit_blocks || a.prefix_caching() != b.prefix_caching()) {
+        sa.prefix_hit_blocks != sb.prefix_hit_blocks || sa.prefix_reused_tokens != sb.prefix_reused_tokens ||
+        sa.copied_blocks != sb.copied_blocks || sa.cached_blocks != sb.cached_blocks ||
+        sa.evicted_blocks != sb.evicted_blocks || a.prefix_caching() != b.prefix_caching()) {
         return false;
     }
     for (const SeqId id : ids) {

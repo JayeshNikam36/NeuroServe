@@ -334,6 +334,12 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
                       "created": request.app.state.created, "owned_by": "neuroserve"}],
         }
 
+    @app.get("/v1/runtime/state")
+    async def runtime_state(request: Request) -> dict:
+        """The KV cache's occupancy and counters: hits, misses, reused tokens, evictions, preemptions."""
+        svc: EngineService = request.app.state.service
+        return {"object": "runtime.state", **svc.runtime_state()}
+
     @app.get("/v1/runtime/decisions")
     async def decisions(request: Request, since: int = Query(default=0, ge=0),
                         limit: int = Query(default=100, ge=1, le=1000)) -> dict:
