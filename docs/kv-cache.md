@@ -18,6 +18,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 31 | Reference counting through the backend and the engine: `share_prefix` and `sequence_pages` on every backend, shared pages in `/health`, preemption planned with a request's own pages, I11 counting a shared page once; tests in every release order and through completion, cancellation and preemption (`tests/unit/test_kv_sharing.cpp`) | done |
 | 32 | Prefix hashing for full blocks (`kv_prefix_hash.hpp`): XXH64, a pinned byte encoding, the chained block hash and its root, the CUDA backend's K/V identity, `kv_cache_key` in `model_info()`; tests against an independent implementation (`tests/unit/test_kv_prefix_hash.cpp`) | done |
 | 33 | Prefix index and lookup at admission: `admit`, `commit`, `match` in the `KvBlockManager` contract (reference and manager), verified hits, hit counters in `/health`, I7 and I8 checked; contract, property and engine tests (`test_kv_prefix_index.cpp`, `test_kv_prefix_cache.cpp`). The CUDA backend turns it on with Day 34's prefill | done |
+| 34 | Prefill from a cached offset: `attention_prefill_paged` (causal attention over the cached prefix through the block table) and `model_prefill_from` in the CUDA backend; `prefix_caching` in `CudaLlmEngineConfig` and `neuroserve.Engine` (off by default until Day 36); GPU test: the Hugging Face chat references match with and without a prefix hit | done |
 
 ## Today (v0.1)
 
@@ -323,6 +324,31 @@ Day 34 acceptance test, matching Hugging Face exactly, is checked on the referen
 other inputs any difference from the no-cache run is measured and reported, as the release gate
 already does.
 
+**Implemented (Day 34)** in `runtime/backend/src/prefill_from_offset.cu`, without changing the
+engine submodule.
+
+- **`model_prefill_from(model, cache, seq, ids, start)`** runs the engine's per-layer math for
+  `ids[start ..]` only. Position ids, and so RoPE, start at `start`. The new tokens' K/V are
+  scattered into the sequence's pages first, then attention reads the whole prefix through the
+  block table.
+- **`attention_prefill_paged`** gives each new token `t` causal attention over positions
+  `0 … start + t`. Its per-query math is `attention_decode_paged`'s step for step, so a suffix token
+  gets the attention the decode path would give it. One block per (head, token): simple and correct
+  now, made fast in Phase 4.
+- **The prefill picks its path by what was reused.** `start == 0` (no hit) uses the engine's own
+  `model_prefill_paged`, unchanged, so outputs without a hit cannot change. A hit uses
+  `model_prefill_from`.
+- **The CUDA backend admits and commits** like the fake: `admit` before the prefill, `commit` after
+  it and after every decode step. It keeps each sequence's tokens for that.
+- **Off by default.** `prefix_caching` in `CudaLlmEngineConfig` and `neuroserve.Engine(...,
+  prefix_caching=True)`. The server keeps it off until the shared-prefix end-to-end test
+  (Day 36) shows outputs equal to the no-cache run under load.
+- **The acceptance test** (`CudaPrefixCacheTest`) uses the Hugging Face chat references for
+  Llama-3.2-1B-Instruct. Their prompts all start with the same system header. Each case runs at
+  batch size 1 twice: with nothing to reuse, and while a holder keeps the header's pages live, so
+  its prefill starts at the cached offset. Both runs must equal the Hugging Face greedy tokens. A
+  second test reuses every page but the last of an identical prompt.
+
 ### Copy-on-write (Day 35)
 
 **The rule: a write goes only into a block with reference count 1 that is not indexed.** Because
@@ -430,6 +456,7 @@ free, a block in two lists, a write into a shared block) and checks that the che
 | 31 | Shared block freed only by its last owner | reference counting |
 | 32 | Same prefix → same chain; any change in model, weights, dtype, block size, RoPE or a token → a different hash, from that block on; XXH64 and the encoding match an independent implementation; no collisions among 200,000 blocks | hash identity |
 | 33 | A second request with the same system prompt reuses its full blocks and the hit is counted; never the last token's block; stops at the first miss; verified hits; duplicates; all-or-nothing admission; the manager equals the reference on 10,000 random programs with admit, commit and match | prefix index |
+| 34 | With a prefix hit, the chat references still equal Hugging Face's greedy tokens, case by case, at batch size 1; an identical prompt reusing all but its last page too | prefill from a cached offset |
 | 34–36 | Prefix hit outputs vs Hugging Face; two requests diverging after a shared prefix; 16 requests with a 512-token system prompt vs a no-cache run, hit rate reported | prefix reuse is correct |
 | 37 | Memory pressure: only count-0 blocks evicted, oldest first; outputs correct | eviction |
 | 38 | Forced shortage: preempted requests resume from their cached tokens, match Hugging Face, and never re-stream a token | preemption |

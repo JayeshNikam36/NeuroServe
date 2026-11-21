@@ -18,6 +18,10 @@ struct CudaLlmEngineConfig {
     int num_pages = 2048;                   // 2048 pages x 16 tokens x 32 KiB = 1 GiB for Llama-3.2-1B
     int max_batch = 8;                      // max sequences per decode_step
     int max_pages_per_sequence = 64;        // 64 x 16 = 1024 tokens per sequence
+    // Prefix caching (docs/kv-cache.md): a prompt reuses the full pages of live sequences with the
+    // same prefix, and prefill starts at the first uncached token. Off by default until the
+    // shared-prefix end-to-end test (Day 36) turns it on for the server.
+    bool prefix_caching = false;
 };
 
 // InferenceBackend implemented on top of cuda-llm-engine (paged KV cache, split-KV decode attention).
