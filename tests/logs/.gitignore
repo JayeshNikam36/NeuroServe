@@ -1,0 +1,3 @@
+# Full Compute Sanitizer output (scripts/compute_sanitizer.sh); the summary, compute-sanitizer.md, is committed.
+*.log
+*.out
