@@ -9,7 +9,8 @@ add_library(neuroserve_core
     core/src/decision_log.cpp
     core/src/kv_reference.cpp
     core/src/kv_cache_manager.cpp
-    core/src/kv_prefix_hash.cpp)
+    core/src/kv_prefix_hash.cpp
+    core/src/kv_memory.cpp)
 add_library(neuroserve::core ALIAS neuroserve_core)
 
 target_include_directories(neuroserve_core
