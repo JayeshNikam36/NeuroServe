@@ -121,6 +121,46 @@ rounds it was better, the cache counters, and the GPU table. `runs/` holds every
 sample, `configs/` the config each server ran with, and `server-logs/` its log; `--rerender DIR`
 recomputes the report from them.
 
+## Stress run
+
+    python -m neuroserve.bench.stress --config configs/dev.yaml --out-dir benchmarks/results/raw/stress-1
+
+Sustained load for `--duration-min` minutes (default 30), to find what only shows over time:
+leaked KV pages, growing memory, an invariant that breaks after thousands of steps, latency that
+drifts.
+
+- **The server.** Started by the run (as in the prefix comparison) with prefix caching on and 25%
+  of the KV pool (`--pool-fraction`), so sharing, copy-on-write, eviction and preemption all happen
+  under load, not only the plain path.
+- **The load.** `--concurrency` clients (default 24, three times `max_batch`) in a closed loop:
+  each sends its next request as soon as its last one ends, so the queue never empties. Requests
+  are drawn from `mixed` (50%), `shared_prefix` (30%) and `memory_pressure` (20%), seeded; each
+  profile's schedules change seed every 200 requests, so new prefixes keep arriving and old ones
+  age out of the cache. `--cancel-fraction` (default 5%) of the requests are cancelled by the
+  client 0.05–1.5 s after they are sent, mid-prefill or mid-stream.
+- **Every `--interval-s` (10 s)** it records the requests that finished in that interval (TTFT
+  P50 / P95, ITL P50, output tokens per second), the KV pages (used, cached, free, shared), the
+  evictions, preemptions and prefix hit rate so far, the engine's queue, the GPU's memory in use
+  (NVML) and the server process's resident memory. `timeline.csv` has every sample.
+- **The drain.** At the end the clients stop sending and finish what they have in flight; the run
+  then waits until the engine is idle and sends one probe request.
+
+The checks, all in `summary.md` (exit code 0 only if every one passes):
+
+| Check | Passes when |
+| --- | --- |
+| no failed requests | every request not cancelled on purpose succeeded |
+| invariant checks on | the build checks the KV invariants after every engine step (`NS_CHECK_INVARIANTS`, reported by `neuroserve._core.check_invariants`) |
+| engine alive, no invariant violation | `/health` ok and the probe request succeeds after the drain; no violation and no traceback in the server log (a violation stops the engine loop) |
+| no KV pages held after the drain | 0 used and 0 shared pages; free + cached = all pages |
+| GPU memory flat | the end's peak is within 64 MiB of the start's median |
+| server memory flat | the end's median resident memory is within 64 MiB or 5% of the start's |
+| TTFT P50, TTFT P95, ITL P50 stable | the end's median is at most 25% (P95: 50%) above the start's |
+| throughput stable | the end's median output tokens per second is at most 20% below the start's |
+
+"Start" and "end" are the first and last third of the samples after a `--warmup-min` (5 min)
+warm-up; every threshold is a flag.
+
 ## First results: scheduling policies (Day 24)
 
 Full report: [benchmarks/results/day24-policy-comparison.md](../benchmarks/results/day24-policy-comparison.md).

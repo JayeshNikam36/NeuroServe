@@ -299,6 +299,10 @@ class ServerProcess:
         self._proc = subprocess.Popen([sys.executable, "-m", "neuroserve.server", "--config", str(self.config_path)],
                                       stdout=self._log, stderr=subprocess.STDOUT)
 
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
     def wait_ready(self, timeout_s: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         while True:
