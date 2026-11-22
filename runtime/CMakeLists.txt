@@ -21,6 +21,11 @@ target_compile_definitions(neuroserve_core
 
 if(NS_ENABLE_CUDA)
     target_compile_definitions(neuroserve_core PRIVATE NS_WITH_CUDA=1)
+    # NVTX ranges for Nsight Systems (core/include/neuroserve/core/nvtx.hpp): header-only NVTX 3.
+    if(TARGET CUDA::nvtx3)
+        target_link_libraries(neuroserve_core PRIVATE CUDA::nvtx3)
+        target_compile_definitions(neuroserve_core PRIVATE NS_NVTX=1)
+    endif()
 endif()
 if(NS_CHECK_INVARIANTS)
     # PUBLIC: EngineLoopOptions' default must be the same in the library and everything using it.

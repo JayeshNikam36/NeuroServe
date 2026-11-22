@@ -340,6 +340,20 @@ def create_app(config: ServerConfig, service: EngineService | None = None) -> Fa
         svc: EngineService = request.app.state.service
         return {"object": "runtime.state", **svc.runtime_state()}
 
+    @app.get("/v1/runtime/profile")
+    async def step_profile(request: Request, records: bool = Query(default=False)) -> dict:
+        """Where the engine thread's time went since the last reset, by phase; with records=true,
+        each of the newest steps (docs/profiling.md)."""
+        svc: EngineService = request.app.state.service
+        return {"object": "runtime.profile", **svc.step_profile(records)}
+
+    @app.delete("/v1/runtime/profile")
+    async def reset_step_profile(request: Request) -> dict:
+        """Starts a new step profile (before a measurement)."""
+        svc: EngineService = request.app.state.service
+        svc.reset_step_profile()
+        return {"object": "runtime.profile", "reset": True}
+
     @app.get("/v1/runtime/decisions")
     async def decisions(request: Request, since: int = Query(default=0, ge=0),
                         limit: int = Query(default=100, ge=1, le=1000)) -> dict:

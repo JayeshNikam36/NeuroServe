@@ -114,6 +114,35 @@ struct StepStats {
     std::size_t preempted = 0;
 };
 
+// One engine step's time, split by phase (docs/profiling.md). Host clock: the backend's prefill and
+// decode calls return their tokens to the host, so their time includes the GPU work they launch
+// and wait for.
+struct StepRecord {
+    double start_ms = 0.0;         // since the profile was reset
+    double housekeeping_ms = 0.0;  // cancellations, queue timeouts, the backend's free pages, own pages
+    double schedule_ms = 0.0;      // the policy's decision, the loop's checks and the explanations
+    double preempt_ms = 0.0;       // releasing the preempted requests' sequences
+    double prefill_ms = 0.0;       // the backend's prefill calls (one per admitted request)
+    double decode_ms = 0.0;        // the backend's batched decode call
+    double host_ms = 0.0;          // the rest on the host: sequences, tokens, streams, completions, stats
+    double invariants_ms = 0.0;    // check_invariants
+    double total_ms = 0.0;         // the whole step: the sum of the above
+    int prefill_requests = 0;
+    int prefill_tokens = 0;        // prompt (and resumed) tokens prefilled
+    int decode_batch = 0;          // sequences decoded
+};
+
+// Every step since the last reset_step_profile(): totals, and the newest steps one by one.
+struct StepProfile {
+    double elapsed_ms = 0.0;     // since the reset
+    double idle_ms = 0.0;        // the engine thread waiting for work
+    std::uint64_t steps = 0;     // steps taken (with or without work)
+    std::uint64_t busy_steps = 0;  // steps that prefilled or decoded
+    StepRecord totals;           // per-phase sums over all steps (start_ms unused)
+    std::vector<StepRecord> records;  // the newest steps, oldest first; up to step_profile_capacity
+    std::uint64_t dropped = 0;   // older steps whose records were overwritten
+};
+
 // Whether EngineLoopOptions::check_invariants is on by default: the NS_CHECK_INVARIANTS build
 // option (CMake), on unless turned off for a release build.
 #ifdef NS_CHECK_INVARIANTS
@@ -137,6 +166,8 @@ struct EngineLoopOptions {
     bool check_invariants = kCheckInvariantsByDefault;
     // Called on the engine thread after every step that did work. Must be fast and must not throw.
     std::function<void(const StepStats&)> on_step{};
+    // Steps whose records step_profile() keeps (the newest); 0 keeps only the totals.
+    int step_profile_capacity = 8192;
 };
 
 // Latency of completed requests (queue, TTFT, e2e: one sample per request) and of every gap
@@ -227,6 +258,12 @@ public:
     // request's pages by the time its wait() returns.
     KvCacheStats kv_stats() const;
 
+    // Thread-safe. Where the engine thread's time went since the last reset (or the start), by
+    // phase; with `with_records`, each of the newest steps too (docs/profiling.md).
+    StepProfile step_profile(bool with_records) const;
+    // Thread-safe. Starts a new profile: totals to zero, records dropped.
+    void reset_step_profile();
+
 private:
     struct Entry;
     using EntryPtr = std::unique_ptr<Entry>;
@@ -259,6 +296,9 @@ private:
     void refresh_kv_snapshot() noexcept;
     void refresh_own_pages();  // each running request's exclusive pages, for this step's decision
     void check_kv_bookkeeping() const;  // options_.check_invariants; throws KvInvariantViolation
+    // Adds one step to the profile; caller holds mu_.
+    void record_step_locked(std::chrono::steady_clock::time_point waited_from,
+                            std::chrono::steady_clock::time_point started, StepRecord record);
 
     InferenceBackend& backend_;
     const EngineLoopOptions options_;
@@ -289,6 +329,15 @@ private:
     KvCacheStats kv_snapshot_;
 
     std::vector<EntryPtr> active_;  // engine thread only; in admission order
+
+    // Step profile. Guarded by mu_, except the two backend-call timers, which the engine thread
+    // alone uses within one step.
+    std::chrono::steady_clock::time_point profile_origin_ = std::chrono::steady_clock::now();
+    StepProfile profile_;          // totals and counters; records live in profile_ring_
+    std::vector<StepRecord> profile_ring_;
+    std::size_t profile_next_ = 0;  // where the next record goes once the ring is full
+    double step_prefill_ms_ = 0.0;  // engine thread only: this step's backend prefill calls
+    double step_decode_ms_ = 0.0;   // engine thread only: this step's backend decode call
 
     std::mutex join_mu_;
     std::thread thread_;  // last member: started after everything above is initialised

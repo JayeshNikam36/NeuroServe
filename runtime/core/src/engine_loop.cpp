@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <iterator>
+#include <type_traits>
 #include <utility>
 
 #include "neuroserve/core/kv_block_manager.hpp"
 #include "neuroserve/core/log.hpp"
+#include "neuroserve/core/nvtx.hpp"
 
 namespace neuroserve::core {
 
@@ -323,6 +325,77 @@ KvCacheStats EngineLoop::kv_stats() const {
     return kv_snapshot_;
 }
 
+namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+static_assert(std::is_same_v<ProfileClock, Request::Clock>, "ms_between (above) takes the profile's time points");
+
+void add_to(StepRecord& sum, const StepRecord& r) {
+    sum.housekeeping_ms += r.housekeeping_ms;
+    sum.schedule_ms += r.schedule_ms;
+    sum.preempt_ms += r.preempt_ms;
+    sum.prefill_ms += r.prefill_ms;
+    sum.decode_ms += r.decode_ms;
+    sum.host_ms += r.host_ms;
+    sum.invariants_ms += r.invariants_ms;
+    sum.total_ms += r.total_ms;
+    sum.prefill_requests += r.prefill_requests;
+    sum.prefill_tokens += r.prefill_tokens;
+    sum.decode_batch += r.decode_batch;
+}
+
+}  // namespace
+
+StepProfile EngineLoop::step_profile(bool with_records) const {
+    std::lock_guard lock(mu_);
+    StepProfile out = profile_;
+    out.elapsed_ms = ms_between(profile_origin_, ProfileClock::now());
+    if (with_records) {
+        out.records.reserve(profile_ring_.size());
+        // Oldest first: once the ring is full, the oldest record is the one about to be overwritten.
+        const std::size_t first = profile_ring_.size() < static_cast<std::size_t>(options_.step_profile_capacity)
+                                      ? 0
+                                      : profile_next_;
+        for (std::size_t i = 0; i < profile_ring_.size(); ++i) {
+            out.records.push_back(profile_ring_[(first + i) % profile_ring_.size()]);
+        }
+    }
+    return out;
+}
+
+void EngineLoop::reset_step_profile() {
+    std::lock_guard lock(mu_);
+    profile_origin_ = ProfileClock::now();
+    profile_ = StepProfile{};
+    profile_ring_.clear();
+    profile_next_ = 0;
+}
+
+void EngineLoop::record_step_locked(ProfileClock::time_point waited_from, ProfileClock::time_point started,
+                                    StepRecord record) {
+    if (started < profile_origin_) {
+        return;  // the profile was reset during this step: it belongs to neither profile
+    }
+    profile_.idle_ms += ms_between(std::max(waited_from, profile_origin_), started);
+    ++profile_.steps;
+    if (record.prefill_requests > 0 || record.decode_batch > 0) {
+        ++profile_.busy_steps;
+    }
+    record.start_ms = ms_between(profile_origin_, started);
+    add_to(profile_.totals, record);
+    const auto capacity = static_cast<std::size_t>(std::max(0, options_.step_profile_capacity));
+    if (capacity == 0) {
+        return;
+    }
+    if (profile_ring_.size() < capacity) {
+        profile_ring_.push_back(record);
+    } else {
+        profile_ring_[profile_next_] = record;
+        profile_next_ = (profile_next_ + 1) % capacity;
+        ++profile_.dropped;
+    }
+}
+
 // ---- EngineLoop: engine thread ---------------------------------------------------------------
 
 void EngineLoop::run() noexcept {
@@ -341,6 +414,7 @@ void EngineLoop::loop() {
     for (;;) {
         std::vector<EntryPtr> admitted;
         std::vector<EntryPtr> preempted;
+        const auto waited_from = ProfileClock::now();
         {
             std::unique_lock lock(mu_);
             // Sleep only when there is nothing to do; while requests are active, keep stepping.
@@ -349,17 +423,31 @@ void EngineLoop::loop() {
                 return;
             }
         }
+        // The step's phases, timed on the host (docs/profiling.md) and marked for Nsight Systems.
+        const NvtxRange step_range("ns.step");
+        const auto started = ProfileClock::now();
+        StepRecord timing;
+        step_prefill_ms_ = 0.0;
+        step_decode_ms_ = 0.0;
         apply_cancellations();  // first: cancelled requests free their pages before this step's decisions
         expire_queued();
         const int free_pages = backend_.kv_stats().free_pages;  // backend calls: outside the lock
         refresh_own_pages();
+        auto mark = ProfileClock::now();
+        timing.housekeeping_ms = ms_between(started, mark);
         {
+            const NvtxRange range("ns.schedule");
             std::lock_guard lock(mu_);
             schedule_locked(free_pages, admitted, preempted);
         }
+        auto now = ProfileClock::now();
+        timing.schedule_ms = ms_between(mark, now);
+        mark = now;
         StepStats step;
         step.preempted = preempted.size();
         preempt(std::move(preempted));  // first: admissions may count on the pages it frees
+        now = ProfileClock::now();
+        timing.preempt_ms = ms_between(mark, now);
         // Prefill the admitted requests; they join the decode batch from the next step on.
         std::vector<EntryPtr> joining;
         for (auto& entry : admitted) {
@@ -387,11 +475,25 @@ void EngineLoop::loop() {
             }
         }
         refresh_kv_snapshot();
+        const auto checks_from = ProfileClock::now();
         if (options_.check_invariants) {
+            const NvtxRange range("ns.invariants");
             check_kv_bookkeeping();  // a violation ends the loop (run() logs it and cancels everything)
         }
+        const auto finished = ProfileClock::now();
+        timing.invariants_ms = ms_between(checks_from, finished);
+        timing.prefill_ms = step_prefill_ms_;
+        timing.decode_ms = step_decode_ms_;
+        timing.total_ms = ms_between(started, finished);
+        timing.host_ms = std::max(0.0, timing.total_ms - timing.housekeeping_ms - timing.schedule_ms -
+                                           timing.preempt_ms - timing.prefill_ms - timing.decode_ms -
+                                           timing.invariants_ms);
+        timing.prefill_requests = static_cast<int>(step.prefill_requests);
+        timing.prefill_tokens = step.prefill_tokens;
+        timing.decode_batch = step.decode_tokens;
         std::lock_guard lock(mu_);
         stats_.active = active_.size();
+        record_step_locked(waited_from, started, timing);
     }
 }
 
@@ -713,7 +815,13 @@ void EngineLoop::start(EntryPtr entry, std::vector<EntryPtr>& joining) {
         // A resumed request recomputes its prompt and the tokens it already generated (the client
         // has them); the prefill's output is its next new token.
         const std::vector<TokenId> input = entry->prefill_input();
-        const TokenId first = backend_.prefill(entry->seq, input);
+        const auto called = ProfileClock::now();
+        TokenId first{};
+        {
+            const NvtxRange range("ns.prefill");
+            first = backend_.prefill(entry->seq, input);
+        }
+        step_prefill_ms_ += ms_between(called, ProfileClock::now());
         entry->cached = static_cast<int>(input.size());
         if (entry->first_token_at == Request::Clock::time_point{}) {
             entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
@@ -741,7 +849,10 @@ void EngineLoop::decode_active() {
 
     std::vector<TokenId> next;
     try {
+        const NvtxRange range("ns.decode");
+        const auto called = ProfileClock::now();
         next = backend_.decode_step(seqs, last_tokens);
+        step_decode_ms_ += ms_between(called, ProfileClock::now());
         if (next.size() != seqs.size()) {
             throw std::logic_error("decode_step returned " + std::to_string(next.size()) +
                                    " tokens for " + std::to_string(seqs.size()) + " sequences");

@@ -158,6 +158,44 @@ public:
         loop_->set_policy(core::make_policy(name, policy_options_));  // unknown name: ValueError; next step on
     }
 
+    py::dict step_profile(bool records) const {
+        const core::StepProfile p = loop_->step_profile(records);
+        const auto phases = [](const core::StepRecord& r) {
+            py::dict d;
+            d["housekeeping_ms"] = r.housekeeping_ms;
+            d["schedule_ms"] = r.schedule_ms;
+            d["preempt_ms"] = r.preempt_ms;
+            d["prefill_ms"] = r.prefill_ms;
+            d["decode_ms"] = r.decode_ms;
+            d["host_ms"] = r.host_ms;
+            d["invariants_ms"] = r.invariants_ms;
+            d["total_ms"] = r.total_ms;
+            d["prefill_requests"] = r.prefill_requests;
+            d["prefill_tokens"] = r.prefill_tokens;
+            d["decode_batch"] = r.decode_batch;
+            return d;
+        };
+        py::dict out;
+        out["elapsed_ms"] = p.elapsed_ms;
+        out["idle_ms"] = p.idle_ms;
+        out["steps"] = p.steps;
+        out["busy_steps"] = p.busy_steps;
+        out["totals"] = phases(p.totals);
+        out["dropped"] = p.dropped;
+        if (records) {
+            py::list list;
+            for (const auto& r : p.records) {
+                py::dict d = phases(r);
+                d["start_ms"] = r.start_ms;
+                list.append(d);
+            }
+            out["records"] = list;
+        }
+        return out;
+    }
+
+    void reset_step_profile() { loop_->reset_step_profile(); }
+
     py::dict decisions(std::uint64_t since, std::size_t limit) const {
         const core::DecisionPage page = loop_->decisions(since, limit);
         py::list data;
@@ -355,6 +393,11 @@ PYBIND11_MODULE(_core, m) {
         .def("decisions", &Engine::decisions, py::arg("since") = 0, py::arg("limit") = 100,
              "Why requests were admitted, deferred, rejected or preempted, with the numbers each decision was "
              "made on: {'data': [...], 'next_since': cursor, 'dropped': missed}. Pass next_since back as since.")
+        .def("step_profile", &Engine::step_profile, py::arg("records") = false,
+             "Where the engine thread's time went since the last reset, by phase (housekeeping, schedule, "
+             "preempt, prefill, decode, host, invariants), with idle time and step counts; with records=True, "
+             "each of the newest steps too (start_ms from the reset). See docs/profiling.md.")
+        .def("reset_step_profile", &Engine::reset_step_profile, "Starts a new step profile.")
         .def("latency", &Engine::latency,
              "Latency since start, per metric (queue_ms, ttft_ms, itl_ms, e2e_ms): count, mean, p50, p95, p99, "
              "max. Fixed-bucket histograms: percentiles are within one bucket (about 9%) of the exact value.")

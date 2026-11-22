@@ -3,6 +3,18 @@
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may change the API.
 
+## [Unreleased] — Phase 4: GPU optimization
+
+### Added
+- Step profile: the engine thread times every step's phases (housekeeping, scheduling,
+  preemption, the backend's prefill and decode calls, the rest of the host work, invariant checks)
+  and its idle time; `GET /v1/runtime/profile` (`?records=true` for each of the newest 8,192
+  steps), `DELETE /v1/runtime/profile` to reset; `neuroserve.Engine.step_profile()`.
+- NVTX ranges for the step's phases in CUDA builds, so Nsight Systems shows them next to the
+  kernels; `scripts/nsys_profile.sh`.
+- `neuroserve.bench.step_profile`: decode, prefill and mixed scenarios; the time split, decode cost
+  by batch size, prefill cost per token, and a Chrome / Perfetto trace per scenario.
+
 ## [0.1.5] — Phase 3: KV-cache depth (tag `v0.1.5-kv`)
 
 ### Added
