@@ -36,6 +36,15 @@ void finish_all(const std::vector<RequestHandle>& handles) {
     }
 }
 
+// A request completes inside a step, and the step is recorded when it ends, under the lock that
+// also sets stats().active. Once active is 0 the profile includes the last step.
+StepProfile settled_profile(EngineLoop& loop, bool with_records) {
+    for (int i = 0; i < 5000 && loop.stats().active != 0; ++i) {
+        std::this_thread::sleep_for(1ms);
+    }
+    return loop.step_profile(with_records);
+}
+
 // Every phase is >= 0 and they add up to the step's total.
 void expect_consistent(const StepRecord& r) {
     for (const double v : {r.housekeeping_ms, r.schedule_ms, r.preempt_ms, r.prefill_ms, r.decode_ms, r.host_ms,
@@ -59,7 +68,7 @@ TEST(StepProfile, SplitsTheBackendsPrefillAndDecodeFromTheHost) {
         handles.push_back(loop.submit(params({1, 2, 3, 4 + i}, 6)));
     }
     finish_all(handles);
-    const StepProfile p = loop.step_profile(/*with_records=*/true);
+    const StepProfile p = settled_profile(loop, true);
 
     EXPECT_EQ(p.totals.prefill_requests, 3);
     EXPECT_EQ(p.totals.prefill_tokens, 12);
@@ -101,7 +110,7 @@ TEST(StepProfile, CountsTheTimeWaitingForWorkAsIdle) {
     loop.reset_step_profile();
     std::this_thread::sleep_for(50ms);
     finish_all({loop.submit(params({1, 2}, 2))});
-    const StepProfile p = loop.step_profile(false);
+    const StepProfile p = settled_profile(loop, false);
     EXPECT_GE(p.idle_ms, 40.0);
     EXPECT_GE(p.elapsed_ms, p.idle_ms);
     EXPECT_GE(p.busy_steps, 1U);
@@ -111,7 +120,7 @@ TEST(StepProfile, ResetStartsOver) {
     FakeBackend backend;
     EngineLoop loop(backend);
     finish_all({loop.submit(params({1, 2, 3}, 4))});
-    ASSERT_GT(loop.step_profile(false).steps, 0U);
+    ASSERT_GT(settled_profile(loop, false).steps, 0U);
     loop.reset_step_profile();
     const StepProfile empty = loop.step_profile(true);
     EXPECT_EQ(empty.steps, 0U);
@@ -121,7 +130,7 @@ TEST(StepProfile, ResetStartsOver) {
     EXPECT_TRUE(empty.records.empty());
     EXPECT_EQ(empty.dropped, 0U);
     finish_all({loop.submit(params({5, 6}, 3))});
-    const StepProfile again = loop.step_profile(true);
+    const StepProfile again = settled_profile(loop, true);
     EXPECT_EQ(again.totals.prefill_requests, 1);
     EXPECT_EQ(again.totals.prefill_tokens, 2);
     ASSERT_FALSE(again.records.empty());
@@ -134,7 +143,7 @@ TEST(StepProfile, KeepsOnlyTheNewestRecordsAndCountsTheRest) {
     options.step_profile_capacity = 4;
     EngineLoop loop(backend, options);
     finish_all({loop.submit(params({1, 2, 3}, 20))});
-    const StepProfile p = loop.step_profile(true);
+    const StepProfile p = settled_profile(loop, true);
     ASSERT_GT(p.steps, 4U);
     ASSERT_EQ(p.records.size(), 4U);
     EXPECT_EQ(p.dropped, p.steps - 4);
@@ -151,7 +160,7 @@ TEST(StepProfile, ZeroCapacityKeepsTotalsOnly) {
     options.step_profile_capacity = 0;
     EngineLoop loop(backend, options);
     finish_all({loop.submit(params({1, 2, 3}, 5))});
-    const StepProfile p = loop.step_profile(true);
+    const StepProfile p = settled_profile(loop, true);
     EXPECT_TRUE(p.records.empty());
     EXPECT_EQ(p.dropped, 0U);
     EXPECT_EQ(p.totals.decode_batch, 4);
