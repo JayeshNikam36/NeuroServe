@@ -1,7 +1,7 @@
 # NeuroServe architecture
 
 NeuroServe is a GPU-aware LLM inference runtime with an OpenAI-compatible HTTP API.
-This document describes the system as of `v0.1.0` (end of Phase 2: scheduling and serving).
+This document describes the system as of `v0.1.5-kv` (end of Phase 3: KV-cache depth).
 
 ## Layers
 
@@ -51,8 +51,16 @@ This document describes the system as of `v0.1.0` (end of Phase 2: scheduling an
  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Outside the request path, `neuroserve.bench` (load generator, policy comparison, NVML GPU
-sampler) drives a running server for measurements; see [benchmarking.md](benchmarking.md).
+KV memory is NeuroServe's own since Phase 3: `KVCacheManager` owns every 16-token block, its
+reference count and its place in the prefix index, and the CUDA backend reads and writes K/V
+through the block tables it is given. Released blocks stay `CACHED` (reusable) until evicted,
+least recently used first; a prompt whose leading full blocks are cached is prefilled from the
+first uncached token. The design, its invariants and the measurements are in
+[kv-cache.md](kv-cache.md).
+
+Outside the request path, `neuroserve.bench` (load generator, policy comparison, prefix-caching
+comparison, stress run, NVML GPU sampler) drives servers for measurements; see
+[benchmarking.md](benchmarking.md).
 
 ## One engine step
 
@@ -66,7 +74,8 @@ The engine thread repeats one step while there is work, and sleeps when there is
    and ask the policy for a `ScheduleDecision`: whom to preempt, whom to admit. The loop checks
    the decision against every limit before applying it, and records an explanation with its
    numbers for each request concerned.
-4. Preempt (free the pages; the request restarts from its prompt later), prefill the admitted
+4. Preempt (the request keeps its tokens and later resumes by prefilling prompt + generated
+   tokens), prefill the admitted
    requests, and decode one token for every request that was already running, in one batched
    call. Prefill and decode tokens together stay within `engine.max_batch_tokens`.
 5. Publish each new token to its request's buffer, record timings, and complete the requests
@@ -134,11 +143,10 @@ One YAML file (`configs/dev.yaml`), validated at startup; unknown keys are error
 | Limitation | Plan |
 | --- | --- |
 | A prompt is prefilled in one step, so it must fit the token budget, and `decode-first` starves long prompts under load ([benchmarking.md](benchmarking.md)) | Chunked prefill and mixed prefill/decode steps (Days 52–53) |
-| No prefix caching: identical prompt prefixes are recomputed | Reference-counted blocks, prefix hashing, copy-on-write (Days 31–36; design in [kv-cache.md](kv-cache.md)) |
+| Prefix caching shares full 16-token blocks only, and is off by default in `configs/dev.yaml` | On by default once the release gate covers it; partial-block sharing not scheduled |
 | Measured on one laptop GPU; no baseline against another server yet | vLLM baseline and comparison (Days 94–95) |
-| Compute Sanitizer unavailable on WSL | Run on native Linux or a cloud GPU (Day 41) |
 | No authentication; the runtime policy endpoint is an operator control | Security defaults review (Day 115) |
-| Deterministic but not batch-invariant: at a near-tie the batch can change a greedy choice, and a request restarted after preemption can diverge from what it streamed ([ADR-0006](adr/0006-determinism-not-batch-invariance.md)) | Recompute from prompt + generated tokens (Day 38); cause in profiling (Day 46) |
+| Deterministic but not batch-invariant: at a near-tie the batch (or a prefix hit) can change a greedy choice ([ADR-0006](adr/0006-determinism-not-batch-invariance.md)); since Day 38 a preempted request resumes from its own tokens, so it never contradicts what it streamed | Cause in profiling (Day 46) |
 | Greedy decoding only, `n=1` | Not scheduled |
 
 Design decisions are recorded in [adr/](adr/).

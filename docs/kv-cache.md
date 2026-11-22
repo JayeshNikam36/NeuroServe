@@ -1,8 +1,10 @@
 # KV cache
 
-This is the design of NeuroServe's KV-cache manager for Phase 3 (Days 26–45). It records how KV
-memory works today, the design that replaces it, who owns what, and the invariants that the
-per-step checker enforces. Each later Phase 3 day implements one part, against this document.
+This is the design of NeuroServe's KV-cache manager, built in Phase 3 (Days 26–45, tag
+`v0.1.5-kv`). It records who owns what, the invariants the per-step checker enforces, and how
+each part was built and measured. Each Phase 3 day implemented one part against it; the status
+table lists them, and [Measured results](#measured-results) maps the phase's exit criteria to
+their evidence.
 
 Requirements: KV-001 to KV-010 in the technical specification.
 
@@ -29,6 +31,24 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 42 | Block-size sweep: `ns_block_size_sweep` (benchmarks/block_size) computes capacity and waste at 8, 16 and 32 tokens for a seeded length mix and times the paged decode attention kernel at each, interleaved in one process; results in `benchmarks/results/day42-block-size.md` | done |
 | 43 | Prefix caching on vs off: `neuroserve.bench.prefix_ab` runs the `shared_prefix` and `memory_pressure` profiles (the latter on 25% of the KV pool) paced and as a burst, a fresh server per run, paired rounds, GPU clocks recorded; LRU keeps about 87% of the reuse a cache that never evicted would get; results in `benchmarks/results/day43-prefix-caching.md` | done |
 | 44 | 30-minute stress run: `neuroserve.bench.stress`, 24 clients in a closed loop on a mixed, prefix-sharing workload with 5% client cancels, prefix caching on, 25% of the KV pool, sampled every 10 s; 3,725 requests and 95,752 evictions with no failure, no invariant violation, no page held after the drain, memory flat and latency within 2% from start to end; results in `benchmarks/results/day44-stress.md` | done |
+| 45 | Phase 3 wrap-up: measured results against the exit criteria (below), CHANGELOG, release notes, the release gate, tag `v0.1.5-kv` | done |
+
+## Measured results
+
+Phase 3's exit criteria, and the evidence for each (RTX 4050 Laptop GPU, Llama 3.2 1B FP16).
+
+| Exit criterion | Result | Evidence |
+| --- | --- | --- |
+| Prefix hits > 0 with identical outputs | Hit rate 82.9% on `shared_prefix`, 66–74% on `memory_pressure`; with a hit, outputs equal those without (16 requests sharing a 512-token system prompt) and Hugging Face (prefill from an offset, copy-on-write, eviction, resumption) | GPU integration tests of Days 34–38; [day43](../benchmarks/results/day43-prefix-caching.md) |
+| Zero leaks under stress | 30 minutes, 24 clients, 3,725 requests, 205 cancelled mid-stream, 95,752 evictions: 0 blocks held after the drain, GPU memory flat to the MiB, server memory flat | [day44](../benchmarks/results/day44-stress.md) |
+| No invalid block state | I1–I12 checked after every engine step, through the stress run too; 0 violations. 10,000 property-test programs (about 600,000 operations) agree with the reference; each invariant has a fault-injection test | Days 29–30, 44 |
+| No invalid GPU memory access | Compute Sanitizer memcheck and racecheck: 0 errors on the CUDA and GPU integration suites | [compute-sanitizer.md](../tests/logs/compute-sanitizer.md) |
+| What caching buys | `shared_prefix`: TTFT P50 1846 → 123 ms at 4 requests/s (−93%), throughput 233 → 339 output tok/s at saturation (+45%); `memory_pressure` on a quarter of the pool: TTFT P50 −63%, throughput +17%; better in every measured round | [day43](../benchmarks/results/day43-prefix-caching.md) |
+| Block size chosen on data | 16: 2.6% waste; 8 gains 1.4% capacity for twice the table entries, 32 loses 2.8%; attention time within ±1% | [day42](../benchmarks/results/day42-block-size.md) |
+
+What Phase 3 did not show: the stress run never forced preemption (cached blocks are reclaimed
+first and running requests never filled the pool), so preemption rests on its unit and GPU tests;
+and prefix caching stays off by default in `configs/dev.yaml` until the release gate exercises it.
 
 ## Today (v0.1)
 
@@ -627,9 +647,8 @@ free, a block in two lists, a write into a shared block) and checks that the che
 
 ## Open questions
 
-- **Block size.** 16 is fixed by the fast decode kernel. The Day 42 sweep (8 / 16 / 32) needs the
-  generic paged kernel for the other sizes, so it measures capacity and waste with it, and
-  attention time with both kernels.
+- **Block size.** Settled on Day 42: 16 stays (see [Block size](#block-size-day-42)). Revisit if
+  Phase 4's kernels change what a block costs.
 - **Hash width.** 64 bits plus verification is enough for correctness. If verification ever shows
   up in profiles, compare against a 128-bit hash without it.
 - **Eviction policy.** LRU stays. On Day 43's `memory_pressure` it kept about 87% of the reuse a
