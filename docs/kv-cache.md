@@ -28,6 +28,7 @@ Requirements: KV-001 to KV-010 in the technical specification.
 | 41 | Compute Sanitizer: `memcheck` and `racecheck` on the unit (KV, scheduler, engine loop), CUDA and GPU integration suites; CMake target `compute_sanitizer`, `scripts/compute_sanitizer.sh`, summary in `tests/logs/compute-sanitizer.md` | done |
 | 42 | Block-size sweep: `ns_block_size_sweep` (benchmarks/block_size) computes capacity and waste at 8, 16 and 32 tokens for a seeded length mix and times the paged decode attention kernel at each, interleaved in one process; results in `benchmarks/results/day42-block-size.md` | done |
 | 43 | Prefix caching on vs off: `neuroserve.bench.prefix_ab` runs the `shared_prefix` and `memory_pressure` profiles (the latter on 25% of the KV pool) paced and as a burst, a fresh server per run, paired rounds, GPU clocks recorded; LRU keeps about 87% of the reuse a cache that never evicted would get; results in `benchmarks/results/day43-prefix-caching.md` | done |
+| 44 | 30-minute stress run: `neuroserve.bench.stress`, 24 clients in a closed loop on a mixed, prefix-sharing workload with 5% client cancels, prefix caching on, 25% of the KV pool, sampled every 10 s; 3,725 requests and 95,752 evictions with no failure, no invariant violation, no page held after the drain, memory flat and latency within 2% from start to end; results in `benchmarks/results/day44-stress.md` | done |
 
 ## Today (v0.1)
 
