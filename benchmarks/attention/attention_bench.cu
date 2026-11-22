@@ -1,8 +1,8 @@
-// Prefill attention, timed per layer with CUDA events (docs/prefill-attention.md, Day 48).
+// Prefill attention, timed per layer with CUDA events (docs/prefill-attention.md, Days 48-49).
 //
 // Compares the kernel the engine uses today for prefill from a cached offset (Day 34's
 // attention_prefill_paged, one launch per sequence) with the varlen v0 kernel (one launch for the
-// whole pack), on Llama 3.2 1B's shapes: 32 query heads, 8 KV heads, head dimension 64, 16-token
+// whole pack) and the tiled kernel at each tile shape (Day 49), on Llama 3.2 1B's shapes: 32 query heads, 8 KV heads, head dimension 64, 16-token
 // pages. Each case is timed as the median of 20 runs after 3 warm-up runs, and set against the
 // whole prefill step Day 46 measured (0.28 ms per token) to show attention's share of it.
 
@@ -43,7 +43,12 @@ struct Result {
     std::string name;
     int tokens = 0, max_keys = 0;
     double today_ms = 0, v0_ms = 0;
+    std::vector<double> tiled_ms;  // per kShapes
 };
+
+const neuroserve::kernels::TileShape kShapes[] = {
+    neuroserve::kernels::TileShape::k64x64, neuroserve::kernels::TileShape::k64x32,
+    neuroserve::kernels::TileShape::k128x64, neuroserve::kernels::TileShape::k128x32};
 
 template <typename F>
 double median_ms(F&& launch) {
@@ -136,6 +141,17 @@ Result run_case(const Case& c, std::mt19937& rng) {
                                                                 kKvHeads, kDim);
         }
     });
+    for (const auto shape : kShapes) {
+        const std::vector<std::int32_t> map =
+            neuroserve::kernels::varlen_tile_map(std::vector<std::int32_t>(cu.begin(), cu.end()),
+                                                 std::vector<std::int32_t>(start.begin(), start.end()),
+                                                 neuroserve::kernels::tile_rows(shape));
+        std::int32_t* dmap = upload(map);
+        const int tiles = static_cast<int>(map.size() / 2);
+        r.tiled_ms.push_back(
+            median_ms([&] { neuroserve::kernels::attention_prefill_varlen_tiled(a, dmap, tiles, shape); }));
+        cudaFree(dmap);
+    }
     check(cudaGetLastError(), "kernels");
     for (void* p : {static_cast<void*>(dk), static_cast<void*>(dv), static_cast<void*>(dq), static_cast<void*>(dout),
                     static_cast<void*>(dcu), static_cast<void*>(dstart), static_cast<void*>(dtables)})
@@ -164,17 +180,20 @@ int main(int argc, char** argv) {
     for (const auto& c : cases) {
         results.push_back(run_case(c, rng));
         const auto& r = results.back();
-        std::printf("%-24s tokens=%5d keys<=%5d  today %8.3f ms  v0 %8.3f ms per layer\n", r.name.c_str(), r.tokens,
-                    r.max_keys, r.today_ms, r.v0_ms);
+        std::printf("%-24s tokens=%5d keys<=%5d  today %8.3f  v0 %8.3f  tiled 64x64 %7.3f 64x32 %7.3f 128x64 %7.3f "
+                    "128x32 %7.3f ms per layer\n",
+                    r.name.c_str(), r.tokens, r.max_keys, r.today_ms, r.v0_ms, r.tiled_ms[0], r.tiled_ms[1],
+                    r.tiled_ms[2], r.tiled_ms[3]);
     }
 
-    std::string md = "# Prefill attention: today's kernel and varlen v0\n\n";
+    std::string md = "# Prefill attention: today's kernel, varlen v0 and the tiled kernel\n\n";
     md += std::string("- **GPU:** ") + prop.name + ", " + std::to_string(prop.multiProcessorCount) + " SMs, compute capability " +
           std::to_string(prop.major) + "." + std::to_string(prop.minor) + "\n";
     md += "- **Shapes:** Llama 3.2 1B: 32 query heads, 8 KV heads, head dimension 64, 16-token pages (shuffled)\n";
     md += "- **Timing:** CUDA events, median of 20 runs after 3 warm-up runs, one layer's attention. `today` is "
           "Day 34's `attention_prefill_paged`, one launch per sequence (what the backend runs for a prefill from a "
-          "cached offset); `v0` is `attention_prefill_varlen_v0`, one launch for the pack.\n";
+          "cached offset); `v0` is `attention_prefill_varlen_v0`, one launch for the pack; `tiled RxC` is "
+          "`attention_prefill_varlen_tiled` with R query rows per block and C keys per K/V tile.\n";
     md += "- **Against the step:** 16 layers of today's kernel against the whole prefill step at Day 46's 0.28 ms "
           "per token (measured up to 480 tokens; longer prompts extrapolated, since the matmuls scale linearly). "
           "A prompt prefilled from zero does not run this kernel (the engine's own prefill attention does; Day 46's "
@@ -188,6 +207,16 @@ int main(int argc, char** argv) {
         std::snprintf(buf, sizeof buf, "| %s | %d | %d | %.3f | %.3f | %.1f ms | %.1f ms | %.0f%% |\n", r.name.c_str(),
                       r.tokens, r.max_keys, r.today_ms, r.v0_ms, r.today_ms * kLayers, step,
                       100.0 * r.today_ms * kLayers / step);
+        md += buf;
+    }
+    md += "\n## The tiled kernel, ms per layer\n\n| Case | v0 | tiled 64x64 | tiled 64x32 | tiled 128x64 | tiled 128x32 | "
+          "best | speed-up on today's | best x 16 layers |\n|---|---|---|---|---|---|---|---|---|\n";
+    for (const auto& r : results) {
+        const auto best = std::min_element(r.tiled_ms.begin(), r.tiled_ms.end());
+        const char* best_name = neuroserve::kernels::tile_shape_name(kShapes[best - r.tiled_ms.begin()]);
+        std::snprintf(buf, sizeof buf, "| %s | %.3f | %.3f | %.3f | %.3f | %.3f | %s | %.1fx | %.2f ms |\n",
+                      r.name.c_str(), r.v0_ms, r.tiled_ms[0], r.tiled_ms[1], r.tiled_ms[2], r.tiled_ms[3], best_name,
+                      r.today_ms / *best, *best * kLayers);
         md += buf;
     }
     std::printf("\n%s", md.c_str());

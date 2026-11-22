@@ -1,7 +1,7 @@
 # Variable-length prefill attention: design
 
-Status: v0 implemented (Day 48, `runtime/kernels`); the tiled kernel is Day 49, then the engine
-changes that use it. This note was written before the code (Day 47), and each implementation day is
+Status: v0 (Day 48) and the tiled kernel (Day 49) implemented in `runtime/kernels`; next, the
+engine changes that use them. This note was written before the code (Day 47), and each implementation day is
 checked against it.
 
 ## Why
@@ -83,6 +83,73 @@ in a `VarlenAttentionArgs` struct. One block of 128 threads per (packed token, q
 block finds its sequence by binary search over `cu_seqlens_q` (the tile map is for the tiled
 kernel); scores for every key in shared memory, so at most 12,288 keys (48 KB). Tests:
 `tests/cuda/test_attention_varlen.cpp` (8 tests, every case listed under Tests below).
+
+## The tiled kernel as implemented (Day 49)
+
+`attention_prefill_varlen_tiled(args, tile_map, num_tiles, shape)`, with `varlen_tile_map` building
+the work list on the host (longest tiles first) and four tile shapes: 64 x 32 (default, chosen by
+the sweep below), 64 x 64, 128 x 64 and 128 x 32 (query rows per block x keys per K/V tile). It follows the design above in
+what it computes and in what it guarantees, with two simplifications for this first version:
+
+- **WMMA, with the scores staged in shared memory.** `Q K^T` and `P V` run on tensor cores through
+  the WMMA API (16 x 16 x 16 fragments, FP16 in, FP32 accumulate). WMMA does not say which lane
+  holds which accumulator element, so each warp stores `S` to its own slice of shared memory, lanes
+  0–15 do the online softmax one row each (FP32, `exp2f`, fixed order) and write `P` in FP16, and
+  `P V` lands in the same slice before every lane folds its 32 output elements (row `k / 2`,
+  columns `lane` and `lane + 32`) into registers. The design's register-resident softmax needs
+  `mma.sync` with its documented fragment layout: the next step if the measurement says the
+  shared-memory round trip matters.
+- **K and V single-buffered**, loaded with 128-bit loads through the block table; double buffering
+  with `cp.async` comes with that next step.
+
+The shared-memory scratch for `S` makes blocks larger than the design's 40 KB:
+
+| Shape | per block | blocks per SM (100 KB) | warps per SM |
+| --- | --- | --- | --- |
+| 64 x 64 | 53.8 KB | 1 | 4 |
+| 64 x 32 | 40.8 KB | 2 | 8 |
+| 128 x 64 | 89.5 KB | 1 | 8 |
+| 128 x 32 | 72.5 KB | 1 | 8 |
+
+Above 48 KB the launcher opts in (`cudaFuncSetAttribute`) after checking the device's limit.
+85 registers per thread, no spills (`ptxas -v`, sm_89).
+
+Tests (`tests/cuda/test_attention_varlen.cpp`, `AttentionVarlenTiled`): the reference cases of v0
+(every length 1–2,048, the mixed pack with cached prefixes, random packs, a sharp softmax, no GQA)
+for the default shape; every shape against v0 within the tolerance on a pack with every tile edge
+(lengths 1, 31–33, 64, 65, 127–129, 480, 2,048; starts on and off page and tile boundaries);
+batch independence and determinism for every shape; the tile map (every token once, longest
+first); refused arguments.
+
+### Measured (Day 49)
+
+`ns_attention_bench`, one layer, CUDA events, median of 20 runs, RTX 4050 Laptop GPU. Full table:
+[benchmarks/results/day49-attention-tiled.md](../benchmarks/results/day49-attention-tiled.md).
+
+| Case | today's kernel | tiled, best shape | speed-up | x 16 layers, tiled |
+| --- | --- | --- | --- | --- |
+| 1 x 64 tokens | 0.13 ms | 0.027 ms (64 x 32) | 4.8x | 0.4 ms |
+| 1 x 480 | 5.86 ms | 0.230 ms (64 x 32) | 25.5x | 3.7 ms |
+| 1 x 2,048 | 109 ms | 3.10 ms (128 x 64) | 35.1x | 50 ms |
+| 4 x 480 | 24.2 ms | 0.867 ms (64 x 32) | 27.9x | 14 ms |
+| 256 new after 1,024 cached | 17.0 ms | 0.504 ms (128 x 64) | 33.7x | 8 ms |
+| 8 x 32 | 0.33 ms | 0.056 ms (64 x 32) | 5.8x | 0.9 ms |
+
+- **The target is met.** A 480-token prompt's attention went from 5.9 ms per layer to 0.23 ms
+  (94 ms to 3.7 ms over 16 layers). The longer the context, the larger the gain (35x at 2,048
+  keys), since the tiled kernel reads K and V once per 64 queries instead of once per query.
+- **Prefill from an offset is no longer dominated by attention.** 256 new tokens after a 1,024-token
+  cached prefix: about 262 ms of attention before, 8 ms now, against about 72 ms for the rest of
+  that prefill. Long prefix hits, chunked prefill and resumption now cost about what their new
+  tokens cost.
+- **64 x 32 is the best shape up to 480 tokens, and the default.** Its 41 KB blocks fit two per SM
+  (8 warps); 64 x 64's 54 KB blocks fit one (4 warps), and it is the slowest tiled shape everywhere.
+  128 x 64 is 3–9% faster from 1,024 keys, where there are enough blocks to fill the GPU with fewer,
+  larger ones. The engine can pick by length later; the gap is small.
+- **Room left.** At 2,048 keys the kernel does about 5.5 TFLOPS (`4,096 x T^2` FLOPs per layer under
+  the causal mask; 4.1 TFLOPS at 480). Occupancy, set by the shared-memory scratch for the scores,
+  is the visible limit: the register-resident softmax (`mma.sync`) and double-buffered K/V
+  (`cp.async`) are the next step if attention becomes the bottleneck again.
 
 ## The model it serves
 

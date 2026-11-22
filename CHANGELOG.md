@@ -19,6 +19,11 @@ before 1.0, minor versions may change the API.
   for a pack of sequences with cached prefixes, paged K/V (docs/prefill-attention.md); tested
   against a per-sequence FP32 reference for lengths 1–2,048, bit-identical alone or packed.
 - `ns_attention_bench`: prefill attention per layer (CUDA events), today's kernel against v0.
+- Tiled varlen prefill attention (`attention_prefill_varlen_tiled`, FlashAttention-2 style): Q tile
+  in shared memory, K/V streamed tile by tile with 128-bit loads, online softmax in FP32, Q K^T and
+  P V on tensor cores (WMMA); four tile shapes (64 x 32 default); `varlen_tile_map` (longest tiles
+  first). Matches v0 within tolerance at every tested length; deterministic and batch-invariant.
+  25.5x faster than today's kernel at 480 tokens (0.23 ms per layer), 35x at 2,048.
 
 ## [0.1.5] — Phase 3: KV-cache depth (tag `v0.1.5-kv`)
 
