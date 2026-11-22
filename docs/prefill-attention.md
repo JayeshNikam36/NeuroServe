@@ -1,0 +1,253 @@
+# Variable-length prefill attention: design
+
+Status: design (Day 47). Implemented in steps: v0 on Day 48, the tiled kernel on Day 49, then
+the engine changes that use it. This note is written before the code, and each implementation
+day is checked against it.
+
+## Why
+
+The Day 46 baseline ([profiling.md](profiling.md#baseline-day-46)) shows what prefill costs today:
+
+- **0.28–0.30 ms per prompt token** (about 3,500 tokens per second), for 64- and 480-token
+  prompts alike.
+- **A 480-token prompt is one step of about 135 ms.** No running request gets a token during it;
+  that is the 38–42 ms step P99 under load.
+- **One backend call per admitted request.** Each call runs every layer for that prompt alone:
+  three prompts admitted in one step are three full passes over the weights, one after another.
+
+The prefill attention kernel written on Day 34 for prefill from a cached offset
+(`attention_prefill_paged_kernel`, `runtime/backend/src/prefill_from_offset.cu`) was written to
+be obviously correct, not fast (a prompt prefilled from zero goes through the engine's own prefill
+kernels; Day 48 measures both):
+
+- one thread block per (query head, new token), 128 threads;
+- every block reads the whole of its sequence's K and V from global memory: for a prompt of T
+  new tokens over S keys, `T x S` key reads per head instead of `S`;
+- the scores of all S keys sit in shared memory (`S x 4` bytes), so shared memory grows with the
+  context;
+- one thread sums the softmax, in order.
+
+What this design changes, and what it does not:
+
+1. **Many sequences, one launch.** Every prompt admitted in a step is packed into one batch of
+   tokens, and attention runs as one kernel over all of them, each sequence with its own cached
+   prefix. This is what lets the engine prefill all admitted prompts in one pass over the weights
+   (the matmuls then see `sum(T)` rows instead of `T`), and later run chunked prefill and mixed
+   prefill/decode steps.
+2. **Tiled attention with online softmax** (FlashAttention-2): K and V are read once per tile of
+   queries, not once per query, and shared memory no longer grows with the context.
+3. **Not the matmuls.** At these lengths the weight matmuls do most of prefill's arithmetic
+   (`2 x 1.24 G` FLOPs per token, against `4 x S x 64 x 32` per token per layer for attention,
+   with S averaging half the prompt under the causal mask: about 1–2% for a 480-token prompt). How much of the 135 ms the current attention kernel takes is
+   not known yet: Nsight Systems on WSL 2 does not record kernel activity. **Day 48 measures it
+   first** (CUDA events around the attention launches of one prefill), so the gain of each step
+   is known, not assumed.
+
+## The model it serves
+
+Llama 3.2 1B, FP16:
+
+| | |
+| --- | --- |
+| layers | 16 |
+| query heads | 32 |
+| KV heads | 8 (grouped-query attention: 4 query heads share each KV head) |
+| head dimension `d` | 64 |
+| KV row (one token, all KV heads) | 8 x 64 = 512 halves = 1 KB, for K and for V |
+| KV page | 16 tokens (Day 42) |
+| scale | `1 / sqrt(64)` = 0.125 |
+
+The kernel takes these as runtime arguments (`n_heads`, `n_kv_heads`) and `d` as a template
+parameter (64 instantiated; 128 is the next model size's).
+
+## Interface
+
+```cpp
+// Causal attention for B sequences whose new tokens are packed one after another.
+// Sequence b has start[b] cached tokens (already in the KV pages) and
+// T[b] = cu_seqlens_q[b + 1] - cu_seqlens_q[b] new tokens, whose K and V the caller has already
+// written to its pages (as kv_scatter does today). Its new token i is at position start[b] + i and
+// attends to keys 0 .. start[b] + i.
+void attention_prefill_varlen(
+    const __half* q,               // [total_q, n_heads, d], token-major: the layout the QKV matmul produces
+    const __half* k_pool,          // [num_pages * page_size, n_kv_heads, d]
+    const __half* v_pool,          // same
+    const int32_t* cu_seqlens_q,   // [B + 1], cu_seqlens_q[0] = 0, cu_seqlens_q[B] = total_q
+    const int32_t* start,          // [B], cached tokens per sequence (0 for a fresh prompt)
+    const int32_t* block_tables,   // [B, max_pages], page ids per sequence, row-major
+    int32_t max_pages,             // block_tables' row length
+    const int32_t* tile_map,       // [num_q_tiles, 2]: (b, first token of the tile within b); see Scheduling
+    int32_t num_q_tiles,
+    __half* out,                   // [total_q, n_heads, d], same layout as q
+    int n_heads, int n_kv_heads, int page_size, float scale, cudaStream_t stream);
+```
+
+- **Packed, token-major `q` and `out`** (`cu_seqlens_q`, the FlashAttention varlen convention):
+  the projections and the MLP already work on rows of tokens, so packing B prompts is "stack their
+  rows", with no padding and no per-sequence launch.
+- **K and V stay in the pages.** Cached and new keys are read the same way, through the block
+  table: there is no contiguous copy of the context. A sequence with `start[b] = 0` is a fresh
+  prompt; `start[b] > 0` is a prefix-cache hit or the next chunk of a chunked prefill. One kernel
+  serves both, which is why the interface takes `start`.
+- **`tile_map` is built on the host** with the other per-step metadata (one small copy per step,
+  not per layer). Blocks then find their work with one load, not a search over `cu_seqlens_q`.
+- **Every integer is 32-bit.** `total_q` and page ids stay far below 2^31 at this scale; offsets
+  into the pools are computed in 64-bit (`size_t`).
+
+## The causal mask
+
+Query `i` of sequence `b` is at position `p = start[b] + i` and sees keys `0 .. p`. For a tile of
+queries at positions `[p0, p0 + Br)` and a tile of keys `[k0, k0 + Bc)`:
+
+- `k0 + Bc - 1 <= p0`: every key is visible to every query. **No mask.** This is almost every tile
+  of a long context.
+- `k0 > p0 + Br - 1`: no key is visible. **Not loaded at all**: the key loop for a query tile ends
+  at `p0 + Br - 1`.
+- otherwise, the diagonal: mask `key > query` to `-inf` before the softmax.
+
+The loop over key tiles therefore runs over `ceil((p0 + Br) / Bc)` tiles, and only the last one
+or two need the mask. Every query sees at least itself, so no row is ever fully masked and the
+softmax never divides by zero.
+
+## Grouped-query attention
+
+Query head `h` reads KV head `g = h / (n_heads / n_kv_heads)` (4 query heads per KV head here).
+
+- **v1 (Day 49): one query head per thread block, GQA by indexing.** The 4 blocks of a group load
+  the same K/V tiles; they are scheduled next to each other (head is the fastest-varying grid
+  index within a group), so the second to fourth loads come from L2, not DRAM.
+- **Considered, later:** packing the 4 query heads of a group into one block's rows (a tile of
+  `4 x Br/4` rows), so each K/V tile is read from L2 once per group. It needs a wider tile for the
+  same number of tokens and a different masking pattern per row group. Worth it only if Day 49's
+  measurement shows the kernel bound by L2 traffic.
+
+## Tiling and the online softmax
+
+FlashAttention-2 (Dao, 2023, arXiv:2307.08691): one thread block owns a tile of `Br` queries of
+one head, keeps it in shared memory, and streams the key tiles past it. For each key tile `j`,
+per query row (all in FP32):
+
+```
+S     = (Q K_j^T) * scale            (masked to -inf on the diagonal tile)
+m_new = max(m, rowmax(S))
+P     = exp(S - m_new)
+l     = l * exp(m - m_new) + rowsum(P)
+O     = O * exp(m - m_new) + P V_j
+m     = m_new
+```
+
+and at the end `out = O / l`. `exp` is `exp2f` on scores pre-multiplied by `log2(e)`, folded into
+`scale`. `m` starts at `-inf`, `l` and `O` at 0.
+
+- **Work split:** 4 warps per block, each warp owns 16 query rows of the `Br = 64` tile and does
+  its own rows' softmax: no shared-memory reduction across warps, no `__syncthreads` inside the
+  softmax (the FlashAttention-2 split, as opposed to splitting the keys across warps).
+- **Matmuls on tensor cores:** `Q K^T` and `P V` with warp-level `mma.sync` (m16n8k16, FP16 in,
+  FP32 accumulate), available on sm_80 and later. `P` is converted to FP16 for `P V`, as in
+  FlashAttention.
+- **Loads:** 128-bit (`uint4`, 8 halves). A K or V row of one head is 64 halves = 128 bytes =
+  8 loads; a warp loads 4 rows per instruction, fully coalesced within each row. Rows of a tile
+  come from up to `Bc / page_size + 1` pages (4 or 5 for `Bc = 64`), each row's address through
+  the block table.
+- **Double-buffered K/V:** tile `j + 1` is loaded (`cp.async`, sm_80+) while tile `j` is
+  computed.
+
+## Shared memory and registers
+
+RTX 4050 Laptop GPU: AD107, compute capability 8.9, 20 SMs. Per SM: 100 KB shared memory, 64 K
+32-bit registers, at most 1,536 threads and 24 blocks. A block can use up to 99 KB of shared
+memory, above 48 KB only by opting in (`cudaFuncSetAttribute`). The kernel checks these with
+`cudaGetDeviceProperties` at startup rather than assuming them.
+
+Starting point, `Br = 64`, `Bc = 64`, `d = 64`, 128 threads:
+
+| Buffer | Size |
+| --- | --- |
+| Q tile, 64 x 64 FP16 | 8 KB |
+| K tile, double-buffered | 2 x 8 KB |
+| V tile, double-buffered | 2 x 8 KB |
+| **per block** | **40 KB** |
+
+- **2 blocks per SM** (80 of 100 KB): 8 warps per SM. Scores `S` and `P` never touch shared
+  memory: they live in the `mma` accumulator registers of the warp that owns the rows.
+- **Registers, estimated per thread:** O accumulator (16 x 64 FP32 over 32 lanes) 32, S tile 32,
+  P as FP16 16, m and l 4, addresses and loop state about 30: roughly 120. 128 threads x 2 blocks
+  x 128 registers = 32 K of the SM's 64 K. A third block would need 120 KB of shared memory, so
+  shared memory, not registers, sets occupancy.
+- **Shared memory is independent of the context length.** Today's kernel needs `S x 4` bytes;
+  this one needs 40 KB at any length.
+- **To sweep on Day 49:** `Br` 64 or 128 (128: 8 warps, a 16 KB Q tile, 48 KB per block, still
+  2 blocks per SM), `Bc` 32 or 64, single or double buffering. Chosen by measurement.
+
+## Scheduling the work
+
+- **Grid:** `num_q_tiles x n_heads` blocks, with `num_q_tiles = sum over b of ceil(T[b] / Br)`.
+  The head index varies fastest so a group's 4 query heads run together (GQA through L2).
+- **Longest work first.** A tile's cost grows with its last position (the number of key tiles it
+  reads). The host orders `tile_map` by descending end position, so the long tiles start first
+  and the short ones fill the gaps at the end (the "tail" of a launch).
+- **Sizes at this scale:** one 480-token prompt is 8 query tiles x 32 heads = 256 blocks, about 6
+  waves of 40 (2 per SM x 20 SMs). Four 128-token prompts are the same count. A single short
+  prompt (T < 64) is 32 blocks: fewer than the 40 the GPU can run at once, which is fine for a
+  launch that short.
+
+## Numerics and determinism
+
+- **FP16 inputs, FP32 accumulation and softmax, FP16 output**, like today's kernel.
+- **Deterministic:** every block computes its rows with a fixed order of key tiles (ascending),
+  no atomics and no split of the keys across blocks, so the same inputs give the same bits.
+- **Independent of the batch.** A sequence's output does not depend on what else is packed with
+  it, or where: its tiles start at its own first token, the key loop depends only on its own
+  positions, and nothing is reduced across sequences. Packed with other prompts or alone, a
+  prompt's attention output is bit-identical. This is a stated goal (ADR-0006: today's outputs are
+  deterministic but not batch-invariant), tested directly.
+- **Not bit-identical to today's kernel.** The order of the softmax sums and the FP16 rounding of
+  `P` differ. Both are checked against an FP32 reference within a tolerance; at a near-tie a
+  greedy token can change, as with any change of kernel.
+
+## Tests
+
+Kernel level, against a reference that computes each sequence alone in FP32 on the host (Day 48
+is "matches per-sequence naive attention for mixed lengths 1–2,048"):
+
+- **Lengths:** packs of sequences with `T` in {1, 2, 15, 16, 17, 63, 64, 65, 127, 128, 129, 480,
+  1000, 2047, 2048} and random lengths, seeded; packs of 1 to 16 sequences.
+- **Cached prefixes:** `start` of 0, of whole pages and of partial pages (17, 100), up to a total
+  of 2,048 keys.
+- **Paging:** shuffled page ids; unused pool rows filled with NaN, so a read outside a sequence's
+  pages poisons its output and fails the test.
+- **GQA:** 32 query heads over 8 KV heads, and 1:1 (`n_kv_heads = n_heads`).
+- **Tolerance:** `|out - ref| <= 2e-3 + 1e-2 x |ref|` per element (FP16 output, FP32 reference);
+  the report gives the largest error found.
+- **Batch independence:** every sequence's output equal, bit for bit, whether it runs alone or
+  packed with others, in any position of the pack.
+- **Determinism:** the same pack twice gives the same bits.
+- **Compute Sanitizer:** memcheck and racecheck on the kernel tests (`scripts/compute_sanitizer.sh`).
+
+Engine level, once it serves prefill: the existing GPU integration tests (outputs against
+Hugging Face, prefix hits, copy-on-write, resumption) unchanged, and the step profile's
+`prefill` scenario for the gain.
+
+## Plan
+
+| Day | Step | Done when |
+| --- | --- | --- |
+| 48 | Measure today's attention share of prefill (CUDA events); v0 varlen kernel, simple: one block per (query, head), the interface above, the tests above | matches the per-sequence reference at every length 1–2,048 |
+| 49 | Tiled kernel: Q tile in shared memory, streamed K/V tiles, online softmax, `mma.sync`, 128-bit loads; the tile sweep | matches v0 within the tolerance at every tested length; faster than v0 and than today's kernel, measured |
+| later | The engine prefills all admitted prompts in one batched pass using it; then chunked prefill and mixed prefill/decode steps | step profile and outputs |
+
+## Out of scope
+
+- **Decode.** Decode keeps its own kernel (one query per sequence); Day 46 showed decode is bound
+  by reading the weights, not by attention.
+- **Hopper features** (TMA, `wgmma`, FlashAttention-3): not on sm_89.
+- **Splitting keys across blocks** (flash-decoding style): for long contexts with few queries;
+  not needed below 2,048 keys, and it would break the fixed reduction order.
+- **FP8 and quantized KV.**
+
+## Open questions
+
+- How much of the 135 ms is attention today? Day 48's measurement decides whether the tiled
+  kernel (Day 49) or the batched pass over the weights matters more for the step's length.
+- Does GQA through L2 suffice, or is the kernel L2-bound (the packed-heads variant)?
+- Does the tolerance hold for the longest contexts (2,048 keys), where FP16 `P` loses the most?
