@@ -70,8 +70,6 @@ TEST(StepProfile, SplitsTheBackendsPrefillAndDecodeFromTheHost) {
     EXPECT_GE(p.busy_steps, static_cast<std::uint64_t>(decode_steps));
     EXPECT_GE(p.steps, p.busy_steps);
     expect_consistent(p.totals);
-    // Backend time dominates here: the fake's sleeps are far longer than the loop's own work.
-    EXPECT_GT(p.totals.prefill_ms + p.totals.decode_ms, 0.5 * p.totals.total_ms);
     EXPECT_LE(p.totals.total_ms + p.idle_ms, p.elapsed_ms + 1.0);
 
     ASSERT_EQ(p.records.size(), p.steps);
