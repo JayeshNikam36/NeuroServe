@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -36,6 +37,10 @@ public:
 
     SeqId create_sequence() override;
     TokenId prefill(SeqId seq, std::span<const TokenId> prompt) override;
+    // Prefills the items whose new tokens fit the scratch together, in one forward pass with the
+    // varlen tiled attention (docs/prefill-attention.md); a lone item, or one longer than a chunk,
+    // goes through prefill()'s path. Each item succeeds or fails on its own.
+    void prefill_batch(std::span<PrefillItem> items) override;
     std::vector<TokenId> decode_step(std::span<const SeqId> seqs,
                                      std::span<const TokenId> tokens) override;
     void free_sequence(SeqId seq) override;
@@ -65,6 +70,11 @@ public:
     // Fewer tokens per chunk (1 .. max_prompt_tokens) let tests run the chunked path on short
     // prompts; std::invalid_argument outside that range.
     void set_prefill_chunk_tokens(int tokens);
+
+    // Batched prefill so far: forward passes that prefilled two or more sequences together, and the
+    // sequences they prefilled. For tests and metrics.
+    std::uint64_t batched_prefills() const noexcept;
+    std::uint64_t batched_prefill_sequences() const noexcept;
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

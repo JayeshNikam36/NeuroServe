@@ -62,6 +62,12 @@ public:
         return id;
     }
 
+    // The default (one prefill per item), recording how many items each call had.
+    void prefill_batch(std::span<PrefillItem> items) override {
+        prefill_batch_sizes.push_back(items.size());
+        InferenceBackend::prefill_batch(items);
+    }
+
     TokenId prefill(SeqId id, std::span<const TokenId> prompt) override {
         if (on_prefill) {
             on_prefill();
@@ -208,6 +214,9 @@ public:
     // thread starts; tests use it to pause the engine at a known point.
     std::function<void(std::size_t batch_size)> on_decode;
     std::function<void()> on_prefill;  // the same, at the start of every prefill
+    // The size of every prefill_batch call, in order (written by the engine thread; read it once
+    // the requests have finished).
+    std::vector<std::size_t> prefill_batch_sizes;
 
     // When true, every successful decode_step's sequence ids are appended to decode_batches, and
     // the first token of every prefilled prompt to prefill_first_tokens (the admission order).

@@ -278,7 +278,9 @@ private:
     void expire_queued();  // queue_timeout_ms: reject requests that waited too long for admission
     void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
     void preempt(std::vector<EntryPtr> victims);
-    void start(EntryPtr entry, std::vector<EntryPtr>& joining);
+    // Prefills the requests admitted in this step, together (InferenceBackend::prefill_batch);
+    // each that succeeds joins the decode batch, each that fails fails alone.
+    void start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>& joining);
     void decode_active();
     bool append_token(Entry& entry, TokenId token);
     void publish_token(Entry& entry, TokenId token);  // stream: hand a new token to the reader

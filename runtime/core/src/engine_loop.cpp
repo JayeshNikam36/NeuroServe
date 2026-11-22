@@ -450,10 +450,12 @@ void EngineLoop::loop() {
         timing.preempt_ms = ms_between(mark, now);
         // Prefill the admitted requests; they join the decode batch from the next step on.
         std::vector<EntryPtr> joining;
-        for (auto& entry : admitted) {
+        for (const auto& entry : admitted) {
             ++step.prefill_requests;
             step.prefill_tokens += static_cast<int>(entry->params.prompt.size() + entry->tokens.size());
-            start(std::move(entry), joining);
+        }
+        if (!admitted.empty()) {
+            start_all(std::move(admitted), joining);
         }
         step.decode_tokens = static_cast<int>(active_.size());
         if (!active_.empty()) {
@@ -807,33 +809,62 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
     stats_.pending = pending_.size();
 }
 
-void EngineLoop::start(EntryPtr entry, std::vector<EntryPtr>& joining) {
+void EngineLoop::start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>& joining) {
+    // A sequence each. A resumed request recomputes its prompt and the tokens it already generated
+    // (the client has them); the prefill's output is its next new token.
+    std::vector<EntryPtr> ready;
+    std::vector<std::vector<TokenId>> inputs;
+    for (auto& entry : admitted) {
+        try {
+            entry->seq = backend_.create_sequence();
+            entry->has_seq = true;
+            entry->request.transition_to(RequestState::kPrefill);
+            inputs.push_back(entry->prefill_input());
+            ready.push_back(std::move(entry));
+        } catch (...) {
+            fail(std::move(entry), std::current_exception());  // only this request fails
+        }
+    }
+    if (ready.empty()) {
+        return;
+    }
+    std::vector<PrefillItem> items(ready.size());
+    for (std::size_t i = 0; i < ready.size(); ++i) {
+        items[i].seq = ready[i]->seq;
+        items[i].prompt = inputs[i];
+    }
+    const auto called = ProfileClock::now();
     try {
-        entry->seq = backend_.create_sequence();
-        entry->has_seq = true;
-        entry->request.transition_to(RequestState::kPrefill);
-        // A resumed request recomputes its prompt and the tokens it already generated (the client
-        // has them); the prefill's output is its next new token.
-        const std::vector<TokenId> input = entry->prefill_input();
-        const auto called = ProfileClock::now();
-        TokenId first{};
-        {
-            const NvtxRange range("ns.prefill");
-            first = backend_.prefill(entry->seq, input);
-        }
-        step_prefill_ms_ += ms_between(called, ProfileClock::now());
-        entry->cached = static_cast<int>(input.size());
-        if (entry->first_token_at == Request::Clock::time_point{}) {
-            entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
-        }
-        if (append_token(*entry, first)) {
-            complete(std::move(entry));  // stop token or max_new_tokens == 1: no decode needed
-            return;
-        }
-        entry->request.transition_to(RequestState::kDecode);
-        joining.push_back(std::move(entry));
+        const NvtxRange range("ns.prefill");
+        backend_.prefill_batch(items);  // all together when the backend can (docs/prefill-attention.md)
     } catch (...) {
-        fail(std::move(entry), std::current_exception());  // only this request fails
+        const auto error = std::current_exception();  // the backend could not try: every request fails
+        for (auto& item : items) {
+            item.error = error;
+        }
+    }
+    step_prefill_ms_ += ms_between(called, ProfileClock::now());
+
+    for (std::size_t i = 0; i < ready.size(); ++i) {
+        EntryPtr entry = std::move(ready[i]);
+        if (items[i].error) {
+            fail(std::move(entry), items[i].error);  // only this request fails
+            continue;
+        }
+        try {
+            entry->cached = static_cast<int>(inputs[i].size());
+            if (entry->first_token_at == Request::Clock::time_point{}) {
+                entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
+            }
+            if (append_token(*entry, items[i].first)) {
+                complete(std::move(entry));  // stop token or max_new_tokens == 1: no decode needed
+                continue;
+            }
+            entry->request.transition_to(RequestState::kDecode);
+            joining.push_back(std::move(entry));
+        } catch (...) {
+            fail(std::move(entry), std::current_exception());
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -177,6 +179,111 @@ TEST_F(CudaLlmEngineBackendTest, AllPromptsDecodedTogetherMatchHuggingFace) {
     for (const SeqId id : ids) {
         backend_->free_sequence(id);
     }
+    expect_no_leaked_pages();
+}
+
+// Prefills the prompts with prefill_batch (in calls of `per_call` items), decodes them all together,
+// and returns each sequence's greedy tokens (the prefill's token first). Frees the sequences.
+std::vector<std::vector<TokenId>> batched_greedy(CudaLlmEngineBackend& backend,
+                                                 const std::vector<std::vector<TokenId>>& prompts,
+                                                 std::size_t per_call, std::size_t n_new) {
+    std::vector<SeqId> ids;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        ids.push_back(backend.create_sequence());
+    }
+    std::vector<std::vector<TokenId>> outs(prompts.size());
+    for (std::size_t from = 0; from < prompts.size(); from += per_call) {
+        const std::size_t to = std::min(prompts.size(), from + per_call);
+        std::vector<neuroserve::PrefillItem> items(to - from);
+        for (std::size_t i = from; i < to; ++i) {
+            items[i - from].seq = ids[i];
+            items[i - from].prompt = prompts[i];
+        }
+        backend.prefill_batch(items);
+        for (std::size_t i = from; i < to; ++i) {
+            if (items[i - from].error) {
+                std::rethrow_exception(items[i - from].error);
+            }
+            outs[i].push_back(items[i - from].first);
+        }
+    }
+    for (std::size_t step = 1; step < n_new; ++step) {
+        std::vector<TokenId> last;
+        for (const auto& o : outs) {
+            last.push_back(o.back());
+        }
+        const std::vector<TokenId> next = backend.decode_step(ids, last);
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            outs[i].push_back(next[i]);
+        }
+    }
+    for (const SeqId id : ids) {
+        backend.free_sequence(id);
+    }
+    return outs;
+}
+
+TEST_F(CudaLlmEngineBackendTest, BatchedPrefillMatchesHuggingFaceInEveryPacking) {
+    // The 8 reference prompts three ways: all in one call, in reverse order, and in pairs. Each
+    // call packs what fits the 512-token scratch into one forward pass (Day 51). 24 sequences, each
+    // checked token for token against Hugging Face.
+    const std::size_t n_new = refs_[0].greedy.size();
+    std::vector<std::vector<TokenId>> prompts;
+    for (const auto& r : refs_) {
+        prompts.push_back(r.prompt);
+    }
+    std::vector<std::vector<TokenId>> reversed(prompts.rbegin(), prompts.rend());
+    const std::uint64_t packs_before = backend_->batched_prefills();
+    const std::uint64_t seqs_before = backend_->batched_prefill_sequences();
+
+    int correct = 0;
+    const auto together = batched_greedy(*backend_, prompts, 8, n_new);
+    const auto backwards = batched_greedy(*backend_, reversed, 8, n_new);
+    const auto pairs = batched_greedy(*backend_, prompts, 2, n_new);
+    for (int i = 0; i < kNumPrompts; ++i) {
+        const auto& want = refs_[static_cast<std::size_t>(i)].greedy;
+        EXPECT_EQ(together[static_cast<std::size_t>(i)], want) << "all together, prompt " << i;
+        EXPECT_EQ(backwards[static_cast<std::size_t>(kNumPrompts - 1 - i)], want) << "reversed, prompt " << i;
+        EXPECT_EQ(pairs[static_cast<std::size_t>(i)], want) << "pairs, prompt " << i;
+        correct += (together[static_cast<std::size_t>(i)] == want) +
+                   (backwards[static_cast<std::size_t>(kNumPrompts - 1 - i)] == want) +
+                   (pairs[static_cast<std::size_t>(i)] == want);
+    }
+    std::printf("batched prefill: %d/24 sequences match Hugging Face; %llu packs, %llu sequences packed\n", correct,
+                static_cast<unsigned long long>(backend_->batched_prefills() - packs_before),
+                static_cast<unsigned long long>(backend_->batched_prefill_sequences() - seqs_before));
+    EXPECT_EQ(correct, 24);
+    EXPECT_GT(backend_->batched_prefills(), packs_before) << "no prompts were packed: the batched path did not run";
+    expect_no_leaked_pages();
+}
+
+TEST_F(CudaLlmEngineBackendTest, BatchedPrefillWithAPrefixHitMatchesHuggingFace) {
+    // A prompt with a 48-token prefix (three full pages, the unit the cache reuses; the reference
+    // prompts alone are shorter than a page plus one token) is prefilled once with prefix caching
+    // on, then packed next to a fresh prompt: it starts from its cached offset. Its output must equal
+    // the same prompt prefilled with caching off; the fresh prompt's must equal Hugging Face.
+    const std::size_t n_new = refs_[0].greedy.size();
+    std::vector<TokenId> prefix;
+    for (const auto& r : refs_) {
+        prefix.insert(prefix.end(), r.prompt.begin(), r.prompt.end());
+    }
+    ASSERT_GE(prefix.size(), 48u);
+    prefix.resize(48);
+    std::vector<TokenId> long_prompt = prefix;
+    long_prompt.insert(long_prompt.end(), refs_[0].prompt.begin(), refs_[0].prompt.end());
+
+    const auto uncached = batched_greedy(*backend_, {long_prompt}, 1, n_new);  // caching off: the reference
+    backend_->set_prefix_caching(true);
+    const auto warm = batched_greedy(*backend_, {long_prompt}, 1, n_new);
+    EXPECT_EQ(warm[0], uncached[0]);
+    const auto reused_before = backend_->kv_stats().prefix_reused_tokens;
+    const std::uint64_t packs_before = backend_->batched_prefills();
+    const auto packed = batched_greedy(*backend_, {long_prompt, refs_[1].prompt}, 2, n_new);
+    EXPECT_EQ(packed[0], uncached[0]) << "the prefix hit, packed";
+    EXPECT_EQ(packed[1], refs_[1].greedy) << "the fresh prompt, packed";
+    EXPECT_GE(backend_->kv_stats().prefix_reused_tokens - reused_before, 48) << "the 48-token prefix was not reused";
+    EXPECT_EQ(backend_->batched_prefills(), packs_before + 1);
+    backend_->set_prefix_caching(false);  // evicts the cached pages
     expect_no_leaked_pages();
 }
 

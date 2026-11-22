@@ -1,7 +1,7 @@
 # Variable-length prefill attention: design
 
-Status: v0 (Day 48) and the tiled kernel (Day 49) implemented in `runtime/kernels`; next, the
-engine changes that use them. This note was written before the code (Day 47), and each implementation day is
+Status: v0 (Day 48) and the tiled kernel (Day 49) implemented in `runtime/kernels`, benchmarked
+(Day 50); the engine prefills the requests of a step together with it (Day 51). This note was written before the code (Day 47), and each implementation day is
 checked against it.
 
 ## Why
@@ -184,6 +184,54 @@ report: [benchmarks/results/day50-prefill-kernel.md](../benchmarks/results/day50
   2,048. 64 x 32 stays the default.
 - **Correctness held through the sweep:** the tiled outputs differ from the naive ones by at most
   0.0005 in any element.
+
+## Batched prefill in the engine (Day 51)
+
+The requests admitted in one engine step are prefilled together:
+
+- **The engine** creates a sequence for each and makes one `InferenceBackend::prefill_batch` call
+  with all of them (`PrefillItem`: sequence, prompt, then the first token or the error). Each item
+  succeeds or fails on its own, as with `prefill()`: a request whose prefill fails fails alone and
+  its sequence is freed. The default `prefill_batch` prefills the items one by one, so any backend
+  keeps working unchanged.
+- **The CUDA backend** checks every item and gives it its KV blocks first (prefix-cache hits
+  included), then packs the items whose new tokens fit one chunk into one forward pass while the
+  pack fits the 512-token prefill scratch and `max_batch` sequences
+  (`backend_detail::model_prefill_batch`): the embedding, every projection, RoPE (with each token's
+  own position) and the MLP run once on the stacked tokens; each sequence's new K/V are scattered
+  into its own pages; attention is `attention_prefill_varlen_tiled` (64 x 32) over the pack; the
+  last row of every sequence goes through the final norm and the head together, one
+  `[sequences x hidden]` by `[hidden x vocab]` product. A pack of one, or an item longer than a
+  chunk (a resumed request), takes `prefill()`'s path.
+- **Counted:** `batched_prefills()` and `batched_prefill_sequences()` on the backend.
+
+Tested: the engine (`tests/unit/test_engine_prefill_batch.cpp`: requests admitted in one step go
+in one call; a failing request in the batch fails alone), the backend's packing on a stand-in
+engine (what is packed and what goes alone, errors, prefix hits packed from their cached offset),
+and on the GPU (`CudaLlmEngineBackendTest`): the 8 Hugging Face reference prompts prefilled all
+together, in reverse order and in pairs, 24 sequences, each equal to Hugging Face token for token;
+and a prompt with a 48-token cached prefix packed next to a fresh prompt (equal to the same prompt
+without caching, and to Hugging Face). The release check passed with batched prefill serving the
+live server (concurrent streams equal to the same requests alone).
+
+Measured with the step profile (Day 46's scenarios, RTX 4050 Laptop GPU; full report
+[benchmarks/results/day51-step-profile.md](../benchmarks/results/day51-step-profile.md)):
+
+| Scenario | prefill before (Day 46) | with batched prefill | per request (P50) |
+| --- | --- | --- | --- |
+| `decode`: 32 x 64-token prompts at once | 3,314 tokens/s | **6,165 tokens/s (1.86x)** | 19.0 -> 9.8 ms |
+| `prefill`: 32 x 480-token prompts at once | 3,569 tokens/s | 3,585 tokens/s | 135 -> 134 ms |
+| `mixed`: 2 requests/s | 3,461 tokens/s | 3,393 tokens/s | 25.3 -> 25.3 ms |
+
+- **Short prompts are bound by reading the weights, like decode.** A 64-token prompt alone takes
+  19 ms, most of it reading the 2.5 GB of weights once. Two or more prompts in one pass share that
+  read, so prefill throughput nearly doubled and its share of the `decode` scenario fell from 3.5%
+  to 1.9%.
+- **Long prompts gain nothing yet,** as expected: two 480-token prompts do not fit one 512-token
+  step, so each is still prefilled alone, and at 480 tokens the matmuls are compute-bound anyway.
+- **Paced arrivals rarely share a step.** At 2 requests/s with 16 ms steps, requests seldom arrive
+  together; batching helps bursts. Chunked prefill (several requests' chunks per step) and mixed
+  prefill/decode steps are what move `mixed`.
 
 ## The model it serves
 

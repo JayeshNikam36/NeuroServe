@@ -34,4 +34,40 @@ void copy_page(const Model& m, PagedKVCache& c, int from, int to);
 void model_prefill_from(Model& m, PagedKVCache& c, Sequence& seq, const std::vector<int>& ids, int start,
                         std::vector<float>& logits);
 
+// ---- Batched prefill (Day 51, docs/prefill-attention.md) ----------------------------------------
+
+// One sequence of a batched prefill: its whole input ids, of which the first `start` positions are
+// already in its pages (a prefix-cache hit; 0 for a fresh prompt). seq.pages must cover ids.size()
+// tokens and seq.len must be 0.
+struct PrefillPart {
+    Sequence* seq = nullptr;
+    const std::vector<int>* ids = nullptr;
+    int start = 0;
+};
+
+// Device buffers for a batched prefill of up to max_seqs sequences: their block tables, offsets
+// and tile map, and the last rows and logits of every sequence.
+struct PrefillBatchScratch {
+    int max_seqs = 0;
+    int max_pages = 0;
+    int max_tiles = 0;
+    int* d_tables = nullptr;    // [max_seqs, max_pages]
+    int* d_cu = nullptr;        // [max_seqs + 1]
+    int* d_start = nullptr;     // [max_seqs]
+    int* d_tile_map = nullptr;  // [2 * max_tiles]
+    __half* d_last = nullptr;   // [max_seqs, hidden]: each sequence's last hidden row
+    __half* d_last_norm = nullptr;
+    __half* d_logits = nullptr;  // [max_seqs, vocab]
+};
+
+PrefillBatchScratch alloc_prefill_batch_scratch(const Model& m, int max_seqs, int max_pages);
+void free_prefill_batch_scratch(PrefillBatchScratch& s);
+
+// Prefills several sequences in one forward pass: their new tokens are packed (at most m.max_T in
+// all), every projection and the MLP run once on the pack, each sequence's K/V go into its own
+// pages, and attention is the varlen tiled kernel over the pack. Sets every seq.len and returns
+// each sequence's next token (the argmax of its last position's logits, ties to the lowest id).
+std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vector<PrefillPart>& parts,
+                                     PrefillBatchScratch& s);
+
 }  // namespace neuroserve::backend_detail

@@ -8,7 +8,7 @@ target_include_directories(neuroserve_backend
 
 target_link_libraries(neuroserve_backend
     PUBLIC  neuroserve::core
-    PRIVATE cuda_engine::core neuroserve::cuda ns_warnings)
+    PRIVATE cuda_engine::core neuroserve::cuda neuroserve::kernels ns_warnings)
 
 set_target_properties(neuroserve_backend PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
