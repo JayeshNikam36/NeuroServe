@@ -14,6 +14,11 @@ before 1.0, minor versions may change the API.
   kernels; `scripts/nsys_profile.sh`.
 - `neuroserve.bench.step_profile`: decode, prefill and mixed scenarios; the time split, decode cost
   by batch size, prefill cost per token, and a Chrome / Perfetto trace per scenario.
+- `neuroserve::kernels` (`runtime/kernels`): NeuroServe's own CUDA kernels, tested without a model.
+  First: variable-length prefill attention v0 (`attention_prefill_varlen_v0`), causal attention
+  for a pack of sequences with cached prefixes, paged K/V (docs/prefill-attention.md); tested
+  against a per-sequence FP32 reference for lengths 1–2,048, bit-identical alone or packed.
+- `ns_attention_bench`: prefill attention per layer (CUDA events), today's kernel against v0.
 
 ## [0.1.5] — Phase 3: KV-cache depth (tag `v0.1.5-kv`)
 

@@ -41,5 +41,6 @@ target_link_libraries(neuroserve_core
 set_target_properties(neuroserve_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(NS_ENABLE_CUDA)
+    add_subdirectory(kernels)
     add_subdirectory(backend)
 endif()
