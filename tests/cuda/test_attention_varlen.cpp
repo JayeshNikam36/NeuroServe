@@ -19,8 +19,21 @@
 
 namespace {
 
+using neuroserve::kernels::TileShape;
 using neuroserve::kernels::VarlenAttentionArgs;
+using neuroserve::kernels::attention_prefill_varlen_tiled;
 using neuroserve::kernels::attention_prefill_varlen_v0;
+using neuroserve::kernels::tile_rows;
+using neuroserve::kernels::varlen_tile_map;
+
+// Which kernel a problem runs: v0, or the tiled kernel with a tile shape.
+struct Kernel {
+    bool tiled = false;
+    TileShape shape = TileShape::k64x64;
+};
+constexpr Kernel kV0{};
+constexpr Kernel kTiled{true, TileShape::k64x64};
+const std::vector<TileShape> kShapes = {TileShape::k64x64, TileShape::k64x32, TileShape::k128x64, TileShape::k128x32};
 
 
 constexpr int kPage = 16;
@@ -99,8 +112,8 @@ struct Problem {
         return m;
     }
 
-    // Runs the kernel; returns out as floats.
-    std::vector<float> run() const {
+    // Runs a kernel; returns out as floats.
+    std::vector<float> run(Kernel kernel = kV0) const {
         DeviceBuffer<__half> dq(q), dk(k_pool), dv(v_pool);
         DeviceBuffer<std::int32_t> dcu(cu), dstart(start), dtables(tables);
         std::vector<__half> host_out(q.size(), __float2half(NAN));
@@ -122,7 +135,14 @@ struct Problem {
         a.head_dim = head_dim;
         a.page_size = kPage;
         a.scale = 1.f / std::sqrt(static_cast<float>(head_dim));
-        attention_prefill_varlen_v0(a);
+        if (kernel.tiled) {
+            const std::vector<std::int32_t> map = varlen_tile_map(cu, start, tile_rows(kernel.shape));
+            DeviceBuffer<std::int32_t> dmap(map);
+            attention_prefill_varlen_tiled(a, dmap.ptr, static_cast<int>(map.size() / 2), kernel.shape);
+            if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("tiled kernel failed");
+        } else {
+            attention_prefill_varlen_v0(a);
+        }
         if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("kernel failed");
         if (cudaMemcpy(host_out.data(), dout.ptr, host_out.size() * sizeof(__half), cudaMemcpyDeviceToHost) !=
             cudaSuccess)
@@ -254,12 +274,12 @@ TEST(AttentionVarlenV0, MatchesTheReferenceWithoutGroupedQueries) {
     expect_matches_reference(p, p.run());
 }
 
-TEST(AttentionVarlenV0, ASequencesOutputDoesNotDependOnItsPack) {
+void expect_independent_of_the_pack(Kernel kernel) {
     const std::vector<Seq> seqs = {{0, 37}, {16, 64}, {5, 129}, {0, 1}, {300, 200}};
     // The pack, and each sequence alone, from the same seed-derived data: build the pack once and
     // derive single-sequence problems that share its pages, Q, K and V.
     const Problem packed(seqs, 21);
-    const std::vector<float> out = packed.run();
+    const std::vector<float> out = packed.run(kernel);
     for (size_t b = 0; b < seqs.size(); ++b) {
         Problem alone = packed;
         alone.seqs = {seqs[b]};
@@ -269,7 +289,7 @@ TEST(AttentionVarlenV0, ASequencesOutputDoesNotDependOnItsPack) {
                             packed.tables.begin() + static_cast<long>((b + 1) * packed.max_pages));
         alone.q.assign(packed.q.begin() + static_cast<long>(static_cast<size_t>(packed.cu[b]) * 32 * 64),
                        packed.q.begin() + static_cast<long>(static_cast<size_t>(packed.cu[b + 1]) * 32 * 64));
-        EXPECT_EQ(rows_of(alone, 0, alone.run()), rows_of(packed, b, out)) << "sequence " << b;
+        EXPECT_EQ(rows_of(alone, 0, alone.run(kernel)), rows_of(packed, b, out)) << "sequence " << b;
     }
     // Reversed order: same bits per sequence.
     Problem reversed = packed;
@@ -287,11 +307,13 @@ TEST(AttentionVarlenV0, ASequencesOutputDoesNotDependOnItsPack) {
         reversed.q.insert(reversed.q.end(), packed.q.begin() + static_cast<long>(static_cast<size_t>(packed.cu[b]) * 32 * 64),
                           packed.q.begin() + static_cast<long>(static_cast<size_t>(packed.cu[b + 1]) * 32 * 64));
     }
-    const std::vector<float> rev_out = reversed.run();
+    const std::vector<float> rev_out = reversed.run(kernel);
     for (size_t r = 0; r < seqs.size(); ++r) {
         EXPECT_EQ(rows_of(reversed, r, rev_out), rows_of(packed, seqs.size() - 1 - r, out)) << "reversed position " << r;
     }
 }
+
+TEST(AttentionVarlenV0, ASequencesOutputDoesNotDependOnItsPack) { expect_independent_of_the_pack(kV0); }
 
 TEST(AttentionVarlenV0, IsDeterministic) {
     const Problem p({{0, 300}, {77, 50}}, 5);
@@ -330,6 +352,142 @@ TEST(AttentionVarlenV0, RefusesWhatItCannotServe) {
     a.max_pages = 800;
     a.max_keys = 12289;  // 49,156 bytes of scores
     EXPECT_THROW(attention_prefill_varlen_v0(a), std::invalid_argument);
+}
+
+// ---- The tiled kernel (Day 49) ---------------------------------------------------------------------
+
+// Elementwise: |a - b| <= kAtol + kRtol * |b|.
+void expect_close(const Problem& p, const std::vector<float>& got, const std::vector<float>& want, const char* what) {
+    float worst = 0.f;
+    for (size_t e = 0; e < got.size(); ++e) {
+        const float err = std::fabs(got[e] - want[e]);
+        worst = std::max(worst, err);
+        if (!(err <= kAtol + kRtol * std::fabs(want[e]))) {
+            const size_t token = e / (static_cast<size_t>(p.n_heads) * p.head_dim);
+            ADD_FAILURE() << what << ": token " << token << " element " << e << ": got " << got[e] << ", want " << want[e];
+            return;
+        }
+    }
+    ::testing::Test::RecordProperty(std::string("max_err_") + what, std::to_string(worst));
+}
+
+TEST(AttentionVarlenTiled, MatchesTheReferenceForEverySingleLengthFrom1To2048) {
+    for (const int T : kLengths) {
+        SCOPED_TRACE("T = " + std::to_string(T));
+        const Problem p({{0, T}}, static_cast<std::uint32_t>(T));
+        expect_matches_reference(p, p.run(kTiled));
+    }
+}
+
+TEST(AttentionVarlenTiled, MatchesTheReferenceForAPackOfMixedLengthsWithCachedPrefixes) {
+    const Problem p({{0, 1}, {16, 2}, {17, 15}, {100, 16}, {0, 17}, {33, 63}, {64, 64}, {0, 65}, {1, 127},
+                     {48, 128}, {0, 129}, {256, 480}, {1048, 1000}, {0, 2048}, {1, 2047}},
+                    7);
+    expect_matches_reference(p, p.run(kTiled));
+}
+
+TEST(AttentionVarlenTiled, MatchesTheReferenceForRandomPacks) {
+    std::mt19937 rng(4242);
+    for (int trial = 0; trial < 4; ++trial) {
+        const int n = 1 + static_cast<int>(rng() % 16);
+        std::vector<Seq> seqs;
+        for (int s = 0; s < n; ++s) {
+            const int T = 1 + static_cast<int>(rng() % 256);
+            const int start = (rng() % 3 == 0) ? 0 : static_cast<int>(rng() % 1024u);
+            seqs.push_back({start, T});
+        }
+        SCOPED_TRACE("trial " + std::to_string(trial));
+        const Problem p(seqs, 2000u + static_cast<std::uint32_t>(trial));
+        expect_matches_reference(p, p.run(kTiled));
+    }
+}
+
+TEST(AttentionVarlenTiled, MatchesTheReferenceWithASharpSoftmaxAndWithoutGroupedQueries) {
+    const Problem sharp({{0, 64}, {200, 100}, {0, 513}}, 9, 8.f);
+    expect_matches_reference(sharp, sharp.run(kTiled));
+    const Problem mha({{0, 40}, {30, 70}}, 11, 1.f, /*heads=*/8, /*kv_heads=*/8);
+    expect_matches_reference(mha, mha.run(kTiled));
+}
+
+TEST(AttentionVarlenTiled, MatchesV0WithinToleranceForEveryTileShape) {
+    // Every tile edge: lengths around 16, 32, 64 and 128, cached starts on and off page and tile
+    // boundaries, and the longest context.
+    const Problem p({{0, 1}, {0, 31}, {0, 32}, {0, 33}, {5, 64}, {64, 65}, {0, 127}, {100, 128}, {31, 129},
+                     {0, 480}, {700, 300}, {0, 2048}},
+                    13);
+    const std::vector<float> v0 = p.run(kV0);
+    for (const TileShape shape : kShapes) {
+        SCOPED_TRACE(neuroserve::kernels::tile_shape_name(shape));
+        expect_close(p, p.run({true, shape}), v0, neuroserve::kernels::tile_shape_name(shape));
+    }
+}
+
+TEST(AttentionVarlenTiled, ASequencesOutputDoesNotDependOnItsPack) {
+    for (const TileShape shape : kShapes) {
+        SCOPED_TRACE(neuroserve::kernels::tile_shape_name(shape));
+        expect_independent_of_the_pack({true, shape});
+    }
+}
+
+TEST(AttentionVarlenTiled, IsDeterministic) {
+    const Problem p({{0, 300}, {77, 50}, {0, 1}}, 5);
+    for (const TileShape shape : kShapes) {
+        const std::vector<float> a = p.run({true, shape});
+        const std::vector<float> b = p.run({true, shape});
+        for (size_t s = 0; s < 3; ++s) EXPECT_EQ(rows_of(p, s, a), rows_of(p, s, b)) << s;
+    }
+}
+
+TEST(AttentionVarlenTiled, TheTileMapCoversEveryTokenOnceLongestFirst) {
+    const std::vector<std::int32_t> cu = {0, 1, 65, 200, 330};
+    const std::vector<std::int32_t> start = {0, 1000, 0, 64};
+    for (const int rows : {64, 128}) {
+        const std::vector<std::int32_t> map = varlen_tile_map(cu, start, rows);
+        std::vector<int> covered(330, 0);
+        long long last_end = 1LL << 40;
+        for (size_t t = 0; t < map.size(); t += 2) {
+            const int b = map[t];
+            const int i0 = map[t + 1];
+            const int T = cu[static_cast<size_t>(b) + 1] - cu[static_cast<size_t>(b)];
+            ASSERT_EQ(i0 % rows, 0);
+            for (int i = i0; i < std::min(i0 + rows, T); ++i) ++covered[static_cast<size_t>(cu[static_cast<size_t>(b)] + i)];
+            const long long end = start[static_cast<size_t>(b)] + std::min(i0 + rows, T);
+            EXPECT_LE(end, last_end);
+            last_end = end;
+        }
+        for (int c : covered) EXPECT_EQ(c, 1);
+    }
+    EXPECT_EQ(varlen_tile_map(cu, start, 64), varlen_tile_map(cu, start, 64));
+}
+
+TEST(AttentionVarlenTiled, RefusesWhatItCannotServe) {
+    const Problem p({{0, 8}}, 3, 1.f, /*heads=*/4, /*kv_heads=*/4);
+    DeviceBuffer<__half> dq(p.q), dk(p.k_pool), dv(p.v_pool);
+    DeviceBuffer<std::int32_t> dcu(p.cu), dstart(p.start), dtables(p.tables);
+    const std::vector<std::int32_t> map = varlen_tile_map(p.cu, p.start, 64);
+    DeviceBuffer<std::int32_t> dmap(map);
+    VarlenAttentionArgs a;
+    a.q = dq.ptr;
+    a.k_pool = dk.ptr;
+    a.v_pool = dv.ptr;
+    a.cu_seqlens_q = dcu.ptr;
+    a.start = dstart.ptr;
+    a.block_tables = dtables.ptr;
+    a.out = dq.ptr;
+    a.num_seqs = 1;
+    a.total_q = 8;
+    a.max_keys = 8;
+    a.max_pages = 1;
+    a.n_heads = 4;
+    a.n_kv_heads = 4;
+    a.head_dim = 128;  // only 64 is built
+    a.page_size = kPage;
+    a.scale = 0.125f;
+    EXPECT_THROW(attention_prefill_varlen_tiled(a, dmap.ptr, 1), std::invalid_argument);
+    a.head_dim = 64;
+    EXPECT_THROW(attention_prefill_varlen_tiled(a, nullptr, 1), std::invalid_argument);
+    EXPECT_THROW(attention_prefill_varlen_tiled(a, dmap.ptr, 0), std::invalid_argument);
+    EXPECT_THROW(varlen_tile_map({0, 8}, {}, 64), std::invalid_argument);
 }
 
 }  // namespace
