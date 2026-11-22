@@ -35,8 +35,9 @@ if(NS_ENABLE_CUDA)
     # ---- GPU unit tests (fast, no model needed) ----
     add_executable(ns_cuda_tests
         cuda/test_smoke.cpp
-        cuda/test_device_info.cpp)
-    target_link_libraries(ns_cuda_tests PRIVATE neuroserve::cuda GTest::gtest_main ns_warnings)
+        cuda/test_device_info.cpp
+        cuda/test_attention_varlen.cpp)
+    target_link_libraries(ns_cuda_tests PRIVATE neuroserve::cuda neuroserve::kernels GTest::gtest_main ns_warnings)
     gtest_discover_tests(ns_cuda_tests PROPERTIES LABELS "gpu")
 
     # ---- Integration tests (GPU + model weights + reference outputs) ----

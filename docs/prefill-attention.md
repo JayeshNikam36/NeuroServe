@@ -1,8 +1,8 @@
 # Variable-length prefill attention: design
 
-Status: design (Day 47). Implemented in steps: v0 on Day 48, the tiled kernel on Day 49, then
-the engine changes that use it. This note is written before the code, and each implementation
-day is checked against it.
+Status: v0 implemented (Day 48, `runtime/kernels`); the tiled kernel is Day 49, then the engine
+changes that use it. This note was written before the code (Day 47), and each implementation day is
+checked against it.
 
 ## Why
 
@@ -42,6 +42,47 @@ What this design changes, and what it does not:
    not known yet: Nsight Systems on WSL 2 does not record kernel activity. **Day 48 measures it
    first** (CUDA events around the attention launches of one prefill), so the gain of each step
    is known, not assumed.
+
+## Measured (Day 48)
+
+`ns_attention_bench` (`benchmarks/attention`): one layer's prefill attention, CUDA events, median
+of 20 runs, RTX 4050 Laptop GPU. Full table:
+[benchmarks/results/day48-attention-v0.md](../benchmarks/results/day48-attention-v0.md).
+
+| Case | today's kernel, ms per layer | v0, ms per layer | x 16 layers |
+| --- | --- | --- | --- |
+| 1 x 64 tokens | 0.126 | 0.129 | 2.0 ms |
+| 1 x 480 | 5.58 | 5.57 | 89 ms |
+| 1 x 2,048 | 102.2 | 102.7 | 1,635 ms |
+| 4 x 480 | 22.3 | 22.1 | 356 ms |
+| 256 new tokens after 1,024 cached | 16.4 | 14.1 | 262 ms |
+
+- **Today's kernel is quadratic, and slow.** Time grows with new tokens x keys: 5.6 ms per layer
+  at 480 tokens, 102 ms at 2,048. Every block rereads all of its sequence's K and V, and one
+  thread sums each softmax.
+- **It runs on prefix hits, chunks and resumptions, not on fresh prompts.** A prompt prefilled from
+  zero goes through the engine's own prefill attention: Day 46's cost per token was flat from 64 to
+  480 tokens (0.30 and 0.28 ms), which a quadratic term this size would not allow. So the slow
+  kernel is not in the 135 ms of a fresh 480-token prompt. It is in every prefill from an offset:
+  256 new tokens after a 1,024-token cached prefix spend about 262 ms in attention alone, where the
+  rest of that prefill costs about 72 ms. Prefix caching won on Day 43 with prompts of at most 480
+  tokens; with long cached prefixes, this kernel would eat the gain.
+- **v0 is as fast as today's kernel**, as intended: the same algorithm, one launch for the whole
+  pack instead of one per sequence (slightly faster for the pack and the cached case). It is the
+  correctness reference.
+- **So Day 49's tiled kernel is the win.** Reading K and V once per 64-query tile instead of once
+  per query, with tensor cores, should take 480 tokens from 5.6 ms per layer to well under 1 ms.
+  It makes prefill from an offset (prefix hits, chunked prefill, resumption) cost about what a
+  fresh prompt costs, and it can then replace the engine's own prefill attention as well, so every
+  prefill uses one kernel.
+
+## v0 as implemented
+
+`neuroserve::kernels::attention_prefill_varlen_v0` (`runtime/kernels`), with the interface above
+in a `VarlenAttentionArgs` struct. One block of 128 threads per (packed token, query head); the
+block finds its sequence by binary search over `cu_seqlens_q` (the tile map is for the tiled
+kernel); scores for every key in shared memory, so at most 12,288 keys (48 KB). Tests:
+`tests/cuda/test_attention_varlen.cpp` (8 tests, every case listed under Tests below).
 
 ## The model it serves
 
