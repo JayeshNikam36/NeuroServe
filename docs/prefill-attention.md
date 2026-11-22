@@ -151,6 +151,40 @@ first); refused arguments.
   is the visible limit: the register-resident softmax (`mma.sync`) and double-buffered K/V
   (`cp.async`) are the next step if attention becomes the bottleneck again.
 
+### Benchmark (Day 50)
+
+`ns_prefill_kernel_bench`: fresh prompts of 64–2,048 tokens at batch 1 and batch 8, one layer, the
+L2 flushed before every timed run, NVML clocks logged after every run. RTX 4050 Laptop GPU. Full
+report: [benchmarks/results/day50-prefill-kernel.md](../benchmarks/results/day50-prefill-kernel.md).
+
+| Length | batch 1: naive | tiled (best) | TFLOPS | speed-up | batch 8: naive | tiled (best) | TFLOPS | speed-up |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 0.132 ms | 0.032 ms | 0.54 | 4.2x | 0.98 ms | 0.118 ms | 1.16 | 8.3x |
+| 256 | 1.56 ms | 0.097 ms | 2.77 | 16.1x | 13.1 ms | 0.581 ms | 3.71 | 22.6x |
+| 512 | 6.32 ms | 0.257 ms | 4.19 | 24.6x | 50.9 ms | 1.82 ms | 4.74 | 28.0x |
+| 1,024 | 24.9 ms | 0.826 ms | 5.20 | 30.1x | 202 ms | 6.90 ms | 4.98 | 29.3x |
+| 2,048 | 102 ms | 2.92 ms | 5.88 | 34.8x | 814 ms | 26.0 ms | 5.29 | 31.3x |
+
+- **The naive kernel stays at 0.13–0.17 TFLOPS at every size**: it does not use the tensor cores
+  and rereads K and V for every query, so more work only takes longer. The tiled kernel climbs from
+  0.5 TFLOPS at 64 tokens to 5–5.9 TFLOPS from 1,024: 4x to 35x faster.
+- **Against the hardware:** about 43% of the tensor cores' FP16 peak with FP32 accumulation, which
+  is roughly 13.6 TFLOPS here (20 SMs x 2,655 MHz x 256 FLOPs per SM per clock, the rate per SM
+  and clock implied by NVIDIA's published figures for GeForce Ada). The plateau at about 5 TFLOPS
+  from 512 tokens at batch 8 is the occupancy limit noted above.
+- **Short prompts are launch- and occupancy-bound.** At 64 tokens one prompt is 32 blocks, too few
+  for 20 SMs; batch 8 doubles the TFLOPS (0.54 to 1.16). Packing the prompts of a step into one
+  launch, which the varlen layout allows, is what helps short prompts most.
+- **A warm L2 flatters the short cases.** Without the flush, 64–256 tokens run 12–46% faster (K and
+  V of the last run are still in the 24 MB L2), 512 tokens up to 10%; from 1,024 tokens the
+  difference is under 5%. Every number in this table is with the flush.
+- **The clocks held:** SM at 2,655 MHz in every one of 1,175 runs, 51–70 °C, no thermal events.
+  NVML reported its power-cap reason on 32 runs (3%) without the clock dropping below 2,655 MHz.
+- **Shapes:** 64 x 32 is best or within 4% everywhere up to 1,024 tokens; 128 x 64 is 4–8% faster at
+  2,048. 64 x 32 stays the default.
+- **Correctness held through the sweep:** the tiled outputs differ from the naive ones by at most
+  0.0005 in any element.
+
 ## The model it serves
 
 Llama 3.2 1B, FP16:

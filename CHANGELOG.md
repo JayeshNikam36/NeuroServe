@@ -24,6 +24,9 @@ before 1.0, minor versions may change the API.
   P V on tensor cores (WMMA); four tile shapes (64 x 32 default); `varlen_tile_map` (longest tiles
   first). Matches v0 within tolerance at every tested length; deterministic and batch-invariant.
   25.5x faster than today's kernel at 480 tokens (0.23 ms per layer), 35x at 2,048.
+- `ns_prefill_kernel_bench`: prefill attention by length (64–2,048) and batch (1, 8), naive against
+  tiled; L2 flushed before every timed run, NVML clocks, temperature, power and clock-event reasons
+  per run, achieved TFLOPS.
 
 ## [0.1.5] — Phase 3: KV-cache depth (tag `v0.1.5-kv`)
 

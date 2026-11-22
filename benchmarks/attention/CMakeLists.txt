@@ -3,3 +3,9 @@
 add_executable(ns_attention_bench attention_bench.cu)
 target_include_directories(ns_attention_bench PRIVATE ${PROJECT_SOURCE_DIR}/runtime/backend/src)
 target_link_libraries(ns_attention_bench PRIVATE neuroserve::kernels neuroserve::backend cuda_engine::core)
+
+# Prefill attention kernel by length and batch (Day 50): L2 flushed, clocks logged through NVML.
+#   ./build/dev-cuda/benchmarks/attention/ns_prefill_kernel_bench --out benchmarks/results/day50-prefill-kernel.md
+add_executable(ns_prefill_kernel_bench prefill_kernel_bench.cu)
+target_include_directories(ns_prefill_kernel_bench PRIVATE ${PROJECT_SOURCE_DIR}/runtime/backend/src)
+target_link_libraries(ns_prefill_kernel_bench PRIVATE neuroserve::kernels neuroserve::backend cuda_engine::core CUDA::nvml)
