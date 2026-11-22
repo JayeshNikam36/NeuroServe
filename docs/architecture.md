@@ -146,7 +146,7 @@ One YAML file (`configs/dev.yaml`), validated at startup; unknown keys are error
 | Prefix caching shares full 16-token blocks only, and is off by default in `configs/dev.yaml` | On by default once the release gate covers it; partial-block sharing not scheduled |
 | Measured on one laptop GPU; no baseline against another server yet | vLLM baseline and comparison (Days 94–95) |
 | No authentication; the runtime policy endpoint is an operator control | Security defaults review (Day 115) |
-| Deterministic but not batch-invariant: at a near-tie the batch (or a prefix hit) can change a greedy choice ([ADR-0006](adr/0006-determinism-not-batch-invariance.md)); since Day 38 a preempted request resumes from its own tokens, so it never contradicts what it streamed | Cause in profiling (Day 46) |
+| Deterministic but not batch-invariant: at a near-tie the batch (or a prefix hit) can change a greedy choice ([ADR-0006](adr/0006-determinism-not-batch-invariance.md)); since Day 38 a preempted request resumes from its own tokens, so it never contradicts what it streamed | The cause is in the kernels' numerics (reduction order across batch sizes): Phase 4 kernel work. Day 46's profile times phases, not numerics |
 | Greedy decoding only, `n=1` | Not scheduled |
 
 Design decisions are recorded in [adr/](adr/).

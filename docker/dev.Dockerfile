@@ -23,6 +23,15 @@ RUN python3 -m pip install --no-cache-dir \
         "nvidia-ml-py==12.560.30" \
     && cmake --version
 
+# 2023.4 (CUDA 12.4's own) cannot import traces of this multi-threaded server ("Wrong event order");
+# a newer standalone release profiles CUDA 12.4 programs and imports them.
+# Nsight Systems CLI (nsys): engine-step timelines with CUDA kernels and NVTX ranges
+# (scripts/nsys_profile.sh, docs/profiling.md). Linked into /usr/local/bin if the package does not.
+RUN apt-get update && apt-get install -y --no-install-recommends "$(apt-cache pkgnames nsight-systems-2024 | sort -V | tail -n1)" \
+    && rm -rf /var/lib/apt/lists/* \
+    && (command -v nsys || ln -s "$(ls -d /opt/nvidia/nsight-systems/*/bin/nsys | head -n1)" /usr/local/bin/nsys) \
+    && nsys --version
+
 # Non-root user matching the host UID/GID, so files created in the
 # mounted repo are owned by you, not root.
 ARG USERNAME=dev

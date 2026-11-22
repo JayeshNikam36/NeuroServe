@@ -55,6 +55,10 @@ class GenerationEngine(Protocol):
 
     def decisions(self, since: int = 0, limit: int = 100) -> dict[str, Any]: ...
 
+    def step_profile(self, records: bool = False) -> dict[str, Any]: ...
+
+    def reset_step_profile(self) -> None: ...
+
     def cancel(self, request_id: str) -> bool: ...
 
     def set_scheduling_policy(self, name: str) -> None:
@@ -221,6 +225,13 @@ class EngineService:
 
     def decisions(self, since: int, limit: int) -> dict[str, Any]:
         return self._engine.decisions(since=since, limit=limit)
+
+    def step_profile(self, records: bool) -> dict[str, Any]:
+        """Where the engine thread's time went since the last reset (docs/profiling.md)."""
+        return self._engine.step_profile(records=records)
+
+    def reset_step_profile(self) -> None:
+        self._engine.reset_step_profile()
 
     def cancel(self, engine_request_id: str) -> bool:
         return self._engine.cancel(engine_request_id)

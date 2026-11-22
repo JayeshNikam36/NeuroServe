@@ -108,6 +108,7 @@ class FakeEngine:
         self.policy = "fcfs"
         self.next_policy: str | None = None  # like the real engine: applied at the next step
         self.policy_history: list[str] = []  # every set_scheduling_policy call, in order
+        self.profile_reset_at = 0  # len(calls) at the last reset_step_profile()
         self.decision_log = [{"seq": i, "step": i, "time_ms": 0, "request_id": f"ns-{i:06d}",
                               "client_request_id": "", "action": "admit", "reason": "admitted", "policy": "fcfs",
                               "numbers": {"free_pages": 64}} for i in range(1, 6)]
@@ -171,6 +172,21 @@ class FakeEngine:
     def decisions(self, since=0, limit=100):
         page = [d for d in self.decision_log if d["seq"] > since][:limit]
         return {"data": page, "next_since": page[-1]["seq"] if page else since, "dropped": 0}
+
+    def step_profile(self, records=False):
+        # Like the real engine: one record per call since the last reset, 2 ms of decode each.
+        steps = len(self.calls) - self.profile_reset_at
+        step = {"housekeeping_ms": 0.0, "schedule_ms": 0.0, "preempt_ms": 0.0, "prefill_ms": 0.0,
+                "decode_ms": 2.0, "host_ms": 0.0, "invariants_ms": 0.0, "total_ms": 2.0,
+                "prefill_requests": 0, "prefill_tokens": 0, "decode_batch": 1}
+        out = {"elapsed_ms": 10.0 * steps, "idle_ms": 8.0 * steps, "steps": steps, "busy_steps": steps,
+               "totals": {k: v * steps for k, v in step.items()}, "dropped": 0}
+        if records:
+            out["records"] = [{**step, "start_ms": 10.0 * i} for i in range(steps)]
+        return out
+
+    def reset_step_profile(self):
+        self.profile_reset_at = len(self.calls)
 
 
 @pytest.fixture(scope="module")
@@ -742,4 +758,19 @@ def test_runtime_state_of_an_idle_engine(tok):
         state = client.get("/v1/runtime/state").json()
     assert state["kv_cache"]["occupancy"] == 0.0 and state["kv_cache"]["free_pages"] == 64
     assert state["prefix_cache"]["hit_rate"] == 0.0 and state["prefix_cache"]["miss_pages"] == 0
+
+
+def test_the_step_profile_is_read_and_reset_over_http(tok):
+    app, engine, _ = make_app(tok)
+    body = {"model": MODEL_NAME, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 4}
+    with TestClient(app) as client:
+        for _ in range(3):
+            assert client.post("/v1/chat/completions", json=body).status_code == 200
+        profile = client.get("/v1/runtime/profile").json()
+        assert profile["object"] == "runtime.profile" and profile["steps"] == 3 and "records" not in profile
+        assert profile["totals"]["decode_ms"] == 6.0 and profile["idle_ms"] == 24.0
+        with_records = client.get("/v1/runtime/profile", params={"records": "true"}).json()
+        assert [r["start_ms"] for r in with_records["records"]] == [0.0, 10.0, 20.0]
+        assert client.delete("/v1/runtime/profile").json() == {"object": "runtime.profile", "reset": True}
+        assert client.get("/v1/runtime/profile").json()["steps"] == 0
 
