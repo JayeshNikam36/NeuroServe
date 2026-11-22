@@ -1,6 +1,7 @@
 #include "neuroserve/backend/cuda_llm_engine_backend.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <iterator>
 #include <fstream>
@@ -91,6 +92,10 @@ struct CudaLlmEngineBackend::Impl {
     bool prefix_caching = false;
     int prefill_chunk = 0;  // tokens per prefill chunk: max_prompt_tokens unless a test sets fewer
     SeqId next_id = 1;
+    backend_detail::PrefillBatchScratch prefill_scratch{};  // batched prefill (Day 51)
+    bool prefill_scratch_allocated = false;
+    std::uint64_t batched_prefills = 0;
+    std::uint64_t batched_prefill_sequences = 0;
 
     ~Impl() { release(); }
 
@@ -107,6 +112,10 @@ struct CudaLlmEngineBackend::Impl {
         if (batch_allocated) {
             free_batch_state(batch);
             batch_allocated = false;
+        }
+        if (prefill_scratch_allocated) {
+            backend_detail::free_prefill_batch_scratch(prefill_scratch);
+            prefill_scratch_allocated = false;
         }
         if (cache) {
             free_paged_cache(*cache);
@@ -156,6 +165,93 @@ struct CudaLlmEngineBackend::Impl {
             throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
         }
     }
+
+    // prefill()'s checks: an empty sequence, a non-empty prompt that fits, valid tokens.
+    ::Sequence& checked_for_prefill(SeqId id, std::span<const TokenId> prompt) {
+        ::Sequence& seq = get(id);
+        if (seq.len != 0) {
+            throw std::logic_error("prefill: sequence " + std::to_string(id) + " already holds tokens");
+        }
+        if (prompt.empty()) {
+            throw std::invalid_argument("prefill: empty prompt");
+        }
+        const int n = static_cast<int>(prompt.size());
+        const int capacity = config.max_pages_per_sequence * config.page_size_tokens;
+        if (n > capacity) {  // longer than max_prompt_tokens is fine: it is prefilled in chunks
+            throw std::length_error("prefill: " + std::to_string(n) + " tokens, a sequence holds at most " +
+                                    std::to_string(capacity));
+        }
+        for (const TokenId t : prompt) {
+            check_token(t);
+        }
+        return seq;
+    }
+
+    // Gives the sequence its blocks: reused prefix blocks and new ones with prefix caching, all new
+    // without. Returns how many leading tokens are cached. Throws, changing nothing, if blocks run out.
+    int admit(SeqId id, ::Sequence& seq, std::span<const TokenId> prompt) {
+        const int n = static_cast<int>(prompt.size());
+        int cached = 0;
+        if (prefix_caching) {
+            const core::Admission a = kv->admit(id, prompt);  // reuses indexed full pages, takes the rest;
+                                                              // throws, changing nothing, if pages run out
+            cached = a.cached_tokens;
+            if (a.copy) {  // copy-on-write: the prefill will write the last token into this page
+                backend_detail::copy_page(model, *cache, a.copy->from, a.copy->to);
+            }
+        } else {
+            const int pages = kv->blocks_needed(id, n);
+            if (pages > kv->free_blocks()) {
+                throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages, " +
+                                       std::to_string(kv->free_blocks()) + " free");
+            }
+            kv->append(id, n);  // the blocks for the prompt, from the manager
+        }
+        sync_pages(id, seq);
+        return cached;
+    }
+
+    // After the K/V are written: the engine and the manager agree, and the prompt's full pages are
+    // indexed for later hits.
+    void finish_prefill(SeqId id, const ::Sequence& seq, std::span<const TokenId> prompt) {
+        check_in_sync(id, seq);
+        if (prefix_caching) {
+            std::vector<TokenId>& held = tokens[id];
+            held.assign(prompt.begin(), prompt.end());
+            kv->commit(id, held);
+        }
+    }
+
+    // prefill()'s computation for one admitted sequence, in chunks of at most prefill_chunk tokens
+    // (the scratch holds max_prompt_tokens): a client's prompt is one chunk; a resumed request's
+    // prompt + generated tokens can be several (Day 38).
+    TokenId run_chunked(SeqId id, ::Sequence& seq, std::span<const TokenId> prompt, int cached) {
+        const std::vector<int> ids(prompt.begin(), prompt.end());
+        const int n = static_cast<int>(ids.size());
+        // The engine reports GPU errors by exiting (CUDA_CHECK), never by throwing, so nothing below
+        // can leave the manager ahead of the engine.
+        std::vector<float> logits;
+        const int chunk = prefill_chunk;
+        int done = cached;
+        if (done == 0) {
+            const int first = std::min(n, chunk);
+            if (first == n) {
+                model_prefill_paged(model, *cache, seq, ids, logits);
+            } else {
+                model_prefill_paged(model, *cache, seq, std::vector<int>(ids.begin(), ids.begin() + first), logits);
+            }
+            done = first;
+        }
+        while (done < n) {  // each later chunk attends to everything before it, as a cached prefix
+            const int end = std::min(n, done + chunk);
+            backend_detail::model_prefill_from(model, *cache, seq,
+                                               end == n ? ids : std::vector<int>(ids.begin(), ids.begin() + end), done,
+                                               logits);
+            done = end;
+        }
+        finish_prefill(id, seq, prompt);
+        return argmax_first(logits);
+    }
 };
 
 CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
@@ -193,6 +289,9 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->prefill_chunk = config.max_prompt_tokens;
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
+    impl_->prefill_scratch =
+        backend_detail::alloc_prefill_batch_scratch(impl_->model, config.max_batch, config.max_pages_per_sequence);
+    impl_->prefill_scratch_allocated = true;
 
     ModelInfo& info = impl_->info;
     info.name = config.model_name;
@@ -278,70 +377,84 @@ SeqId CudaLlmEngineBackend::create_sequence() {
 
 TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt) {
     Impl& im = *impl_;
-    ::Sequence& seq = im.get(id);
-    if (seq.len != 0) {
-        throw std::logic_error("prefill: sequence " + std::to_string(id) + " already holds tokens");
-    }
-    if (prompt.empty()) {
-        throw std::invalid_argument("prefill: empty prompt");
-    }
-    const int n = static_cast<int>(prompt.size());
-    const int capacity = im.config.max_pages_per_sequence * im.config.page_size_tokens;
-    if (n > capacity) {  // longer than max_prompt_tokens is fine: it is prefilled in chunks
-        throw std::length_error("prefill: " + std::to_string(n) + " tokens, a sequence holds at most " +
-                                std::to_string(capacity));
-    }
-    for (const TokenId t : prompt) {
-        im.check_token(t);
-    }
-    const std::vector<int> ids(prompt.begin(), prompt.end());
-    int cached = 0;
-    if (im.prefix_caching) {
-        const core::Admission a = im.kv->admit(id, prompt);  // reuses indexed full pages, takes the rest;
-                                                             // throws, changing nothing, if pages run out
-        cached = a.cached_tokens;
-        if (a.copy) {  // copy-on-write: the prefill will write the last token into this page
-            backend_detail::copy_page(im.model, *im.cache, a.copy->from, a.copy->to);
+    ::Sequence& seq = im.checked_for_prefill(id, prompt);
+    const int cached = im.admit(id, seq, prompt);
+    return im.run_chunked(id, seq, prompt, cached);
+}
+
+void CudaLlmEngineBackend::prefill_batch(std::span<PrefillItem> items) {
+    Impl& im = *impl_;
+    struct Admitted {
+        PrefillItem* item;
+        ::Sequence* seq;
+        int cached;
+    };
+    // Every item's checks and blocks first, in order; an item that fails them fails alone.
+    std::vector<Admitted> admitted;
+    for (PrefillItem& item : items) {
+        item.error = nullptr;
+        try {
+            ::Sequence& seq = im.checked_for_prefill(item.seq, item.prompt);
+            admitted.push_back({&item, &seq, im.admit(item.seq, seq, item.prompt)});
+        } catch (...) {
+            item.error = std::current_exception();
         }
-    } else {
-        const int pages = im.kv->blocks_needed(id, n);
-        if (pages > im.kv->free_blocks()) {
-            throw KvCacheExhausted("prefill: needs " + std::to_string(pages) + " KV pages, " +
-                                   std::to_string(im.kv->free_blocks()) + " free");
-        }
-        im.kv->append(id, n);  // the blocks for the prompt, from the manager
     }
-    im.sync_pages(id, seq);
-    // The engine reports GPU errors by exiting (CUDA_CHECK), never by throwing, so nothing below
-    // can leave the manager ahead of the engine.
-    // In chunks of at most prefill_chunk tokens (the scratch holds max_prompt_tokens): a client's
-    // prompt is one chunk; a resumed request's prompt + generated tokens can be several (Day 38).
-    std::vector<float> logits;
-    const int chunk = im.prefill_chunk;
-    int done = cached;
-    if (done == 0) {
-        const int first = std::min(n, chunk);
-        if (first == n) {
-            model_prefill_paged(im.model, *im.cache, seq, ids, logits);
+    // Together: items whose new tokens fit one chunk, while the pack fits the scratch. The rest, and
+    // a pack of one, go through prefill()'s path.
+    std::vector<Admitted*> pack;
+    std::vector<Admitted*> alone;
+    int packed_tokens = 0;
+    for (Admitted& a : admitted) {
+        const int fresh = static_cast<int>(a.item->prompt.size()) - a.cached;
+        if (fresh <= im.prefill_chunk && packed_tokens + fresh <= im.config.max_prompt_tokens &&
+            static_cast<int>(pack.size()) < im.prefill_scratch.max_seqs) {
+            pack.push_back(&a);
+            packed_tokens += fresh;
         } else {
-            model_prefill_paged(im.model, *im.cache, seq, std::vector<int>(ids.begin(), ids.begin() + first), logits);
+            alone.push_back(&a);
         }
-        done = first;
     }
-    while (done < n) {  // each later chunk attends to everything before it, as a cached prefix
-        const int end = std::min(n, done + chunk);
-        backend_detail::model_prefill_from(im.model, *im.cache, seq,
-                                           end == n ? ids : std::vector<int>(ids.begin(), ids.begin() + end), done,
-                                           logits);
-        done = end;
+    if (pack.size() == 1) {
+        alone.insert(alone.begin(), pack.front());
+        pack.clear();
     }
-    im.check_in_sync(id, seq);
-    if (im.prefix_caching) {
-        std::vector<TokenId>& held = im.tokens[id];
-        held.assign(prompt.begin(), prompt.end());
-        im.kv->commit(id, held);  // the prompt's full pages are written: index them
+    if (!pack.empty()) {
+        std::vector<std::vector<int>> ids;
+        ids.reserve(pack.size());
+        std::vector<backend_detail::PrefillPart> parts;
+        for (Admitted* a : pack) {
+            ids.emplace_back(a->item->prompt.begin(), a->item->prompt.end());
+        }
+        for (std::size_t i = 0; i < pack.size(); ++i) {
+            parts.push_back({pack[i]->seq, &ids[i], pack[i]->cached});
+        }
+        const std::vector<int> next = backend_detail::model_prefill_batch(im.model, *im.cache, parts, im.prefill_scratch);
+        for (std::size_t i = 0; i < pack.size(); ++i) {
+            PrefillItem& item = *pack[i]->item;
+            try {
+                im.finish_prefill(item.seq, *pack[i]->seq, item.prompt);
+                item.first = next[i];
+            } catch (...) {
+                item.error = std::current_exception();
+            }
+        }
+        ++im.batched_prefills;
+        im.batched_prefill_sequences += pack.size();
     }
-    return argmax_first(logits);
+    for (Admitted* a : alone) {
+        try {
+            a->item->first = im.run_chunked(a->item->seq, *a->seq, a->item->prompt, a->cached);
+        } catch (...) {
+            a->item->error = std::current_exception();
+        }
+    }
+}
+
+std::uint64_t CudaLlmEngineBackend::batched_prefills() const noexcept { return impl_->batched_prefills; }
+
+std::uint64_t CudaLlmEngineBackend::batched_prefill_sequences() const noexcept {
+    return impl_->batched_prefill_sequences;
 }
 
 std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> ids,

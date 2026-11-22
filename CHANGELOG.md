@@ -24,6 +24,13 @@ before 1.0, minor versions may change the API.
   P V on tensor cores (WMMA); four tile shapes (64 x 32 default); `varlen_tile_map` (longest tiles
   first). Matches v0 within tolerance at every tested length; deterministic and batch-invariant.
   25.5x faster than today's kernel at 480 tokens (0.23 ms per layer), 35x at 2,048.
+- Batched prefill: the engine prefills the requests admitted in a step with one
+  `InferenceBackend::prefill_batch` call (each request succeeds or fails on its own); the CUDA
+  backend packs them into one forward pass, with each sequence's K/V scattered into its own pages
+  and the varlen tiled attention over the pack (prefix hits included). The 8 reference prompts,
+  packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
+  1.86x (3,314 -> 6,165 tokens/s).
+  `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
 - `ns_prefill_kernel_bench`: prefill attention by length (64–2,048) and batch (1, 8), naive against
   tiled; L2 flushed before every timed run, NVML clocks, temperature, power and clock-event reasons
   per run, achieved TFLOPS.

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// One request of a batched prefill (InferenceBackend::prefill_batch): the backend sets `first`, or
+// `error` if this request could not be prefilled, in which case its sequence is unchanged.
+struct PrefillItem {
+    SeqId seq = 0;
+    std::span<const TokenId> prompt;
+    TokenId first = 0;
+    std::exception_ptr error;
+};
+
 // Executes a model and owns its weights and KV memory.
 // Not thread-safe: called only from the engine thread. Generation is greedy for now.
 // On any exception, the backend's state is unchanged.
@@ -75,6 +85,21 @@ public:
     // Throws std::invalid_argument / std::length_error / std::logic_error for bad input,
     // KvCacheExhausted if there are not enough free pages.
     virtual TokenId prefill(SeqId seq, std::span<const TokenId> prompt) = 0;
+
+    // Prefills several empty sequences, each as prefill() would: an item that fails gets `error` set
+    // and leaves its sequence unchanged, without failing the others. The default prefills them one
+    // by one; a backend may run them in one pass (docs/prefill-attention.md). Throws only for an
+    // error that stops it from trying at all.
+    virtual void prefill_batch(std::span<PrefillItem> items) {
+        for (PrefillItem& item : items) {
+            try {
+                item.first = prefill(item.seq, item.prompt);
+                item.error = nullptr;
+            } catch (...) {
+                item.error = std::current_exception();
+            }
+        }
+    }
 
     // One decode step for several sequences: tokens[i] is appended to seqs[i].
     // Returns the next token for each sequence, in the same order.
