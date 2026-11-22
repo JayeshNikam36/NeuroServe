@@ -229,3 +229,35 @@ Medians over the rounds; paired change = cache-on against cache-off in the same 
   the temperature peaked between 70 and 77 °C; power and throttle shares are in the full report.
 - **Absolute numbers are this engine's baseline kernels.** The decode and prefill kernels are
   rewritten in Phase 4; the comparison (same engine, cache off vs on) is what this measures.
+
+## Results: stress run (Day 44)
+
+Full report: [benchmarks/results/day44-stress.md](../benchmarks/results/day44-stress.md). RTX 4050
+Laptop GPU, Llama 3.2 1B (FP16), a build with the KV invariants checked after every engine step;
+30 minutes, 24 clients, prefix caching on, 512 KV pages (25%). **All 10 checks passed.**
+
+| Measured | Start (5–13 min) | End (22–30 min) | Change |
+| --- | --- | --- | --- |
+| TTFT P50 | 7831 ms | 7899 ms | +0.9% |
+| TTFT P95 | 9641 ms | 9793 ms | +1.6% |
+| ITL P50 | 19.8 ms | 19.9 ms | +0.1% |
+| output tok/s | 401.5 | 396.1 | −1.3% |
+| GPU memory in use | 3092 MiB | 3092 MiB (peak) | 0 |
+| server resident memory | 898 MiB | 896 MiB | −2 MiB |
+
+- **Correctness under load.** 3,725 requests finished and none failed; 205 more were cancelled by
+  the client on purpose, mid-prefill or mid-stream. The cache evicted 95,752 pages (about 53 a
+  second) at a 50.2% hit rate, every step checked the KV invariants, none was violated, and after
+  the drain no page was held: 0 used, 0 shared, the other 512 cached or free.
+- **No leaks.** GPU memory did not move by a single MiB over 30 minutes (the KV pool and the
+  weights are allocated at start), and the server's resident memory settled at about 897 MiB
+  within the first 5 minutes and stayed there.
+- **No drift.** Every minute's TTFT P50 is between 7.0 and 8.1 s, ITL P50 between 18.0 and 20.6
+  ms, and throughput between 382 and 422 output tokens per second.
+- **What the latency means.** TTFT is mostly queueing, by design: 24 clients keep about 16
+  requests waiting behind the 8 that run. What matters here is that it stays flat; the latency at
+  a realistic load is in the prefix-caching results.
+- **What it did not exercise: preemption.** No request was preempted. With on-demand admission
+  the running requests never used more than 344 of the 512 pages, because cached pages are
+  reclaimed first. Preemption is covered by its unit and GPU integration tests (Day 38); a stress
+  run that forces it needs a smaller pool or longer outputs.
