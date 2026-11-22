@@ -251,6 +251,8 @@ PYBIND11_MODULE(_core, m) {
         policies[i] = std::string(core::kPolicyNames[i]);
     }
     m.attr("scheduling_policies") = policies;  // the names engine.scheduling_policy accepts
+    // Whether engines check the KV invariants after every step (the NS_CHECK_INVARIANTS build option).
+    m.attr("check_invariants") = core::kCheckInvariantsByDefault;
 
     m.def("set_log_level", [](const std::string& level) { core::log::set_level(core::log::parse_level(level)); },
           py::arg("level"), "Level of the C++ runtime's JSON log lines (stderr): DEBUG, INFO, WARNING or ERROR.");
