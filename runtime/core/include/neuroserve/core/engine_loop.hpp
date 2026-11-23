@@ -154,6 +154,11 @@ inline constexpr bool kCheckInvariantsByDefault = false;
 struct EngineLoopOptions {
     int max_batch = 8;             // most sequences in one decode step
     int max_batch_tokens = 512;    // most tokens one step processes (prefill + decode); see scheduler.hpp
+    // Chunked prefill (Day 52): at most this many of one request's prefill tokens per step; a longer
+    // prompt continues in the next steps from its cached offset while the running requests keep
+    // decoding. 0 = a prompt is prefilled in one step. Needs a backend that supports it
+    // (InferenceBackend::supports_chunked_prefill); otherwise prompts are prefilled whole.
+    int prefill_chunk_tokens = 0;
     KvAdmission admission = KvAdmission::kOnDemand;  // how much KV memory a request needs to start (kv_memory.hpp)
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
     PolicyOptions policy_options{};  // settings for the policy named in `policy`
@@ -281,7 +286,10 @@ private:
     // Prefills the requests admitted in this step, together (InferenceBackend::prefill_batch);
     // each that succeeds joins the decode batch, each that fails fails alone.
     void start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>& joining);
-    void decode_active();
+    void decode_active();  // the running requests that are not prefilling and did not just join
+    // Chunked prefill: this step's chunk for every request still prefilling (Entry::next_chunk),
+    // within the step's token budget. Returns the tokens they add beyond one per request.
+    long long plan_chunks_locked();
     bool append_token(Entry& entry, TokenId token);
     void publish_token(Entry& entry, TokenId token);  // stream: hand a new token to the reader
     void flush_itl_samples_locked();  // itl_samples_ -> itl_hist_; caller holds mu_
@@ -330,7 +338,8 @@ private:
     EngineLoopStats stats_;
     KvCacheStats kv_snapshot_;
 
-    std::vector<EntryPtr> active_;  // engine thread only; in admission order
+    std::vector<EntryPtr> active_;  // engine thread only; in admission order (prefilling ones too)
+    int chunk_tokens_ = 0;          // options_.prefill_chunk_tokens if the backend supports it, else 0
 
     // Step profile. Guarded by mu_, except the two backend-call timers, which the engine thread
     // alone uses within one step.

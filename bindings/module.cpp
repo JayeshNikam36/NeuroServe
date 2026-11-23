@@ -328,10 +328,14 @@ PYBIND11_MODULE(_core, m) {
                          int max_batch, int max_batch_tokens, int max_pages_per_sequence, int device_index,
                          const std::string& scheduling_policy, int priority_aging_ms, int max_queue,
                          int queue_timeout_ms, int decision_log_capacity, bool prefix_caching,
-                         const std::string& kv_admission) {
+                         const std::string& kv_admission, int prefill_chunk_tokens) {
                  core::EngineLoopOptions loop_options;
                  loop_options.max_batch = max_batch;
                  loop_options.max_batch_tokens = max_batch_tokens;
+                 loop_options.prefill_chunk_tokens = prefill_chunk_tokens;
+                 if (prefill_chunk_tokens < 0) {
+                     throw std::invalid_argument("prefill_chunk_tokens must be 0 (off) or more");
+                 }
                  loop_options.policy_options.priority_aging_ms = priority_aging_ms;
                  loop_options.max_queue = max_queue;
                  loop_options.queue_timeout_ms = queue_timeout_ms;
@@ -365,7 +369,7 @@ PYBIND11_MODULE(_core, m) {
              py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs",
              py::arg("priority_aging_ms") = 1000, py::arg("max_queue") = 1024, py::arg("queue_timeout_ms") = 0,
              py::arg("decision_log_capacity") = 4096, py::arg("prefix_caching") = false,
-             py::arg("kv_admission") = "on-demand")
+             py::arg("kv_admission") = "on-demand", py::arg("prefill_chunk_tokens") = 0)
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",

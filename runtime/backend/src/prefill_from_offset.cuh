@@ -37,8 +37,8 @@ void model_prefill_from(Model& m, PagedKVCache& c, Sequence& seq, const std::vec
 // ---- Batched prefill (Day 51, docs/prefill-attention.md) ----------------------------------------
 
 // One sequence of a batched prefill: its whole input ids, of which the first `start` positions are
-// already in its pages (a prefix-cache hit; 0 for a fresh prompt). seq.pages must cover ids.size()
-// tokens and seq.len must be 0.
+// already in its pages (a prefix-cache hit, or earlier chunks of a chunked prefill; 0 for a fresh
+// prompt). seq.pages must cover ids.size() tokens; seq.len is 0, or `start` for a next chunk.
 struct PrefillPart {
     Sequence* seq = nullptr;
     const std::vector<int>* ids = nullptr;

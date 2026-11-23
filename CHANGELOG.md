@@ -31,6 +31,15 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- Chunked prefill (`prefill_chunk_tokens`, off by default): a prompt is prefilled at most that
+  many tokens per step, each chunk resumed from the sequence's cached offset and packed with the
+  step's other prefills, while the other requests keep decoding; prompts may be longer than the
+  step budget. `InferenceBackend::prefill_more()` / `supports_chunked_prefill()`; the CUDA backend
+  supports it. Outputs equal Hugging Face for chunk sizes 64, 128, 256 and 512. With 128-token
+  chunks and a 256-token budget, the step P99 next to 480-token prompts falls from 150 to 69 ms,
+  at about a third more time to first token.
+  `neuroserve.bench.step_profile`: `--prefill-chunk-tokens`, `--max-batch-tokens`, the
+  `interference` scenario and a latency table.
 - `ns_prefill_kernel_bench`: prefill attention by length (64–2,048) and batch (1, 8), naive against
   tiled; L2 flushed before every timed run, NVML clocks, temperature, power and clock-event reasons
   per run, achieved TFLOPS.

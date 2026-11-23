@@ -41,6 +41,10 @@ public:
     // varlen tiled attention (docs/prefill-attention.md); a lone item, or one longer than a chunk,
     // goes through prefill()'s path. Each item succeeds or fails on its own.
     void prefill_batch(std::span<PrefillItem> items) override;
+    // Chunked prefill (Day 52): the next part of a partly prefilled sequence, from its cached
+    // offset (prefill from an offset, docs/kv-cache.md). In prefill_batch, such items are packed too.
+    TokenId prefill_more(SeqId seq, std::span<const TokenId> input) override;
+    bool supports_chunked_prefill() const override { return true; }
     std::vector<TokenId> decode_step(std::span<const SeqId> seqs,
                                      std::span<const TokenId> tokens) override;
     void free_sequence(SeqId seq) override;

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -491,6 +492,28 @@ protected:
         return out;
     }
 
+    // The same, with the prompt prefilled the way the engine's chunked prefill does (Day 52): its
+    // first `chunk` tokens with prefill(), then `chunk` more per prefill_more(), each from the
+    // sequence's cached offset.
+    static std::vector<TokenId> generate_chunked(const std::vector<TokenId>& prompt, std::size_t n, int chunk) {
+        const SeqId id = backend_->create_sequence();
+        const std::span<const TokenId> all(prompt);
+        std::size_t end = std::min(prompt.size(), static_cast<std::size_t>(chunk));
+        TokenId first = backend_->prefill(id, all.first(end));
+        while (end < prompt.size()) {
+            end = std::min(prompt.size(), end + static_cast<std::size_t>(chunk));
+            first = backend_->prefill_more(id, all.first(end));
+        }
+        std::vector<TokenId> out{first};
+        while (out.size() < n) {
+            const SeqId ids[] = {id};
+            const TokenId last[] = {out.back()};
+            out.push_back(backend_->decode_step(ids, last).at(0));
+        }
+        backend_->free_sequence(id);
+        return out;
+    }
+
     static inline std::unique_ptr<CudaLlmEngineBackend> backend_;
     static inline std::vector<std::vector<TokenId>> prompts_;
     static inline std::vector<std::vector<TokenId>> greedy_;
@@ -716,3 +739,77 @@ TEST_F(CudaPrefixCacheTest, ChunkedPrefillReproducesHuggingFace) {
     backend_->check_kv_invariants();
 }
 
+TEST_F(CudaPrefixCacheTest, EngineChunksOf64To512ReproduceHuggingFace) {
+    // Chunked prefill (Day 52): each reference prompt (a 512-token system prompt and a user turn)
+    // prefilled in engine chunks of 64, 128, 256 and 512 tokens, each chunk attending to the K/V
+    // the earlier ones wrote. With caching off and on: on, the input must extend the held tokens.
+    std::size_t prefills = 0;
+    int correct = 0;
+    for (const bool caching : {false, true}) {
+        backend_->set_prefix_caching(caching);
+        for (const int chunk : {64, 128, 256, 512}) {
+            for (std::size_t c = 0; c < prompts_.size(); ++c) {
+                const auto got = generate_chunked(prompts_[c], greedy_[c].size(), chunk);
+                EXPECT_EQ(got, greedy_[c]) << "case " << c << ": " << prompts_[c].size() << " tokens in chunks of "
+                                           << chunk << (caching ? ", caching on" : ", caching off");
+                correct += got == greedy_[c];
+                prefills += (prompts_[c].size() + static_cast<std::size_t>(chunk) - 1) / static_cast<std::size_t>(chunk);
+            }
+        }
+    }
+    std::printf("chunked prefill: %d/%zu sequences match Hugging Face (%zu chunks)\n", correct, 8 * prompts_.size(),
+                prefills);
+    backend_->set_prefix_caching(true);
+    backend_->check_kv_invariants();
+}
+
+TEST_F(CudaPrefixCacheTest, PackedChunksReproduceHuggingFace) {
+    // Every reference prompt prefilled 128 tokens per round, all its next chunks packed into one
+    // prefill_batch() call per round (continuations from their cached offsets, Day 52).
+    backend_->set_prefix_caching(false);
+    const std::size_t chunk = 128;
+    std::vector<SeqId> ids;
+    std::vector<std::size_t> done(prompts_.size(), 0);
+    std::vector<std::vector<TokenId>> out(prompts_.size());
+    for (std::size_t c = 0; c < prompts_.size(); ++c) {
+        ids.push_back(backend_->create_sequence());
+    }
+    const std::uint64_t packs_before = backend_->batched_prefills();
+    for (;;) {  // one round: the next chunk of every prompt not yet prefilled
+        std::vector<neuroserve::PrefillItem> items;
+        std::vector<std::size_t> which;
+        for (std::size_t c = 0; c < prompts_.size(); ++c) {
+            if (done[c] < prompts_[c].size()) {
+                const std::size_t end = std::min(prompts_[c].size(), done[c] + chunk);
+                neuroserve::PrefillItem item;
+                item.seq = ids[c];
+                item.prompt = std::span<const TokenId>(prompts_[c]).first(end);
+                items.push_back(item);
+                which.push_back(c);
+                done[c] = end;
+            }
+        }
+        if (items.empty()) {
+            break;
+        }
+        backend_->prefill_batch(items);
+        for (std::size_t k = 0; k < items.size(); ++k) {
+            ASSERT_FALSE(items[k].error) << "case " << which[k];
+            if (done[which[k]] == prompts_[which[k]].size()) {
+                out[which[k]].push_back(items[k].first);
+            }
+        }
+    }
+    for (std::size_t c = 0; c < prompts_.size(); ++c) {
+        while (out[c].size() < greedy_[c].size()) {
+            const SeqId one[] = {ids[c]};
+            const TokenId last[] = {out[c].back()};
+            out[c].push_back(backend_->decode_step(one, last).at(0));
+        }
+        EXPECT_EQ(out[c], greedy_[c]) << "case " << c << ", packed chunks of 128";
+        backend_->free_sequence(ids[c]);
+    }
+    EXPECT_GT(backend_->batched_prefills(), packs_before) << "no chunks were packed";
+    backend_->set_prefix_caching(true);
+    backend_->check_kv_invariants();
+}

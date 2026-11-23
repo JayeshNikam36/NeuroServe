@@ -233,6 +233,74 @@ Measured with the step profile (Day 46's scenarios, RTX 4050 Laptop GPU; full re
   together; batching helps bursts. Chunked prefill (several requests' chunks per step) and mixed
   prefill/decode steps are what move `mixed`.
 
+## Chunked prefill (Day 52)
+
+With `prefill_chunk_tokens` set (engine option and server `engine.prefill_chunk_tokens`; 0, the
+default, is off), a prompt is prefilled at most that many tokens per step, and the steps in between
+carry the other requests' decodes. A long prompt no longer stalls every running request for the
+whole of its prefill, and a prompt may now be longer than the step budget (`max_batch_tokens`):
+it takes several steps.
+
+- **The engine** plans the step's chunks first (`EngineLoop::plan_chunks_locked`), in admission
+  order: each prefilling request gets `min(remaining, prefill_chunk_tokens, budget left)` tokens,
+  at least one, so a request always moves. Admission counts a queued request's first chunk, not
+  its whole prompt, against the budget and against on-demand KV pages. The step's continuing
+  chunks and its newly admitted first chunks go in **one** `prefill_batch` call; a `PrefillItem`'s
+  prompt is then the input up to the chunk's end, and its sequence already holds the earlier
+  chunks. A request joins the decode batch the step after its last chunk; decodes run only for
+  requests that are not prefilling. Cancelling a request mid-prefill frees its pages at once.
+- **The backend contract:** `supports_chunked_prefill()` (false by default: the engine then
+  prefills each prompt whole, as before) and `prefill_more(seq, input)`, the next part of a partly
+  prefilled sequence, which returns the first generated token when `input` is the whole prompt.
+  The default `prefill_batch` calls `prefill_more` for items whose sequence is not empty.
+- **The CUDA backend** checks that the input extends what the sequence holds (with prefix caching,
+  token for token), gives the new tokens their pages, and prefills them from the sequence's
+  length as a cached offset: the same path a prefix-cache hit takes (`model_prefill_from`, and in a
+  pack `model_prefill_batch`, which now accepts `seq.len == start`). Continuation chunks and new
+  prompts are packed together like Day 51's items.
+- **Limitation:** with prefix caching on, a prompt's cached prefix is found only within its first
+  chunk, since that is when its pages are allocated. Choose a chunk at least as long as the shared
+  prefix (or leave chunking off) when prefixes matter more than the step tail.
+
+Tested: the engine on the fake backend (`tests/unit/test_engine_chunked_prefill.cpp`: a long
+prompt prefilled in chunks while another request decodes; the same outputs for chunk sizes 64,
+128, 256 and 512 as unchunked; the step budget bounds chunks and decodes together; a prompt longer
+than a step accepted only with chunking; a backend that cannot chunk; cancelling mid-prefill);
+the backend's checks and packing on the stand-in engine; on the GPU, the instruct references (a
+512-token system prompt and a user turn) prefilled in chunks of 64, 128, 256 and 512 with caching
+off and on, and in packed rounds of 128, all equal to Hugging Face token for token; and through the
+Python API, concurrent requests with a step budget shorter than the longest prompt
+(`tests/python/test_chunked_prefill.py`). 303/303 tests pass.
+
+Measured with the step profile (RTX 4050 Laptop GPU; full report
+[benchmarks/results/day52-chunked-prefill.md](../benchmarks/results/day52-chunked-prefill.md)):
+
+| Scenario | | chunking off (budget 512) | chunks of 128 (budget 256) |
+| --- | --- | --- | --- |
+| `interference`: 48 requests at 3/s, 1 in 4 with a 480-token prompt | step P99 | 150.5 ms | **69.1 ms (-54%)** |
+| | step P50 | 16.3 ms | 16.4 ms |
+| | TTFT P50 / P99 | 589 / 1,505 ms | 800 / 2,019 ms (+36% / +34%) |
+| | time between tokens P50 / P99 (per-request mean) | 19.4 / 20.6 ms | 19.8 / 21.5 ms |
+| `prefill`: 32 x 480-token prompts at once, 8 output tokens | step P99 | 165.5 ms | **72.6 ms (-56%)** |
+| | elapsed | 5.1 s | 5.7 s (+12%) |
+| | time between tokens P50 | 156.7 ms | **60.0 ms (-62%)** |
+| | TTFT P50 / P99 | 2,410 / 4,866 ms | 2,664 / 5,460 ms (+11% / +12%) |
+
+- **The worst step halves.** Without chunking, a step that prefills a 480-token prompt takes about
+  150 ms, and every running request waits that long for its next token. With 128-token chunks and
+  a 256-token budget no step holds a whole long prefill: the step P99 falls from 150 to 69 ms, and
+  in the prefill burst the time between tokens from 157 to 60 ms.
+- **Time to first token pays for it.** A long prompt now takes four steps instead of one and shares
+  them with decodes, so TTFT rises by about a third under `interference` and the burst finishes
+  12% later (fixed per-pass costs, such as reading the weights, are paid once per chunk).
+- **The mean time between tokens hides the stalls:** it is a per-request average, and a 150 ms
+  stall every few hundred tokens barely moves it; the step P99 is what a streaming client feels as
+  a hitch.
+- So chunking stays **off by default**: it is a knob for latency-sensitive streaming next to long
+  prompts, traded against TTFT and throughput. Smaller chunks bound the step tail further at more
+  cost; mixed steps that decode inside the prefill's pass (one forward pass for both) are what
+  would cut that cost.
+
 ## The model it serves
 
 Llama 3.2 1B, FP16:
@@ -424,7 +492,8 @@ Hugging Face, prefix hits, copy-on-write, resumption) unchanged, and the step pr
 | --- | --- | --- |
 | 48 | Measure today's attention share of prefill (CUDA events); v0 varlen kernel, simple: one block per (query, head), the interface above, the tests above | matches the per-sequence reference at every length 1–2,048 |
 | 49 | Tiled kernel: Q tile in shared memory, streamed K/V tiles, online softmax, `mma.sync`, 128-bit loads; the tile sweep | matches v0 within the tolerance at every tested length; faster than v0 and than today's kernel, measured |
-| later | The engine prefills all admitted prompts in one batched pass using it; then chunked prefill and mixed prefill/decode steps | step profile and outputs |
+| 51 | The engine prefills all admitted prompts in one batched pass using it | step profile and outputs |
+| 52 | Chunked prefill: long prompts split by the step budget, resumed from the cached offset each step, packed with other prefills and sharing steps with decodes | outputs equal for chunk sizes 64, 128, 256, 512 |
 
 ## Out of scope
 
