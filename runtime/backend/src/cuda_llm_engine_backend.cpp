@@ -1,6 +1,7 @@
 #include "neuroserve/backend/cuda_llm_engine_backend.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
 #include <filesystem>
 #include <iterator>
@@ -99,6 +100,8 @@ struct CudaLlmEngineBackend::Impl {
     // CUDA Graphs for decode (Day 56), made on first use. The KV pool has one page more than the
     // manager knows of: the pad page padding rows write to.
     std::optional<backend_detail::DecodeGraphs> graphs;
+    std::atomic<int> graphs_captured{0};  // copies of graphs' counters, for readers on other threads
+    std::atomic<std::uint64_t> graph_replays{0};
     CudaLlmEngineBackend::DecodePath decode_path = CudaLlmEngineBackend::DecodePath::kEager;
     std::uint64_t batched_prefills = 0;
     std::uint64_t batched_prefill_sequences = 0;
@@ -443,6 +446,8 @@ struct CudaLlmEngineBackend::Impl {
             }
             if (static_cast<int>(seqs.size()) <= graphs->max_bucket()) {
                 graphs->step(seqs, ids, next, decode_path == CudaLlmEngineBackend::DecodePath::kGraph);
+                graphs_captured.store(graphs->graphs(), std::memory_order_relaxed);
+                graph_replays.store(graphs->replays(), std::memory_order_relaxed);
                 return;
             }
         }
@@ -691,11 +696,25 @@ void CudaLlmEngineBackend::set_decode_path(DecodePath path) { impl_->decode_path
 CudaLlmEngineBackend::DecodePath CudaLlmEngineBackend::decode_path() const noexcept { return impl_->decode_path; }
 
 int CudaLlmEngineBackend::cuda_graphs_captured() const noexcept {
-    return impl_->graphs ? impl_->graphs->graphs() : 0;
+    return impl_->graphs_captured.load(std::memory_order_relaxed);
 }
 
 std::uint64_t CudaLlmEngineBackend::cuda_graph_replays() const noexcept {
-    return impl_->graphs ? impl_->graphs->replays() : 0;
+    return impl_->graph_replays.load(std::memory_order_relaxed);
+}
+
+CudaLlmEngineBackend::DecodeHostTimes CudaLlmEngineBackend::decode_host_times() const {
+    if (!impl_->graphs) {
+        return {};
+    }
+    const auto& t = impl_->graphs->host_times();
+    return {t.stage_ms, t.issue_ms, t.wait_ms, t.steps};
+}
+
+void CudaLlmEngineBackend::reset_decode_host_times() {
+    if (impl_->graphs) {
+        impl_->graphs->reset_host_times();
+    }
 }
 
 std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> ids,

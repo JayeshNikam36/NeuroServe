@@ -35,6 +35,9 @@ class EngineSection(_Strict):
     prefill_chunk_tokens: int = Field(default=0, ge=0)
     # Mixed steps: a step's prefills and decodes run as one forward pass (false = two passes).
     mixed_steps: bool = True
+    # CUDA Graphs for decode (docs/cuda-graphs.md): decode-only steps replay captured graphs,
+    # 2-4.5% faster per step (Day 57). false = the engine's eager decode.
+    cuda_graphs: bool = True
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
     # which requests are admitted and preempted each step; see docs/scheduling.md

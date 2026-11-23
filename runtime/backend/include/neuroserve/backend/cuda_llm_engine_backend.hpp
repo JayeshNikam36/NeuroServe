@@ -98,7 +98,17 @@ public:
     void set_decode_path(DecodePath path);
     DecodePath decode_path() const noexcept;
     int cuda_graphs_captured() const noexcept;        // (bucket, splits) graphs instantiated so far
-    std::uint64_t cuda_graph_replays() const noexcept;  // mixed steps run as one forward pass (Day 53)
+    std::uint64_t cuda_graph_replays() const noexcept;  // both safe to read from any thread
+
+    // Host time of the decode steps that took a graph path (kGraph or kGraphEager) since the last
+    // reset, in milliseconds (Day 57): writing the inputs, issuing the GPU work, waiting for it.
+    // Read and reset from the thread that decodes.
+    struct DecodeHostTimes {
+        double stage_ms = 0, issue_ms = 0, wait_ms = 0;
+        std::uint64_t steps = 0;
+    };
+    DecodeHostTimes decode_host_times() const;
+    void reset_decode_host_times();  // mixed steps run as one forward pass (Day 53)
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

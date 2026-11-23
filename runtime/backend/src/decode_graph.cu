@@ -1,6 +1,7 @@
 #include "decode_graph.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 
@@ -21,6 +22,11 @@ namespace {
 constexpr int kMaxSplits = 32;                       // the engine's workspace limit (batched.cu)
 constexpr size_t kCublasWorkspaceBytes = 4u << 20;   // set, so cuBLAS allocates nothing in a capture
 constexpr int kBuckets[] = {1, 2, 4, 8, 16};
+
+using Clock = std::chrono::steady_clock;
+double ms_between(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
 
 // The engine's layer_forward_batched (engine/batched.cu, static there), with every launch on `stream`.
 void layer_forward(cublasHandle_t handle, const LayerConfig& c, const LayerWeights& w, LayerScratch& s, __half* x,
@@ -166,6 +172,7 @@ void DecodeGraphs::step(std::vector<Sequence*>& seqs, const std::vector<int>& to
         throw std::logic_error("DecodeGraphs::step: " + std::to_string(n) + " sequences, buckets up to " +
                                std::to_string(max_bucket()));
     }
+    const auto t0 = Clock::now();
     const int B = max_bucket();
     int* ids = h_in_;
     int* pos = h_in_ + B;
@@ -195,13 +202,20 @@ void DecodeGraphs::step(std::vector<Sequence*>& seqs, const std::vector<int>& to
     // The eager path's choice, from the real rows (padding never changes it: docs/cuda-graphs.md).
     const int splits = choose_num_splits(n, m_.cfg.n_kv_heads, max_len);
     const bool captured = execs_.count(bucket * 64 + splits) > 0;
+    const auto t1 = Clock::now();
     if (graph && captured) {
         CUDA_CHECK(cudaGraphLaunch(execs_.at(bucket * 64 + splits), stream_));
         ++replays_;
     } else {
         enqueue(bucket, splits);  // eagerly: a first use is also the capture's warm-up
     }
+    const auto t2 = Clock::now();
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+    const auto t3 = Clock::now();
+    times_.stage_ms += ms_between(t0, t1);
+    times_.issue_ms += ms_between(t1, t2);
+    times_.wait_ms += ms_between(t2, t3);
+    ++times_.steps;
     if (graph && !captured) {
         graph_for(bucket, splits);  // capture after the eager run: replayed from the next step on
     }
