@@ -62,6 +62,7 @@ TEST(StepProfile, SplitsTheBackendsPrefillAndDecodeFromTheHost) {
     backend.on_decode = [](std::size_t) { std::this_thread::sleep_for(2ms); };
     EngineLoopOptions options;
     options.max_batch = 4;
+    options.mixed_steps = false;  // a mixed step's one backend call is counted as prefill: split them here
     EngineLoop loop(backend, options);
     std::vector<RequestHandle> handles;
     for (int i = 0; i < 3; ++i) {

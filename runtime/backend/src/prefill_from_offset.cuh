@@ -70,4 +70,22 @@ void free_prefill_batch_scratch(PrefillBatchScratch& s);
 std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vector<PrefillPart>& parts,
                                      PrefillBatchScratch& s);
 
+// ---- Mixed steps (Day 53) -----------------------------------------------------------------------
+
+// One decode row of a mixed step: a prefilled sequence and the token it was fed back (its newest),
+// to be cached at position seq.len. seq.pages must already cover seq.len + 1 tokens.
+struct DecodeRow {
+    Sequence* seq = nullptr;
+    int token = 0;
+};
+
+// One forward pass over prefill parts and decode rows together: the decode rows are packed after
+// the prefill tokens (at most m.max_T rows, at most s.max_seqs sequences in all), the projections,
+// RoPE and the MLP run once on every row, and attention is dispatched per segment (the varlen
+// tiled kernel for the prefill parts, a row-per-sequence kernel for the decode rows). Returns the
+// next token of every part, then of every decode row; sets each part's seq.len and adds one to each
+// decode row's.
+std::vector<int> model_mixed_batch(Model& m, PagedKVCache& c, const std::vector<PrefillPart>& parts,
+                                   const std::vector<DecodeRow>& decodes, PrefillBatchScratch& s);
+
 }  // namespace neuroserve::backend_detail

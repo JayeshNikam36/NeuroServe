@@ -30,16 +30,14 @@ __device__ __forceinline__ size_t paged_row(const int* __restrict__ block_table,
 // One block per (query head, new token). The math, step by step, is attention_decode_paged's:
 // float dot products, softmax with the max subtracted, one thread summing in order, then the value
 // blend in position order. Only the length differs per query: S = start + t + 1 (causal).
-__global__ void attention_prefill_paged_kernel(const __half* __restrict__ q, const __half* __restrict__ k_pool,
-                                               const __half* __restrict__ v_pool,
-                                               const int* __restrict__ block_table, __half* __restrict__ out,
-                                               int start, int page_size, int n_heads, int n_kv_heads, int head_dim) {
+// One query row `t` of q/out, head h, over the S positions in block_table.
+__device__ __forceinline__ void attend_row(const __half* __restrict__ q, const __half* __restrict__ k_pool,
+                                           const __half* __restrict__ v_pool, const int* __restrict__ block_table,
+                                           __half* __restrict__ out, int t, int h, int S, int page_size, int n_heads,
+                                           int n_kv_heads, int head_dim) {
     extern __shared__ float scores[];  // S floats
     __shared__ float s_max, s_sum;
 
-    const int h = blockIdx.x;
-    const int t = blockIdx.y;
-    const int S = start + t + 1;
     const int g = h / (n_heads / n_kv_heads);  // grouped-query sharing
     const float scale = rsqrtf(static_cast<float>(head_dim));
     const __half* qv = q + (static_cast<size_t>(t) * n_heads + h) * head_dim;
@@ -76,6 +74,27 @@ __global__ void attention_prefill_paged_kernel(const __half* __restrict__ q, con
             acc += scores[j] * __half2float(v_pool[(paged_row(block_table, j, page_size) * n_kv_heads + g) * head_dim + d]);
         o[d] = __float2half_rn(acc);
     }
+}
+
+__global__ void attention_prefill_paged_kernel(const __half* __restrict__ q, const __half* __restrict__ k_pool,
+                                               const __half* __restrict__ v_pool,
+                                               const int* __restrict__ block_table, __half* __restrict__ out,
+                                               int start, int page_size, int n_heads, int n_kv_heads, int head_dim) {
+    const int t = blockIdx.y;
+    attend_row(q, k_pool, v_pool, block_table, out, t, blockIdx.x, start + t + 1, page_size, n_heads, n_kv_heads,
+               head_dim);
+}
+
+// Mixed steps (Day 53): one block per (query head, decode row). Row b is one sequence's newest
+// token: it attends to lens[b] cached positions and itself, through its own table (tables + b *
+// max_pages). The same math as a prefill query.
+__global__ void attention_decode_rows_kernel(const __half* __restrict__ q, const __half* __restrict__ k_pool,
+                                             const __half* __restrict__ v_pool, const int* __restrict__ tables,
+                                             const int* __restrict__ lens, __half* __restrict__ out, int max_pages,
+                                             int page_size, int n_heads, int n_kv_heads, int head_dim) {
+    const int b = blockIdx.y;
+    attend_row(q, k_pool, v_pool, tables + static_cast<size_t>(b) * max_pages, out, b, blockIdx.x, lens[b] + 1,
+               page_size, n_heads, n_kv_heads, head_dim);
 }
 
 // The engine's layer_forward_paged (engine/paged.cu, static there), with the new tokens at
@@ -115,7 +134,8 @@ void layer_forward_batch(cublasHandle_t handle, const LayerConfig& c, const Laye
                          __half* x, const int* d_positions, const float* d_inv_freq, int T, __half* k_pool,
                          __half* v_pool, const std::vector<PrefillPart>& parts, const std::vector<int>& cu,
                          int page_size, neuroserve::kernels::VarlenAttentionArgs a, const int* d_tile_map,
-                         int num_tiles) {
+                         int num_tiles, const std::vector<DecodeRow>& decodes, const int* d_decode_tables,
+                         const int* d_decode_lens, int max_decode_keys) {
     const int qdim = c.n_heads * c.head_dim, kvdim = c.n_kv_heads * c.head_dim;
     const size_t n_hidden = static_cast<size_t>(T) * c.hidden;
 
@@ -132,11 +152,29 @@ void layer_forward_batch(cublasHandle_t handle, const LayerConfig& c, const Laye
         kv_scatter(s.k + row, k_pool, p.seq->d_table, p.start, Tb, page_size, kvdim);
         kv_scatter(s.v + row, v_pool, p.seq->d_table, p.start, Tb, page_size, kvdim);
     }
-    a.q = s.q;
-    a.out = s.attn;
-    a.k_pool = k_pool;
-    a.v_pool = v_pool;
-    neuroserve::kernels::attention_prefill_varlen_tiled(a, d_tile_map, num_tiles, neuroserve::kernels::TileShape::k64x32);
+    const int Tp = cu.back();  // the prefill rows; decode rows follow them
+    for (size_t i = 0; i < decodes.size(); ++i) {  // each decode row's K/V at its sequence's next position
+        const size_t row = static_cast<size_t>(Tp) + i;
+        kv_scatter(s.k + row * kvdim, k_pool, decodes[i].seq->d_table, decodes[i].seq->len, 1, page_size, kvdim);
+        kv_scatter(s.v + row * kvdim, v_pool, decodes[i].seq->d_table, decodes[i].seq->len, 1, page_size, kvdim);
+    }
+    // Attention, dispatched per segment: the prefill segments through the varlen tiled kernel, the
+    // decode rows through one row-per-sequence kernel.
+    if (!parts.empty()) {
+        a.q = s.q;
+        a.out = s.attn;
+        a.k_pool = k_pool;
+        a.v_pool = v_pool;
+        neuroserve::kernels::attention_prefill_varlen_tiled(a, d_tile_map, num_tiles,
+                                                            neuroserve::kernels::TileShape::k64x32);
+    }
+    if (!decodes.empty()) {
+        const size_t off = static_cast<size_t>(Tp) * qdim;
+        const dim3 grid(static_cast<unsigned>(c.n_heads), static_cast<unsigned>(decodes.size()));
+        attention_decode_rows_kernel<<<grid, 128, static_cast<size_t>(max_decode_keys) * sizeof(float)>>>(
+            s.q + off, k_pool, v_pool, d_decode_tables, d_decode_lens, s.attn + off, a.max_pages, page_size,
+            c.n_heads, c.n_kv_heads, c.head_dim);
+    }
 
     linear(handle, s.attn, w.wo, s.proj, T, qdim, c.hidden);
     residual_add(x, s.proj, x, n_hidden);
@@ -249,14 +287,24 @@ void free_prefill_batch_scratch(PrefillBatchScratch& s) {
 
 std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vector<PrefillPart>& parts,
                                      PrefillBatchScratch& s) {
-    const int B = static_cast<int>(parts.size());
+    if (parts.empty()) {
+        throw std::logic_error("model_prefill_batch: no sequences");
+    }
+    return model_mixed_batch(m, c, parts, {}, s);
+}
+
+std::vector<int> model_mixed_batch(Model& m, PagedKVCache& c, const std::vector<PrefillPart>& parts,
+                                   const std::vector<DecodeRow>& decodes, PrefillBatchScratch& s) {
+    const int Bp = static_cast<int>(parts.size());
+    const int Bd = static_cast<int>(decodes.size());
+    const int B = Bp + Bd;
     if (B < 1 || B > s.max_seqs) {
         throw std::logic_error("model_prefill_batch: " + std::to_string(B) + " sequences, scratch for " +
                                std::to_string(s.max_seqs));
     }
     std::vector<int> cu{0}, start, ids, pos, tables(static_cast<size_t>(B) * static_cast<size_t>(s.max_pages), 0);
     int max_keys = 1;
-    for (int b = 0; b < B; ++b) {
+    for (int b = 0; b < Bp; ++b) {
         const PrefillPart& p = parts[static_cast<size_t>(b)];
         const int total = static_cast<int>(p.ids->size());
         const int T = total - p.start;
@@ -281,12 +329,37 @@ std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vecto
         CUDA_CHECK(cudaMemcpy(p.seq->d_table, p.seq->pages.data(), p.seq->pages.size() * sizeof(int),
                               cudaMemcpyHostToDevice));
     }
-    const int T = cu.back();
+    const int Tp = cu.back();
+    int max_decode_keys = 1;
+    for (int i = 0; i < Bd; ++i) {  // a decode row: its sequence's next token, after everything it holds
+        const DecodeRow& d = decodes[static_cast<size_t>(i)];
+        const int len = d.seq->len;
+        if (len < 1 || static_cast<int>(d.seq->pages.size()) * c.page_size < len + 1 ||
+            static_cast<int>(d.seq->pages.size()) > s.max_pages) {
+            throw std::logic_error("model_mixed_batch: decode row " + std::to_string(i) + " does not fit (length " +
+                                   std::to_string(len) + ", " + std::to_string(d.seq->pages.size()) + " pages)");
+        }
+        ids.push_back(d.token);
+        pos.push_back(len);
+        start.push_back(len);  // after the prefill parts' starts: the decode rows' lengths
+        max_decode_keys = std::max(max_decode_keys, len + 1);
+        std::copy(d.seq->pages.begin(), d.seq->pages.end(),
+                  tables.begin() + static_cast<long>(Bp + i) * s.max_pages);
+        CUDA_CHECK(cudaMemcpy(d.seq->d_table, d.seq->pages.data(), d.seq->pages.size() * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    }
+    if (static_cast<size_t>(max_decode_keys) * sizeof(float) > 48 * 1024) {
+        throw std::logic_error("model_mixed_batch: a decode row's " + std::to_string(max_decode_keys) +
+                               " positions exceed the attention kernel's shared memory");
+    }
+    const int T = Tp + Bd;
     if (T > m.max_T) {
         throw std::logic_error("model_prefill_batch: " + std::to_string(T) + " tokens exceed the scratch (" +
                                std::to_string(m.max_T) + ")");
     }
-    const std::vector<int> tile_map = neuroserve::kernels::varlen_tile_map(cu, start, 64);  // the 64 x 32 shape's rows
+    const std::vector<int> prefill_start(start.begin(), start.begin() + Bp);
+    const std::vector<int> tile_map =
+        Bp > 0 ? neuroserve::kernels::varlen_tile_map(cu, prefill_start, 64) : std::vector<int>{};  // 64 x 32 rows
     if (static_cast<int>(tile_map.size() / 2) > s.max_tiles) {
         throw std::logic_error("model_prefill_batch: more tiles than the scratch holds");
     }
@@ -295,14 +368,16 @@ std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vecto
     CUDA_CHECK(cudaMemcpy(s.d_tables, tables.data(), sizeof(int) * tables.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s.d_cu, cu.data(), sizeof(int) * cu.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s.d_start, start.data(), sizeof(int) * start.size(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(s.d_tile_map, tile_map.data(), sizeof(int) * tile_map.size(), cudaMemcpyHostToDevice));
+    if (!tile_map.empty()) {
+        CUDA_CHECK(cudaMemcpy(s.d_tile_map, tile_map.data(), sizeof(int) * tile_map.size(), cudaMemcpyHostToDevice));
+    }
 
     neuroserve::kernels::VarlenAttentionArgs a;
     a.cu_seqlens_q = s.d_cu;
     a.start = s.d_start;
     a.block_tables = s.d_tables;
-    a.num_seqs = B;
-    a.total_q = T;
+    a.num_seqs = Bp;  // the varlen kernel sees the prefill segments only
+    a.total_q = Tp;
     a.max_keys = max_keys;
     a.max_pages = s.max_pages;
     a.n_heads = m.cfg.n_heads;
@@ -315,14 +390,15 @@ std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vecto
     for (int l = 0; l < m.n_layers; l++) {
         layer_forward_batch(m.handle, m.cfg, m.layers[static_cast<size_t>(l)], m.scratch, m.d_x, m.d_pos,
                             m.d_inv_freq, T, c.k_pool[static_cast<size_t>(l)], c.v_pool[static_cast<size_t>(l)], parts,
-                            cu, c.page_size, a, s.d_tile_map, static_cast<int>(tile_map.size() / 2));
+                            cu, c.page_size, a, s.d_tile_map, static_cast<int>(tile_map.size() / 2), decodes,
+                            s.d_tables + static_cast<size_t>(Bp) * s.max_pages, s.d_start + Bp, max_decode_keys);
     }
 
     // Each sequence's last row: the final norm and the head, once for all of them.
     const int H = m.cfg.hidden;
-    for (int b = 0; b < B; ++b) {
-        CUDA_CHECK(cudaMemcpyAsync(s.d_last + static_cast<size_t>(b) * H,
-                                   m.d_x + static_cast<size_t>(cu[static_cast<size_t>(b) + 1] - 1) * H,
+    for (int b = 0; b < B; ++b) {  // a prefill part's last row, or a decode row
+        const int row = b < Bp ? cu[static_cast<size_t>(b) + 1] - 1 : Tp + (b - Bp);
+        CUDA_CHECK(cudaMemcpyAsync(s.d_last + static_cast<size_t>(b) * H, m.d_x + static_cast<size_t>(row) * H,
                                    sizeof(__half) * static_cast<size_t>(H), cudaMemcpyDeviceToDevice, 0));
     }
     rmsnorm(s.d_last, m.final_norm, s.d_last_norm, B, H, m.cfg.eps);
@@ -343,7 +419,11 @@ std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vecto
             }
         }
         next[static_cast<size_t>(b)] = best;
-        parts[static_cast<size_t>(b)].seq->len = static_cast<int>(parts[static_cast<size_t>(b)].ids->size());
+        if (b < Bp) {
+            parts[static_cast<size_t>(b)].seq->len = static_cast<int>(parts[static_cast<size_t>(b)].ids->size());
+        } else {
+            ++decodes[static_cast<size_t>(b - Bp)].seq->len;  // its token is now cached
+        }
     }
     return next;
 }

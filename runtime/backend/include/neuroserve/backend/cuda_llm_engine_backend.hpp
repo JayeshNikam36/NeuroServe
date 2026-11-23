@@ -45,6 +45,11 @@ public:
     // offset (prefill from an offset, docs/kv-cache.md). In prefill_batch, such items are packed too.
     TokenId prefill_more(SeqId seq, std::span<const TokenId> input) override;
     bool supports_chunked_prefill() const override { return true; }
+    // Mixed steps (Day 53): the prefills packed with the decode rows in one forward pass, the
+    // prefill segments' attention through the varlen tiled kernel and the decode rows' through a
+    // row-per-sequence kernel. Items that do not fit the pass are prefilled alone first.
+    void mixed_step(std::span<PrefillItem> items, DecodeBatch& decode) override;
+    bool supports_mixed_steps() const override { return true; }
     std::vector<TokenId> decode_step(std::span<const SeqId> seqs,
                                      std::span<const TokenId> tokens) override;
     void free_sequence(SeqId seq) override;
@@ -79,6 +84,7 @@ public:
     // sequences they prefilled. For tests and metrics.
     std::uint64_t batched_prefills() const noexcept;
     std::uint64_t batched_prefill_sequences() const noexcept;
+    std::uint64_t mixed_passes() const noexcept;  // mixed steps run as one forward pass (Day 53)
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

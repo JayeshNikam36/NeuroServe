@@ -21,6 +21,8 @@ The engine thread times every step on the host clock (`steady_clock`), phase by 
 `prefill` and `decode` are the backend calls only. They return their tokens to the host, so their
 time is the GPU work they launch plus the launches and the copy back: the GPU's share of the step,
 seen from the host. The phases add up to the step's total. Time with nothing to do is `idle`.
+A mixed step (Day 53: the step's prefills and decode in one backend call, `EngineLoopStats::mixed_steps`)
+cannot be split, so its whole call is counted as `prefill`.
 
 Every step is kept as a record (the newest 8,192, `EngineLoopOptions::step_profile_capacity`),
 with its start time, its phases, and what it did (requests and tokens prefilled, the decode batch).
@@ -58,7 +60,7 @@ Runs the server under `nsys profile` (CUDA API calls, kernels, memory copies, NV
 the step-profile tool against it, stops it and exports summaries: kernels by GPU time, CUDA API
 calls, memory copies, NVTX ranges (`stats_*.csv`). The report, `neuroserve.nsys-rep`, opens in the
 Nsight Systems GUI on Windows. In CUDA builds the engine marks its phases with NVTX ranges
-(`ns.step`, `ns.schedule`, `ns.prefill`, `ns.decode`, `ns.invariants`;
+(`ns.step`, `ns.schedule`, `ns.prefill`, `ns.decode`, `ns.mixed`, `ns.invariants`;
 `runtime/core/include/neuroserve/core/nvtx.hpp`), so the timeline shows each step's kernels under
 the phase that launched them.
 

@@ -70,6 +70,13 @@ public:
 
     bool supports_chunked_prefill() const override { return chunked_prefill; }
 
+    // Mixed steps (Day 53): the default two calls, recording each mixed call's (prefills, decodes).
+    void mixed_step(std::span<PrefillItem> items, DecodeBatch& decode) override {
+        mixed_calls.emplace_back(items.size(), decode.ids.size());
+        InferenceBackend::mixed_step(items, decode);
+    }
+    bool supports_mixed_steps() const override { return mixed_steps; }
+
     TokenId prefill_more(SeqId id, std::span<const TokenId> input) override {
         if (on_prefill) {
             on_prefill();
@@ -250,6 +257,8 @@ public:
     // the requests have finished).
     std::vector<std::size_t> prefill_batch_sizes;
     bool chunked_prefill = true;  // supports_chunked_prefill(): turn off to test the fallback
+    bool mixed_steps = true;      // supports_mixed_steps(): turn off to test the two-call path
+    std::vector<std::pair<std::size_t, std::size_t>> mixed_calls;  // (prefill items, decode sequences) per call
 
     // When true, every successful decode_step's sequence ids are appended to decode_batches, and
     // the first token of every prefilled prompt to prefill_first_tokens (the admission order).

@@ -148,6 +148,26 @@ RequestHandle::TokenBatch RequestHandle::read_tokens(std::chrono::milliseconds t
 
 // ---- EngineLoop: caller side -----------------------------------------------------------------
 
+struct EngineLoop::PrefillPlan {
+    struct Job {
+        Entry* entry;
+        std::size_t active_index;  // in active_, or kAdmitted for an admitted request (in `ready`)
+        std::vector<TokenId> input;
+        int end;                   // tokens of `input` cached once this prefill is done
+    };
+    static constexpr std::size_t kAdmitted = static_cast<std::size_t>(-1);
+    std::vector<Job> jobs;
+    std::vector<EntryPtr> ready;    // the admitted requests, in job order
+    std::vector<PrefillItem> items;  // one per job
+};
+
+struct EngineLoop::DecodePlan {
+    std::vector<std::size_t> decoding;  // indices in active_
+    std::vector<SeqId> seqs;
+    std::vector<TokenId> last_tokens;
+    DecodeBatch batch;  // its ids and tokens are set when the step runs (run_step)
+};
+
 EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
                        std::unique_ptr<SchedulingPolicy> policy)
     : backend_(backend),
@@ -181,12 +201,13 @@ EngineLoop::EngineLoop(InferenceBackend& backend, EngineLoopOptions options,
     if (options_.prefill_chunk_tokens > 0 && backend.supports_chunked_prefill()) {
         chunk_tokens_ = std::min(options_.prefill_chunk_tokens, options_.max_batch_tokens);
     }
+    mixed_ = options_.mixed_steps && backend.supports_mixed_steps();
     policy_name_ = std::string(policy_->name());
     log::write(log::Level::kInfo, kLogger, "engine loop started",
                {{"backend", std::string(backend.name())}, {"policy", std::string(policy_->name())},
                 {"max_batch", options_.max_batch}, {"max_batch_tokens", options_.max_batch_tokens},
                 {"kv_admission", std::string(admission_name(options_.admission))},
-                {"prefill_chunk_tokens", chunk_tokens_},
+                {"prefill_chunk_tokens", chunk_tokens_}, {"mixed_steps", mixed_},
                 {"total_pages", total_pages_}, {"page_size_tokens", page_size_}});
     thread_ = std::thread([this] { run(); });
 }
@@ -476,14 +497,13 @@ void EngineLoop::loop() {
             ++step.prefill_requests;
             step.prefill_tokens += chunk_tokens_ > 0 ? std::min(input, chunk_tokens_) : input;
         }
-        if (step.prefill_requests > 0) {
-            start_all(std::move(admitted), joining);
-        }
-        step.decode_tokens = static_cast<int>(
-            std::count_if(active_.begin(), active_.end(), [](const EntryPtr& e) { return !e->prefilling() && !e->fresh; }));
-        if (step.decode_tokens > 0) {
-            decode_active();
-        }
+        PrefillPlan prefill = step.prefill_requests > 0 ? plan_prefill(std::move(admitted)) : PrefillPlan{};
+        DecodePlan decode = plan_decode();
+        step.decode_tokens = static_cast<int>(decode.seqs.size());
+        run_step(prefill, decode);
+        finish_prefill(prefill, joining);
+        finish_decode(decode);
+        std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
         for (auto& entry : active_) {
             entry->fresh = false;  // joined in this step: decodes from the next one
         }
@@ -861,26 +881,18 @@ void EngineLoop::preempt(std::vector<EntryPtr> victims) {
     stats_.pending = pending_.size();
 }
 
-void EngineLoop::start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>& joining) {
-    // One prefill_batch call for this step: the next chunk of every running request still
-    // prefilling (chunked prefill), then the admitted requests (their first chunk, or all of their
-    // prefill). A resumed request recomputes its prompt and the tokens it already generated (the
-    // client has them); a prefill that ends its input returns the request's next new token.
-    struct Job {
-        Entry* entry;
-        std::size_t active_index;  // in active_, or SIZE_MAX for an admitted request (in `ready`)
-        std::vector<TokenId> input;
-        int end;                   // tokens of `input` cached once this prefill is done
-    };
-    constexpr std::size_t kAdmitted = static_cast<std::size_t>(-1);
-    std::vector<Job> jobs;
+EngineLoop::PrefillPlan EngineLoop::plan_prefill(std::vector<EntryPtr> admitted) {
+    // One prefill item per request: the next chunk of every running request still prefilling
+    // (chunked prefill), then the admitted requests (their first chunk, or all of their prefill). A
+    // resumed request recomputes its prompt and the tokens it already generated (the client has
+    // them); a prefill that ends its input returns the request's next new token.
+    PrefillPlan plan;
     for (std::size_t i = 0; i < active_.size(); ++i) {
         Entry& entry = *active_[i];
         if (entry.prefilling()) {
-            jobs.push_back({&entry, i, entry.prefill_input(), entry.cached + entry.next_chunk});
+            plan.jobs.push_back({&entry, i, entry.prefill_input(), entry.cached + entry.next_chunk});
         }
     }
-    std::vector<EntryPtr> ready;
     for (auto& entry : admitted) {
         try {
             entry->seq = backend_.create_sequence();
@@ -890,47 +902,101 @@ void EngineLoop::start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>
             entry->input_tokens = static_cast<int>(input.size());
             entry->fresh = false;
             const int end = chunk_tokens_ > 0 ? std::min(entry->input_tokens, chunk_tokens_) : entry->input_tokens;
-            jobs.push_back({entry.get(), kAdmitted, std::move(input), end});
-            ready.push_back(std::move(entry));
+            plan.jobs.push_back({entry.get(), PrefillPlan::kAdmitted, std::move(input), end});
+            plan.ready.push_back(std::move(entry));
         } catch (...) {
             fail(std::move(entry), std::current_exception());  // only this request fails
         }
     }
-    if (jobs.empty()) {
-        return;
+    plan.items.resize(plan.jobs.size());
+    for (std::size_t j = 0; j < plan.jobs.size(); ++j) {
+        plan.items[j].seq = plan.jobs[j].entry->seq;
+        plan.items[j].prompt =
+            std::span<const TokenId>(plan.jobs[j].input.data(), static_cast<std::size_t>(plan.jobs[j].end));
     }
-    std::vector<PrefillItem> items(jobs.size());
-    for (std::size_t j = 0; j < jobs.size(); ++j) {
-        items[j].seq = jobs[j].entry->seq;
-        items[j].prompt = std::span<const TokenId>(jobs[j].input.data(), static_cast<std::size_t>(jobs[j].end));
-    }
-    const auto called = ProfileClock::now();
-    try {
-        const NvtxRange range("ns.prefill");
-        backend_.prefill_batch(items);  // all together when the backend can (docs/prefill-attention.md)
-    } catch (...) {
-        const auto error = std::current_exception();  // the backend could not try: every request fails
-        for (auto& item : items) {
-            item.error = error;
+    return plan;
+}
+
+EngineLoop::DecodePlan EngineLoop::plan_decode() {
+    // Requests still prefilling (chunked prefill) take no decode; nor do those that join in this step
+    // (they are not in active_ yet, or finish their last chunk in it).
+    DecodePlan plan;
+    for (std::size_t i = 0; i < active_.size(); ++i) {
+        const Entry& entry = *active_[i];
+        if (!entry.prefilling() && !entry.fresh) {
+            plan.decoding.push_back(i);
+            plan.seqs.push_back(entry.seq);
+            plan.last_tokens.push_back(entry.tokens.back());
         }
     }
-    step_prefill_ms_ += ms_between(called, ProfileClock::now());
+    return plan;
+}
 
+void EngineLoop::run_step(PrefillPlan& prefill, DecodePlan& decode) {
+    const bool prefills = !prefill.items.empty();
+    const bool decodes = !decode.seqs.empty();
+    decode.batch.ids = decode.seqs;
+    decode.batch.tokens = decode.last_tokens;
+    if (mixed_ && prefills && decodes) {  // one call; its time is counted as prefill (docs/profiling.md)
+        const auto called = ProfileClock::now();
+        try {
+            const NvtxRange range("ns.mixed");
+            backend_.mixed_step(prefill.items, decode.batch);
+        } catch (...) {
+            const auto error = std::current_exception();  // the backend could not try: everything fails
+            for (auto& item : prefill.items) {
+                item.error = error;
+            }
+            decode.batch.error = error;
+        }
+        step_prefill_ms_ += ms_between(called, ProfileClock::now());
+        std::lock_guard lock(mu_);
+        ++stats_.mixed_steps;
+        return;
+    }
+    if (prefills) {
+        const auto called = ProfileClock::now();
+        try {
+            const NvtxRange range("ns.prefill");
+            backend_.prefill_batch(prefill.items);  // all together when the backend can (docs/prefill-attention.md)
+        } catch (...) {
+            const auto error = std::current_exception();  // the backend could not try: every request fails
+            for (auto& item : prefill.items) {
+                item.error = error;
+            }
+        }
+        step_prefill_ms_ += ms_between(called, ProfileClock::now());
+    }
+    if (decodes) {
+        const auto called = ProfileClock::now();
+        try {
+            const NvtxRange range("ns.decode");
+            decode.batch.next = backend_.decode_step(decode.seqs, decode.last_tokens);
+            decode.batch.error = nullptr;
+        } catch (...) {
+            decode.batch.error = std::current_exception();
+        }
+        step_decode_ms_ += ms_between(called, ProfileClock::now());
+    }
+}
+
+void EngineLoop::finish_prefill(PrefillPlan& prefill, std::vector<EntryPtr>& joining) {
     // A request whose prefill is done takes its first token and joins the decode batch (from the next
     // step); one still prefilling waits for its next chunk; one that failed fails alone.
     std::size_t next_ready = 0;
-    for (std::size_t j = 0; j < jobs.size(); ++j) {
-        Job& job = jobs[j];
+    for (std::size_t j = 0; j < prefill.jobs.size(); ++j) {
+        PrefillPlan::Job& job = prefill.jobs[j];
+        const PrefillItem& item = prefill.items[j];
         EntryPtr owned;
         EntryPtr* slot = nullptr;
-        if (job.active_index == kAdmitted) {
-            owned = std::move(ready[next_ready++]);
+        if (job.active_index == PrefillPlan::kAdmitted) {
+            owned = std::move(prefill.ready[next_ready++]);
         } else {
             slot = &active_[job.active_index];
         }
         EntryPtr& entry = slot != nullptr ? *slot : owned;
-        if (items[j].error) {
-            fail(std::move(entry), items[j].error);
+        if (item.error) {
+            fail(std::move(entry), item.error);
             continue;
         }
         try {
@@ -944,7 +1010,7 @@ void EngineLoop::start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>
             if (entry->first_token_at == Request::Clock::time_point{}) {
                 entry->first_token_at = Request::Clock::now();  // a restarted request keeps its first token time
             }
-            if (append_token(*entry, items[j].first)) {
+            if (append_token(*entry, item.first)) {
                 complete(std::move(entry));  // stop token or max_new_tokens == 1: no decode needed
                 continue;
             }
@@ -958,59 +1024,40 @@ void EngineLoop::start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>
             fail(std::move(entry), std::current_exception());
         }
     }
-    std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
 }
 
-void EngineLoop::decode_active() {
-    // Requests still prefilling (chunked prefill) and those that joined in this step take no decode.
-    std::vector<std::size_t> decoding;
-    std::vector<SeqId> seqs;
-    std::vector<TokenId> last_tokens;
-    for (std::size_t i = 0; i < active_.size(); ++i) {
-        const Entry& entry = *active_[i];
-        if (!entry.prefilling() && !entry.fresh) {
-            decoding.push_back(i);
-            seqs.push_back(entry.seq);
-            last_tokens.push_back(entry.tokens.back());
-        }
-    }
-
-    std::vector<TokenId> next;
-    try {
-        const NvtxRange range("ns.decode");
-        const auto called = ProfileClock::now();
-        next = backend_.decode_step(seqs, last_tokens);
-        step_decode_ms_ += ms_between(called, ProfileClock::now());
-        if (next.size() != seqs.size()) {
-            throw std::logic_error("decode_step returned " + std::to_string(next.size()) +
-                                   " tokens for " + std::to_string(seqs.size()) + " sequences");
-        }
-    } catch (...) {
-        // The backend cannot say which sequence caused the error, so the whole batch fails.
-        // The loop itself keeps serving later requests.
-        const auto error = std::current_exception();
-        log::write(log::Level::kError, kLogger, "decode step failed; failing its batch",
-                   {{"batch_size", seqs.size()}, {"error", describe(error)}});
-        for (const std::size_t i : decoding) {
-            fail(std::move(active_[i]), error);
-        }
-        std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
+void EngineLoop::finish_decode(DecodePlan& decode) {
+    if (decode.seqs.empty()) {
         return;
     }
-
+    DecodeBatch& batch = decode.batch;
+    if (!batch.error && batch.next.size() != decode.seqs.size()) {
+        batch.error = std::make_exception_ptr(std::logic_error(
+            "decode_step returned " + std::to_string(batch.next.size()) + " tokens for " +
+            std::to_string(decode.seqs.size()) + " sequences"));
+    }
+    if (batch.error) {
+        // The backend cannot say which sequence caused the error, so the whole batch fails.
+        // The loop itself keeps serving later requests.
+        log::write(log::Level::kError, kLogger, "decode step failed; failing its batch",
+                   {{"batch_size", decode.seqs.size()}, {"error", describe(batch.error)}});
+        for (const std::size_t i : decode.decoding) {
+            fail(std::move(active_[i]), batch.error);
+        }
+        return;
+    }
     {
         std::lock_guard lock(mu_);
         ++stats_.decode_steps;
-        stats_.max_batch_seen = std::max(stats_.max_batch_seen, seqs.size());
+        stats_.max_batch_seen = std::max(stats_.max_batch_seen, decode.seqs.size());
     }
-    for (std::size_t k = 0; k < decoding.size(); ++k) {
-        EntryPtr& entry = active_[decoding[k]];
+    for (std::size_t k = 0; k < decode.decoding.size(); ++k) {
+        EntryPtr& entry = active_[decode.decoding[k]];
         ++entry->cached;  // the fed-back token is now in the KV cache
-        if (append_token(*entry, next[k])) {
+        if (append_token(*entry, batch.next[k])) {
             complete(std::move(entry));  // finished on this step: no wasted decode work
         }
     }
-    std::erase_if(active_, [](const EntryPtr& entry) { return !entry; });
 }
 
 bool EngineLoop::append_token(Entry& entry, TokenId token) {

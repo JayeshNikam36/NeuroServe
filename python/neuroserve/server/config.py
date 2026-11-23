@@ -33,6 +33,8 @@ class EngineSection(_Strict):
     # Chunked prefill: a prompt is prefilled at most this many tokens per step, so long prompts
     # share steps with decodes (0 = off: each prompt is prefilled in one step). See docs/prefill-attention.md.
     prefill_chunk_tokens: int = Field(default=0, ge=0)
+    # Mixed steps: a step's prefills and decodes run as one forward pass (false = two passes).
+    mixed_steps: bool = True
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
     # which requests are admitted and preempted each step; see docs/scheduling.md

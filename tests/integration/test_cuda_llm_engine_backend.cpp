@@ -224,6 +224,89 @@ std::vector<std::vector<TokenId>> batched_greedy(CudaLlmEngineBackend& backend,
     return outs;
 }
 
+// Mixed steps (Day 53), the way the engine makes them: the first `lead` prompts are prefilled up
+// front; then every step is one mixed_step() call with the next `chunk` tokens of every prompt still
+// prefilling and a decode of every sequence that has its first token (from the step after it).
+// Each sequence stops at its own n_new[i] tokens. Counts the steps that had both in `mixed`.
+std::vector<std::vector<TokenId>> mixed_greedy(CudaLlmEngineBackend& backend,
+                                               const std::vector<std::vector<TokenId>>& prompts, std::size_t lead,
+                                               std::size_t chunk, const std::vector<std::size_t>& n_new, int& mixed) {
+    std::vector<SeqId> ids;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        ids.push_back(backend.create_sequence());
+    }
+    std::vector<std::vector<TokenId>> outs(prompts.size());
+    std::vector<std::size_t> done(prompts.size(), 0);
+    {
+        std::vector<neuroserve::PrefillItem> items(lead);
+        for (std::size_t i = 0; i < lead; ++i) {
+            items[i].seq = ids[i];
+            items[i].prompt = prompts[i];
+            done[i] = prompts[i].size();
+        }
+        backend.prefill_batch(items);
+        for (std::size_t i = 0; i < lead; ++i) {
+            if (items[i].error) {
+                std::rethrow_exception(items[i].error);
+            }
+            outs[i].push_back(items[i].first);
+        }
+    }
+    mixed = 0;
+    for (;;) {
+        std::vector<neuroserve::PrefillItem> items;
+        std::vector<std::size_t> prefilling;
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            if (done[i] < prompts[i].size()) {
+                const std::size_t end = std::min(prompts[i].size(), done[i] + chunk);
+                neuroserve::PrefillItem item;
+                item.seq = ids[i];
+                item.prompt = std::span<const TokenId>(prompts[i]).first(end);
+                items.push_back(item);
+                prefilling.push_back(i);
+                done[i] = end;
+            }
+        }
+        std::vector<SeqId> dec;
+        std::vector<TokenId> last;
+        std::vector<std::size_t> decoding;
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            if (!outs[i].empty() && outs[i].size() < n_new[i]) {
+                dec.push_back(ids[i]);
+                last.push_back(outs[i].back());
+                decoding.push_back(i);
+            }
+        }
+        if (items.empty() && dec.empty()) {
+            break;
+        }
+        neuroserve::DecodeBatch batch;
+        batch.ids = dec;
+        batch.tokens = last;
+        backend.mixed_step(items, batch);
+        mixed += !items.empty() && !dec.empty();
+        for (std::size_t k = 0; k < items.size(); ++k) {
+            if (items[k].error) {
+                std::rethrow_exception(items[k].error);
+            }
+            const std::size_t i = prefilling[k];
+            if (done[i] == prompts[i].size()) {
+                outs[i].push_back(items[k].first);
+            }
+        }
+        if (batch.error) {
+            std::rethrow_exception(batch.error);
+        }
+        for (std::size_t k = 0; k < decoding.size(); ++k) {
+            outs[decoding[k]].push_back(batch.next.at(k));
+        }
+    }
+    for (const SeqId id : ids) {
+        backend.free_sequence(id);
+    }
+    return outs;
+}
+
 TEST_F(CudaLlmEngineBackendTest, BatchedPrefillMatchesHuggingFaceInEveryPacking) {
     // The 8 reference prompts three ways: all in one call, in reverse order, and in pairs. Each
     // call packs what fits the 512-token scratch into one forward pass (Day 51). 24 sequences, each
@@ -285,6 +368,50 @@ TEST_F(CudaLlmEngineBackendTest, BatchedPrefillWithAPrefixHitMatchesHuggingFace)
     EXPECT_GE(backend_->kv_stats().prefix_reused_tokens - reused_before, 48) << "the 48-token prefix was not reused";
     EXPECT_EQ(backend_->batched_prefills(), packs_before + 1);
     backend_->set_prefix_caching(false);  // evicts the cached pages
+    expect_no_leaked_pages();
+}
+
+TEST_F(CudaLlmEngineBackendTest, MixedStepsMatchHuggingFace) {
+    // Mixed steps (Day 53): reference prompts 0-3 decode while 4-7 are prefilled 4 tokens per step,
+    // prefill chunks and decode rows in one forward pass; then all 8 decode. Every sequence must
+    // equal Hugging Face token for token. Then the same with the halves swapped, and with caching on.
+    std::vector<std::vector<TokenId>> prompts;
+    std::vector<std::size_t> n_new;
+    for (const auto& r : refs_) {
+        prompts.push_back(r.prompt);
+        n_new.push_back(r.greedy.size());
+    }
+    int correct = 0;
+    int total = 0;
+    int steps = 0;
+    const std::uint64_t passes_before = backend_->mixed_passes();
+    for (const bool caching : {false, true}) {
+        backend_->set_prefix_caching(caching);
+        for (const bool swapped : {false, true}) {
+            std::vector<std::vector<TokenId>> order = prompts;
+            std::vector<std::size_t> lengths = n_new;
+            if (swapped) {
+                std::rotate(order.begin(), order.begin() + 4, order.end());
+                std::rotate(lengths.begin(), lengths.begin() + 4, lengths.end());
+            }
+            int mixed = 0;
+            const auto out = mixed_greedy(*backend_, order, 4, 4, lengths, mixed);
+            steps += mixed;
+            for (int i = 0; i < kNumPrompts; ++i) {
+                const int ref = swapped ? (i + 4) % kNumPrompts : i;
+                const auto& want = refs_[static_cast<std::size_t>(ref)].greedy;
+                EXPECT_EQ(out[static_cast<std::size_t>(i)], want) << "prompt " << ref << (swapped ? ", swapped" : "")
+                                                                  << (caching ? ", caching on" : "");
+                correct += out[static_cast<std::size_t>(i)] == want;
+                ++total;
+            }
+        }
+    }
+    backend_->set_prefix_caching(false);
+    std::printf("mixed steps: %d/%d sequences match Hugging Face; %d mixed steps, %llu one-pass\n", correct, total,
+                steps, static_cast<unsigned long long>(backend_->mixed_passes() - passes_before));
+    EXPECT_EQ(correct, total);
+    EXPECT_GT(backend_->mixed_passes(), passes_before) << "no step ran as one mixed pass";
     expect_no_leaked_pages();
 }
 
@@ -810,6 +937,29 @@ TEST_F(CudaPrefixCacheTest, PackedChunksReproduceHuggingFace) {
         backend_->free_sequence(ids[c]);
     }
     EXPECT_GT(backend_->batched_prefills(), packs_before) << "no chunks were packed";
+    backend_->set_prefix_caching(true);
+    backend_->check_kv_invariants();
+}
+
+TEST_F(CudaPrefixCacheTest, MixedStepsWithLongPromptsReproduceHuggingFace) {
+    // Mixed steps (Day 53) with the instruct references (a 512-token system prompt and a user turn):
+    // the first half decode while the second half are prefilled 128 tokens per step; with caching
+    // off and on. Every sequence must equal Hugging Face token for token.
+    std::vector<std::size_t> n_new;
+    for (const auto& g : greedy_) {
+        n_new.push_back(g.size());
+    }
+    const std::size_t lead = prompts_.size() / 2;
+    for (const bool caching : {false, true}) {
+        backend_->set_prefix_caching(caching);
+        backend_->evict_cached_pages();
+        int mixed = 0;
+        const auto out = mixed_greedy(*backend_, prompts_, lead, 128, n_new, mixed);
+        EXPECT_GT(mixed, 0);
+        for (std::size_t c = 0; c < prompts_.size(); ++c) {
+            EXPECT_EQ(out[c], greedy_[c]) << "case " << c << (caching ? ", caching on" : ", caching off");
+        }
+    }
     backend_->set_prefix_caching(true);
     backend_->check_kv_invariants();
 }

@@ -94,6 +94,7 @@ struct CudaLlmEngineBackend::Impl {
     SeqId next_id = 1;
     backend_detail::PrefillBatchScratch prefill_scratch{};  // batched prefill (Day 51)
     bool prefill_scratch_allocated = false;
+    std::uint64_t mixed_passes = 0;  // mixed steps run as one forward pass (Day 53)
     std::uint64_t batched_prefills = 0;
     std::uint64_t batched_prefill_sequences = 0;
 
@@ -265,6 +266,168 @@ struct CudaLlmEngineBackend::Impl {
         }
     }
 
+    // decode_step()'s checks, which change nothing: returns the sequences and, in `new_pages`, the
+    // blocks their new tokens need (at most one each).
+    std::vector<::Sequence*> checked_for_decode(std::span<const SeqId> ids, std::span<const TokenId> toks,
+                                                int& new_pages) {
+        if (ids.empty()) {
+            throw std::invalid_argument("decode_step: no sequences");
+        }
+        if (ids.size() != toks.size()) {
+            throw std::invalid_argument("decode_step: " + std::to_string(ids.size()) + " sequences but " +
+                                        std::to_string(toks.size()) + " tokens");
+        }
+        if (ids.size() > static_cast<std::size_t>(config.max_batch)) {
+            throw std::invalid_argument("decode_step: batch of " + std::to_string(ids.size()) +
+                                        " exceeds max_batch " + std::to_string(config.max_batch));
+        }
+        std::vector<::Sequence*> seqs;
+        seqs.reserve(ids.size());
+        std::unordered_set<SeqId> seen;
+        new_pages = 0;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (!seen.insert(ids[i]).second) {
+                throw std::invalid_argument("decode_step: sequence " + std::to_string(ids[i]) + " listed twice");
+            }
+            ::Sequence& s = get(ids[i]);
+            if (s.len == 0) {
+                throw std::logic_error("decode_step: sequence " + std::to_string(ids[i]) + " has not been prefilled");
+            }
+            check_token(toks[i]);
+            const int needed = kv->blocks_needed(ids[i], 1);
+            if (static_cast<int>(s.pages.size()) + needed > config.max_pages_per_sequence) {
+                throw std::length_error("decode_step: sequence " + std::to_string(ids[i]) +
+                                        " reached its maximum length");
+            }
+            new_pages += needed;
+            seqs.push_back(&s);
+        }
+        return seqs;
+    }
+
+    // The decode's new blocks (at most one per sequence), from the manager.
+    void append_for_decode(std::span<const SeqId> ids, const std::vector<::Sequence*>& seqs) {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            kv->append(ids[i], 1);
+            sync_pages(ids[i], *seqs[i]);
+        }
+    }
+
+    // After the decode's K/V are written: the engine and the manager agree, and the fed-back tokens
+    // are indexed for prefix caching.
+    void finish_decode(std::span<const SeqId> ids, const std::vector<::Sequence*>& seqs,
+                       std::span<const TokenId> toks) {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            check_in_sync(ids[i], *seqs[i]);
+            if (prefix_caching) {
+                std::vector<TokenId>& held = tokens[ids[i]];
+                held.push_back(toks[i]);
+                kv->commit(ids[i], held);  // indexes the page this token filled, if any
+            }
+        }
+    }
+
+    // A prefill item that passed its checks and has its blocks: `cached` tokens of it are already in
+    // its pages (a prefix hit, or earlier chunks).
+    struct Admitted {
+        PrefillItem* item;
+        ::Sequence* seq;
+        int cached;
+    };
+
+    // Every item's checks and blocks, in order; an item that fails them fails alone (`error` set).
+    std::vector<Admitted> admit_items(std::span<PrefillItem> items) {
+        std::vector<Admitted> admitted;
+        for (PrefillItem& item : items) {
+            item.error = nullptr;
+            try {
+                if (get(item.seq).len == 0) {  // a new prefill
+                    ::Sequence& seq = checked_for_prefill(item.seq, item.prompt);
+                    admitted.push_back({&item, &seq, admit(item.seq, seq, item.prompt)});
+                } else {  // the next chunk of one (chunked prefill)
+                    ::Sequence& seq = checked_for_more(item.seq, item.prompt);
+                    admitted.push_back({&item, &seq, admit_more(item.seq, seq, item.prompt)});
+                }
+            } catch (...) {
+                item.error = std::current_exception();
+            }
+        }
+        return admitted;
+    }
+
+    // Which admitted items go in one pass: those whose new tokens fit one chunk, while the pack fits
+    // `tokens` rows and `seqs` sequences. The rest go through prefill()'s path, one by one.
+    void split_pack(std::vector<Admitted>& admitted, int tokens, int seqs, std::vector<Admitted*>& pack,
+                    std::vector<Admitted*>& alone) {
+        int packed_tokens = 0;
+        for (Admitted& a : admitted) {
+            const int fresh = static_cast<int>(a.item->prompt.size()) - a.cached;
+            if (fresh <= prefill_chunk && packed_tokens + fresh <= tokens && static_cast<int>(pack.size()) < seqs) {
+                pack.push_back(&a);
+                packed_tokens += fresh;
+            } else {
+                alone.push_back(&a);
+            }
+        }
+    }
+
+    void run_alone(const std::vector<Admitted*>& alone) {
+        for (Admitted* a : alone) {
+            try {
+                a->item->first = run_chunked(a->item->seq, *a->seq, a->item->prompt, a->cached);
+            } catch (...) {
+                a->item->error = std::current_exception();
+            }
+        }
+    }
+
+    // prefill_batch() after the admission: what fits one pass together, the rest (and a pack of one)
+    // through prefill()'s path.
+    void prefill_admitted(std::vector<Admitted>& admitted) {
+        std::vector<Admitted*> pack;
+        std::vector<Admitted*> alone;
+        split_pack(admitted, config.max_prompt_tokens, prefill_scratch.max_seqs, pack, alone);
+        if (pack.size() == 1) {
+            alone.insert(alone.begin(), pack.front());
+            pack.clear();
+        }
+        if (!pack.empty()) {
+            run_pack(pack, {});
+        }
+        run_alone(alone);
+    }
+
+    // One forward pass over the packed items and the decode rows (none, for a batched prefill).
+    // Returns the decode rows' next tokens.
+    std::vector<int> run_pack(const std::vector<Admitted*>& pack,
+                              const std::vector<backend_detail::DecodeRow>& decodes) {
+        std::vector<std::vector<int>> ids;
+        ids.reserve(pack.size());
+        std::vector<backend_detail::PrefillPart> parts;
+        for (Admitted* a : pack) {
+            ids.emplace_back(a->item->prompt.begin(), a->item->prompt.end());
+        }
+        for (std::size_t i = 0; i < pack.size(); ++i) {
+            parts.push_back({pack[i]->seq, &ids[i], pack[i]->cached});
+        }
+        const std::vector<int> next =
+            backend_detail::model_mixed_batch(model, *cache, parts, decodes, prefill_scratch);
+        for (std::size_t i = 0; i < pack.size(); ++i) {
+            PrefillItem& item = *pack[i]->item;
+            try {
+                finish_prefill(item.seq, *pack[i]->seq, item.prompt);
+                item.first = next[i];
+            } catch (...) {
+                item.error = std::current_exception();
+            }
+        }
+        if (!pack.empty()) {
+            ++batched_prefills;
+            batched_prefill_sequences += pack.size();
+        }
+        return std::vector<int>(next.begin() + static_cast<long>(pack.size()), next.end());
+    }
+
     // prefill()'s computation for one admitted sequence, in chunks of at most prefill_chunk tokens
     // (the scratch holds max_prompt_tokens): a client's prompt is one chunk; a resumed request's
     // prompt + generated tokens can be several (Day 38).
@@ -434,76 +597,63 @@ TokenId CudaLlmEngineBackend::prefill_more(SeqId id, std::span<const TokenId> in
 
 void CudaLlmEngineBackend::prefill_batch(std::span<PrefillItem> items) {
     Impl& im = *impl_;
-    struct Admitted {
-        PrefillItem* item;
-        ::Sequence* seq;
-        int cached;
-    };
-    // Every item's checks and blocks first, in order; an item that fails them fails alone.
-    std::vector<Admitted> admitted;
-    for (PrefillItem& item : items) {
-        item.error = nullptr;
-        try {
-            if (im.get(item.seq).len == 0) {  // a new prefill
-                ::Sequence& seq = im.checked_for_prefill(item.seq, item.prompt);
-                admitted.push_back({&item, &seq, im.admit(item.seq, seq, item.prompt)});
-            } else {  // the next chunk of one (chunked prefill)
-                ::Sequence& seq = im.checked_for_more(item.seq, item.prompt);
-                admitted.push_back({&item, &seq, im.admit_more(item.seq, seq, item.prompt)});
-            }
-        } catch (...) {
-            item.error = std::current_exception();
-        }
+    std::vector<Impl::Admitted> admitted = im.admit_items(items);
+    im.prefill_admitted(admitted);
+}
+
+void CudaLlmEngineBackend::mixed_step(std::span<PrefillItem> items, DecodeBatch& decode) {
+    Impl& im = *impl_;
+    if (items.empty() || decode.ids.empty()) {
+        InferenceBackend::mixed_step(items, decode);  // nothing to mix
+        return;
     }
-    // Together: items whose new tokens fit one chunk, while the pack fits the scratch. The rest, and
-    // a pack of one, go through prefill()'s path.
-    std::vector<Admitted*> pack;
-    std::vector<Admitted*> alone;
-    int packed_tokens = 0;
-    for (Admitted& a : admitted) {
-        const int fresh = static_cast<int>(a.item->prompt.size()) - a.cached;
-        if (fresh <= im.prefill_chunk && packed_tokens + fresh <= im.config.max_prompt_tokens &&
-            static_cast<int>(pack.size()) < im.prefill_scratch.max_seqs) {
-            pack.push_back(&a);
-            packed_tokens += fresh;
-        } else {
-            alone.push_back(&a);
-        }
-    }
-    if (pack.size() == 1) {
-        alone.insert(alone.begin(), pack.front());
-        pack.clear();
-    }
-    if (!pack.empty()) {
-        std::vector<std::vector<int>> ids;
-        ids.reserve(pack.size());
-        std::vector<backend_detail::PrefillPart> parts;
-        for (Admitted* a : pack) {
-            ids.emplace_back(a->item->prompt.begin(), a->item->prompt.end());
-        }
-        for (std::size_t i = 0; i < pack.size(); ++i) {
-            parts.push_back({pack[i]->seq, &ids[i], pack[i]->cached});
-        }
-        const std::vector<int> next = backend_detail::model_prefill_batch(im.model, *im.cache, parts, im.prefill_scratch);
-        for (std::size_t i = 0; i < pack.size(); ++i) {
-            PrefillItem& item = *pack[i]->item;
-            try {
-                im.finish_prefill(item.seq, *pack[i]->seq, item.prompt);
-                item.first = next[i];
-            } catch (...) {
-                item.error = std::current_exception();
+    decode.error = nullptr;
+    decode.next.clear();
+    // The decode's checks first: they change nothing. If they fail, the prefills still run.
+    std::vector<::Sequence*> seqs;
+    int new_pages = 0;
+    try {
+        seqs = im.checked_for_decode(decode.ids, decode.tokens, new_pages);
+        for (const PrefillItem& item : items) {
+            if (std::find(decode.ids.begin(), decode.ids.end(), item.seq) != decode.ids.end()) {
+                throw std::invalid_argument("mixed_step: sequence " + std::to_string(item.seq) +
+                                            " is both prefilled and decoded");
             }
         }
-        ++im.batched_prefills;
-        im.batched_prefill_sequences += pack.size();
+    } catch (...) {
+        decode.error = std::current_exception();
+        prefill_batch(items);
+        return;
     }
-    for (Admitted* a : alone) {
-        try {
-            a->item->first = im.run_chunked(a->item->seq, *a->seq, a->item->prompt, a->cached);
-        } catch (...) {
-            a->item->error = std::current_exception();
+    std::vector<Impl::Admitted> admitted = im.admit_items(items);
+    if (new_pages > im.kv->free_blocks()) {  // the prefills took the pages the decode needed
+        decode.error = std::make_exception_ptr(KvCacheExhausted(
+            "decode_step: needs " + std::to_string(new_pages) + " new KV pages, " +
+            std::to_string(im.kv->free_blocks()) + " free"));
+        im.prefill_admitted(admitted);
+        return;
+    }
+    im.append_for_decode(decode.ids, seqs);
+    // The pack shares the scratch with the decode rows: one row and one sequence each.
+    const int rows = static_cast<int>(seqs.size());
+    std::vector<Impl::Admitted*> pack;
+    std::vector<Impl::Admitted*> alone;
+    im.split_pack(admitted, im.config.max_prompt_tokens - rows, im.prefill_scratch.max_seqs - rows, pack, alone);
+    im.run_alone(alone);  // what does not fit the pass, before it
+    std::vector<int> next;
+    if (pack.empty()) {
+        const std::vector<int> toks(decode.tokens.begin(), decode.tokens.end());
+        model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
+    } else {
+        std::vector<backend_detail::DecodeRow> rows_in;
+        for (std::size_t i = 0; i < seqs.size(); ++i) {
+            rows_in.push_back({seqs[i], decode.tokens[i]});
         }
+        next = im.run_pack(pack, rows_in);
+        ++im.mixed_passes;
     }
+    im.finish_decode(decode.ids, seqs, decode.tokens);
+    decode.next.assign(next.begin(), next.end());
 }
 
 std::uint64_t CudaLlmEngineBackend::batched_prefills() const noexcept { return impl_->batched_prefills; }
@@ -512,62 +662,22 @@ std::uint64_t CudaLlmEngineBackend::batched_prefill_sequences() const noexcept {
     return impl_->batched_prefill_sequences;
 }
 
+std::uint64_t CudaLlmEngineBackend::mixed_passes() const noexcept { return impl_->mixed_passes; }
+
 std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> ids,
                                                        std::span<const TokenId> tokens) {
     Impl& im = *impl_;
-    if (ids.empty()) {
-        throw std::invalid_argument("decode_step: no sequences");
-    }
-    if (ids.size() != tokens.size()) {
-        throw std::invalid_argument("decode_step: " + std::to_string(ids.size()) + " sequences but " +
-                                    std::to_string(tokens.size()) + " tokens");
-    }
-    if (ids.size() > static_cast<std::size_t>(im.config.max_batch)) {
-        throw std::invalid_argument("decode_step: batch of " + std::to_string(ids.size()) +
-                                    " exceeds max_batch " + std::to_string(im.config.max_batch));
-    }
-
-    std::vector<::Sequence*> seqs;
-    seqs.reserve(ids.size());
-    std::unordered_set<SeqId> seen;
     int new_pages = 0;
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (!seen.insert(ids[i]).second) {
-            throw std::invalid_argument("decode_step: sequence " + std::to_string(ids[i]) + " listed twice");
-        }
-        ::Sequence& s = im.get(ids[i]);
-        if (s.len == 0) {
-            throw std::logic_error("decode_step: sequence " + std::to_string(ids[i]) + " has not been prefilled");
-        }
-        im.check_token(tokens[i]);
-        const int needed = im.kv->blocks_needed(ids[i], 1);
-        if (static_cast<int>(s.pages.size()) + needed > im.config.max_pages_per_sequence) {
-            throw std::length_error("decode_step: sequence " + std::to_string(ids[i]) + " reached its maximum length");
-        }
-        new_pages += needed;
-        seqs.push_back(&s);
-    }
+    std::vector<::Sequence*> seqs = im.checked_for_decode(ids, tokens, new_pages);
     if (new_pages > im.kv->free_blocks()) {
         throw KvCacheExhausted("decode_step: needs " + std::to_string(new_pages) + " new KV pages, " +
                                std::to_string(im.kv->free_blocks()) + " free");
     }
-
-    // Every check has passed: take the new blocks (at most one per sequence) from the manager.
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        im.kv->append(ids[i], 1);
-        im.sync_pages(ids[i], *seqs[i]);
-    }
-    const std::vector<int> toks(tokens.begin(), tokens.end());
+    im.append_for_decode(ids, seqs);  // every check has passed
     std::vector<int> next;
+    const std::vector<int> toks(tokens.begin(), tokens.end());
     model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        im.check_in_sync(ids[i], *seqs[i]);
-        if (im.prefix_caching) {
-            std::vector<TokenId>& held = im.tokens[ids[i]];
-            held.push_back(tokens[i]);
-            im.kv->commit(ids[i], held);  // indexes the page this token filled, if any
-        }
-    }
+    im.finish_decode(ids, seqs, tokens);
     return std::vector<TokenId>(next.begin(), next.end());
 }
 

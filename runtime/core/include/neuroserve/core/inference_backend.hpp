@@ -67,6 +67,16 @@ struct PrefillItem {
     std::exception_ptr error;
 };
 
+// The decode half of a mixed step (InferenceBackend::mixed_step, Day 53): tokens[i] is appended to
+// ids[i], as decode_step() would. The backend sets `next` (one token per sequence, in order), or
+// `error` if the decode failed, in which case every sequence in it is unchanged.
+struct DecodeBatch {
+    std::span<const SeqId> ids;
+    std::span<const TokenId> tokens;
+    std::vector<TokenId> next;
+    std::exception_ptr error;
+};
+
 // Executes a model and owns its weights and KV memory.
 // Not thread-safe: called only from the engine thread. Generation is greedy for now.
 // On any exception, the backend's state is unchanged.
@@ -113,6 +123,33 @@ public:
         throw std::logic_error("this backend cannot prefill in chunks");
     }
     virtual bool supports_chunked_prefill() const { return false; }
+
+    // One engine step's work: the prefills (as prefill_batch) and a decode (as decode_step) of
+    // other sequences, none in both. Each item and the decode succeed or fail on their own. The
+    // default makes the two calls; a backend whose supports_mixed_steps() is true runs them in one
+    // forward pass (docs/prefill-attention.md). Throws only for an error that stops it from trying.
+    virtual void mixed_step(std::span<PrefillItem> items, DecodeBatch& decode) {
+        if (!items.empty()) {
+            try {
+                prefill_batch(items);
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                for (PrefillItem& item : items) {
+                    item.error = error;
+                }
+            }
+        }
+        decode.error = nullptr;
+        decode.next.clear();
+        if (!decode.ids.empty()) {
+            try {
+                decode.next = decode_step(decode.ids, decode.tokens);
+            } catch (...) {
+                decode.error = std::current_exception();
+            }
+        }
+    }
+    virtual bool supports_mixed_steps() const { return false; }
 
     // One decode step for several sequences: tokens[i] is appended to seqs[i].
     // Returns the next token for each sequence, in the same order.

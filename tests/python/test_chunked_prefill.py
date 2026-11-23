@@ -57,7 +57,9 @@ def test_chunked_requests_match_hugging_face(chunked_engine, refs, step_budget):
     assert not errors, errors[:3]
     mismatched = [k for k, (_, expected) in enumerate(jobs) if results[k] != expected]
     assert not mismatched, f"{len(mismatched)} of {len(jobs)} differ from Hugging Face (first: request {mismatched[0]})"
-    assert chunked_engine.stats()["max_step_tokens"] <= step_budget
+    stats = chunked_engine.stats()
+    assert stats["max_step_tokens"] <= step_budget
+    assert stats["mixed_steps"] > 0, "no step mixed prefill chunks and decodes"
     kv = chunked_engine.kv_stats()
     assert kv["free_pages"] == kv["total_pages"], "KV pages leaked"
 
