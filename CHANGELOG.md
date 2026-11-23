@@ -31,6 +31,10 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- Design: CUDA Graphs for decode (docs/cuda-graphs.md): the capture blockers in today's decode
+  step (synchronous pageable copies, the legacy default stream, no cuBLAS workspace, the host-side
+  split choice), graphs per (bucket, splits) for buckets 1/2/4/8/16, a reserved pad page for
+  padding rows, static pinned and device buffers, one host sync per step.
 - `neuroserve.bench.chunked_ab`: chunked prefill against unchunked (and, opt-in, the two-pass
   engine), a fresh server per run, the same seeded schedule per round, the order balanced across
   rounds; TTFT split by prompt length, the time between tokens over every streamed token

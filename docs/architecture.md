@@ -58,6 +58,10 @@ least recently used first; a prompt whose leading full blocks are cached is pref
 first uncached token. The design, its invariants and the measurements are in
 [kv-cache.md](kv-cache.md).
 
+Phase 4 makes the GPU path NeuroServe's own too: prefill attention and batched, chunked and mixed
+prefill/decode steps ([prefill-attention.md](prefill-attention.md)), the step profile
+([profiling.md](profiling.md)), and CUDA Graphs for decode ([cuda-graphs.md](cuda-graphs.md)).
+
 Outside the request path, `neuroserve.bench` (load generator, policy comparison, prefix-caching
 comparison, stress run, NVML GPU sampler) drives servers for measurements; see
 [benchmarking.md](benchmarking.md).
