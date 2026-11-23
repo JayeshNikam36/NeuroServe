@@ -153,6 +153,7 @@ class EngineService:
             max_batch=e.max_batch,
             max_batch_tokens=e.max_batch_tokens,
             prefill_chunk_tokens=e.prefill_chunk_tokens,
+            mixed_steps=e.mixed_steps,
             max_pages_per_sequence=e.max_pages_per_sequence,
             device_index=e.device_index,
             scheduling_policy=e.scheduling_policy,

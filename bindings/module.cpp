@@ -254,6 +254,7 @@ public:
         out["timed_out"] = s.timed_out;
         out["preemptions"] = s.preemptions;
         out["decode_steps"] = s.decode_steps;
+        out["mixed_steps"] = s.mixed_steps;
         out["prefill_tokens"] = s.prefill_tokens;
         out["decode_tokens"] = s.decode_tokens;
         out["max_step_tokens"] = s.max_step_tokens;
@@ -328,11 +329,12 @@ PYBIND11_MODULE(_core, m) {
                          int max_batch, int max_batch_tokens, int max_pages_per_sequence, int device_index,
                          const std::string& scheduling_policy, int priority_aging_ms, int max_queue,
                          int queue_timeout_ms, int decision_log_capacity, bool prefix_caching,
-                         const std::string& kv_admission, int prefill_chunk_tokens) {
+                         const std::string& kv_admission, int prefill_chunk_tokens, bool mixed_steps) {
                  core::EngineLoopOptions loop_options;
                  loop_options.max_batch = max_batch;
                  loop_options.max_batch_tokens = max_batch_tokens;
                  loop_options.prefill_chunk_tokens = prefill_chunk_tokens;
+                 loop_options.mixed_steps = mixed_steps;
                  if (prefill_chunk_tokens < 0) {
                      throw std::invalid_argument("prefill_chunk_tokens must be 0 (off) or more");
                  }
@@ -369,7 +371,8 @@ PYBIND11_MODULE(_core, m) {
              py::arg("device_index") = 0, py::arg("scheduling_policy") = "fcfs",
              py::arg("priority_aging_ms") = 1000, py::arg("max_queue") = 1024, py::arg("queue_timeout_ms") = 0,
              py::arg("decision_log_capacity") = 4096, py::arg("prefix_caching") = false,
-             py::arg("kv_admission") = "on-demand", py::arg("prefill_chunk_tokens") = 0)
+             py::arg("kv_admission") = "on-demand", py::arg("prefill_chunk_tokens") = 0,
+             py::arg("mixed_steps") = true)
         .def("run", &Engine::run,
              py::arg("prompt_ids"), py::arg("max_new_tokens") = 32, py::kw_only(),
              py::arg("stop_token_ids") = std::vector<ns::TokenId>{}, py::arg("client_request_id") = "",

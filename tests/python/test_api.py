@@ -48,6 +48,11 @@ def test_with_chunked_prefill_a_prompt_may_be_longer_than_a_step():
         make_config(prefill_chunk_tokens=-1)
 
 
+def test_mixed_steps_are_on_by_default():
+    assert make_config().engine.mixed_steps is True
+    assert make_config(mixed_steps=False).engine.mixed_steps is False
+
+
 class FakeStream:
     """Like neuroserve.TokenStream: hands out the tokens one per read(), then the result.
 

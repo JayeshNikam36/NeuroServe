@@ -144,7 +144,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
              f"- **GPU:** {meta['gpu']} · **model:** {meta['model']} · **config:** `{meta['config']}`; prefix "
              f"caching {_on_off(meta['prefix_caching'])}; invariant checks "
              f"{_on_off(meta['check_invariants'])}; step budget {_fmt(meta.get('max_batch_tokens'))} tokens, "
-             f"chunked prefill {_chunk(meta.get('prefill_chunk_tokens'))}",
+             f"chunked prefill {_chunk(meta.get('prefill_chunk_tokens'))}; mixed steps "
+             f"{_on_off(meta.get('mixed_steps'))}",
              "- **Method:** the engine times every step's phases on its own thread (host clock). The backend's "
              "prefill and decode calls return tokens to the host, so their time includes the GPU work they "
              "launch and wait for; everything else in the step is host work. Idle = the engine thread waiting "
@@ -236,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefill-chunk-tokens", type=int, default=None,
                         help="start the server with chunked prefill, at most this many tokens per prompt per step")
     parser.add_argument("--max-batch-tokens", type=int, default=None, help="start the server with this step budget")
+    parser.add_argument("--no-mixed-steps", action="store_true",
+                        help="start the server with mixed steps off: prefill and decode in two passes")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--startup-timeout-s", type=float, default=300.0)
@@ -253,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     server = None
     chunk_tokens: int | None = None  # the started server's settings (unknown for a running server)
     step_budget: int | None = None
+    mixed_steps: bool | None = None
     url = args.url
     if url is None:
         cfg = prefix_ab.run_config(base, prefix_caching=args.prefix_caching, pool_fraction=1.0, burst=True,
@@ -260,14 +264,17 @@ def main(argv: list[str] | None = None) -> int:
         for key in ("prefill_chunk_tokens", "max_batch_tokens"):
             if getattr(args, key) is not None:
                 cfg["engine"][key] = getattr(args, key)
+        if args.no_mixed_steps:
+            cfg["engine"]["mixed_steps"] = False
         engine_cfg = ServerConfig.model_validate(cfg).engine  # raises if the combination is invalid
         chunk_tokens, step_budget = engine_cfg.prefill_chunk_tokens, engine_cfg.max_batch_tokens
+        mixed_steps = engine_cfg.mixed_steps
         server = prefix_ab.ServerProcess(cfg, args.out_dir, "profile")
     meta: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "git_commit": compare._git_commit(),
         "config": str(args.config), "model": model, "url": url, "seed": args.seed, "scenarios": scenarios,
         "prefix_caching": args.prefix_caching if server else None, "gpu": None,
-        "prefill_chunk_tokens": chunk_tokens, "max_batch_tokens": step_budget,
+        "prefill_chunk_tokens": chunk_tokens, "max_batch_tokens": step_budget, "mixed_steps": mixed_steps,
     }
     from .stress import invariant_checks
     meta["check_invariants"] = invariant_checks()

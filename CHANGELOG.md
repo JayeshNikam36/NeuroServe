@@ -31,6 +31,13 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- Mixed steps (`mixed_steps`, on by default): a step's prefills and decode go to the backend in
+  one `InferenceBackend::mixed_step()` call; the CUDA backend runs them as one forward pass over
+  the prefill tokens and decode rows, attention dispatched per segment (varlen tiled kernel for
+  prefill segments, a row-per-sequence kernel for decode rows). Outputs equal Hugging Face with
+  prefills and decodes mixed. `EngineLoopStats::mixed_steps`, `CudaLlmEngineBackend::mixed_passes()`;
+  `neuroserve.bench.step_profile --no-mixed-steps`. Next to 480-token prompts: TTFT P50 560 -> 73 ms,
+  step P99 150 -> 57 ms.
 - Chunked prefill (`prefill_chunk_tokens`, off by default): a prompt is prefilled at most that
   many tokens per step, each chunk resumed from the sequence's cached offset and packed with the
   step's other prefills, while the other requests keep decoding; prompts may be longer than the

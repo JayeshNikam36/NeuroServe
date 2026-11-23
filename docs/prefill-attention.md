@@ -301,6 +301,64 @@ Measured with the step profile (RTX 4050 Laptop GPU; full report
   cost; mixed steps that decode inside the prefill's pass (one forward pass for both) are what
   would cut that cost.
 
+## Mixed steps (Day 53)
+
+A step that prefills (new prompts, or the next chunks of long ones) while other requests decode
+now runs as **one forward pass**: the weights are read once for the prefill tokens and the decode
+tokens together, instead of once by `prefill_batch` and again by `decode_step`.
+
+- **The engine** plans the step's prefill items and its decode batch, then makes one
+  `InferenceBackend::mixed_step(items, decode)` call (`EngineLoopOptions::mixed_steps`, on by
+  default; server `engine.mixed_steps`; `Engine(mixed_steps=...)`). Each prefill item and the
+  decode still succeed or fail on their own: a failed decode fails only the decoding requests, as
+  before. The default `mixed_step` makes the two calls, so any backend works unchanged; one whose
+  `supports_mixed_steps()` is true runs them together. `stats()["mixed_steps"]` counts them.
+- **The CUDA backend** checks the decode first (changing nothing), admits the prefill items and
+  gives the decode its pages, then packs the items that fit with the decode rows after them
+  (`backend_detail::model_mixed_batch`; at most 512 rows and `max_batch` sequences in all). The
+  embedding, every projection, RoPE and the MLP run once on all rows; each row's K/V go to its own
+  pages; **attention is dispatched per segment**: the prefill segments through the varlen tiled
+  kernel (64 x 32), the decode rows through a row-per-sequence kernel (one block per head and row,
+  the decode attention's math); the head runs once on every sequence's last row. Items that do not
+  fit the pass are prefilled alone before it. If the prefills take the pages the decode needed, the
+  decode fails with `KvCacheExhausted` (as a decode after them would have) and the prefills stand.
+  `mixed_passes()` counts the steps run as one pass.
+
+Tested: the engine on the fake backend (`tests/unit/test_engine_mixed_steps.cpp`: a long prompt's
+chunks and a running request's decode in one call per step; the same outputs, prefill sizes and
+tokens as with two calls; a failed decode fails only the decode batch; 24 requests of mixed
+lengths match the two-call run); the backend's packing on the stand-in engine (prefills and
+decodes in one pass, equal to prefill then decode, a failed decode check still prefills, a
+sequence in both is refused, pages taken by the prefills fail only the decode, what does not fit
+is prefilled first); and on the GPU: the 8 Hugging Face references, four decoding while the other
+four are prefilled 4 tokens per step, both ways round, with caching off and on (32 sequences), and
+the instruct references (512-token system prompt), half decoding while half are prefilled 128
+tokens per step, all equal to Hugging Face token for token. Every existing suite, the Python API
+tests and the release check now run with mixed steps on. 309/309 tests pass.
+
+Measured with the step profile (RTX 4050 Laptop GPU, chunking off, step budget 512; full report
+[benchmarks/results/day53-mixed-steps.md](../benchmarks/results/day53-mixed-steps.md)):
+
+| Scenario | | two passes | mixed steps |
+| --- | --- | --- | --- |
+| `interference`: 48 requests at 3/s, 1 in 4 with a 480-token prompt | TTFT P50 / P99 | 560 / 1,507 ms | **73 / 834 ms** |
+| | step P99 | 150.0 ms | **57.2 ms** |
+| | time between tokens P50 / P99 | 19.1 / 20.4 ms | 17.4 / 17.8 ms |
+| `mixed`: the mixed profile at 2 requests/s | TTFT P50 / P99 | 71.6 / 1,015 ms | **54.3 / 824 ms** |
+| | step P99 | 42.1 ms | 29.1 ms |
+| | time between tokens P50 / P99 | 17.6 / 22.7 ms | 16.7 / 18.2 ms |
+
+- **Better on every latency figure,** and more than reading the weights once can explain. Most of
+  the gain on long prompts is the attention kernel: a prompt prefilled alone (a pack of one, Day
+  51) still took the engine's own prefill path with its per-query attention, about 150 ms at 480
+  tokens; in a mixed step the same prompt goes through the varlen tiled kernel (Day 49). The
+  weights read once for prefill and decode is the rest, the part that moves `mixed`, whose prompts
+  are short.
+- **Unlike chunking, nothing is traded:** TTFT falls instead of rising, and the step tail falls
+  almost as far (150 -> 57 ms here, 69 ms with 128-token chunks on Day 52).
+- **Follow-up:** a prompt prefilled alone with no decode running still takes the old path; sending
+  a pack of one through `model_mixed_batch` too would give it the tiled kernel.
+
 ## The model it serves
 
 Llama 3.2 1B, FP16:
@@ -494,6 +552,7 @@ Hugging Face, prefix hits, copy-on-write, resumption) unchanged, and the step pr
 | 49 | Tiled kernel: Q tile in shared memory, streamed K/V tiles, online softmax, `mma.sync`, 128-bit loads; the tile sweep | matches v0 within the tolerance at every tested length; faster than v0 and than today's kernel, measured |
 | 51 | The engine prefills all admitted prompts in one batched pass using it | step profile and outputs |
 | 52 | Chunked prefill: long prompts split by the step budget, resumed from the cached offset each step, packed with other prefills and sharing steps with decodes | outputs equal for chunk sizes 64, 128, 256, 512 |
+| 53 | Mixed steps: the step's prefill chunks and decode tokens in one forward pass, attention dispatched per segment | every correctness suite passes with mixed steps on |
 
 ## Out of scope
 

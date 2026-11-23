@@ -159,6 +159,10 @@ struct EngineLoopOptions {
     // decoding. 0 = a prompt is prefilled in one step. Needs a backend that supports it
     // (InferenceBackend::supports_chunked_prefill); otherwise prompts are prefilled whole.
     int prefill_chunk_tokens = 0;
+    // Mixed steps (Day 53): a step's prefills and decodes go to the backend in one call
+    // (InferenceBackend::mixed_step), which a backend that supports it runs as one forward pass.
+    // false = two calls, prefill then decode.
+    bool mixed_steps = true;
     KvAdmission admission = KvAdmission::kOnDemand;  // how much KV memory a request needs to start (kv_memory.hpp)
     std::string policy = "fcfs";   // scheduling policy by name (see make_policy)
     PolicyOptions policy_options{};  // settings for the policy named in `policy`
@@ -194,6 +198,7 @@ struct EngineLoopStats {
     std::uint64_t cancelled = 0;
     std::uint64_t preemptions = 0;  // times a running request was preempted (it resumes from its tokens)
     std::uint64_t decode_steps = 0;
+    std::uint64_t mixed_steps = 0;  // steps whose prefills and decode went to the backend in one mixed pass
     std::uint64_t prefill_tokens = 0;  // prompt tokens processed (including restarts after preemption)
     std::uint64_t decode_tokens = 0;
     int max_step_tokens = 0;           // most tokens any single step processed
@@ -283,10 +288,17 @@ private:
     void expire_queued();  // queue_timeout_ms: reject requests that waited too long for admission
     void schedule_locked(int free_pages, std::vector<EntryPtr>& admitted, std::vector<EntryPtr>& preempted);
     void preempt(std::vector<EntryPtr> victims);
-    // Prefills the requests admitted in this step, together (InferenceBackend::prefill_batch);
-    // each that succeeds joins the decode batch, each that fails fails alone.
-    void start_all(std::vector<EntryPtr> admitted, std::vector<EntryPtr>& joining);
-    void decode_active();  // the running requests that are not prefilling and did not just join
+    // A step's backend work, in three parts: the prefills (the next chunk of every running request
+    // still prefilling, then the requests admitted in this step), the decode (the running requests
+    // that are not prefilling), and one backend call for both, or two (run_step). Finishing leaves
+    // null slots in active_, erased once both are done.
+    struct PrefillPlan;
+    struct DecodePlan;
+    PrefillPlan plan_prefill(std::vector<EntryPtr> admitted);
+    DecodePlan plan_decode();
+    void run_step(PrefillPlan& prefill, DecodePlan& decode);
+    void finish_prefill(PrefillPlan& prefill, std::vector<EntryPtr>& joining);  // each that fails fails alone
+    void finish_decode(DecodePlan& decode);  // a failed decode fails its whole batch
     // Chunked prefill: this step's chunk for every request still prefilling (Entry::next_chunk),
     // within the step's token budget. Returns the tokens they add beyond one per request.
     long long plan_chunks_locked();
@@ -340,6 +352,7 @@ private:
 
     std::vector<EntryPtr> active_;  // engine thread only; in admission order (prefilling ones too)
     int chunk_tokens_ = 0;          // options_.prefill_chunk_tokens if the backend supports it, else 0
+    bool mixed_ = false;            // options_.mixed_steps and the backend supports them
 
     // Step profile. Guarded by mu_, except the two backend-call timers, which the engine thread
     // alone uses within one step.

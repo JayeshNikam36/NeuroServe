@@ -26,7 +26,8 @@ add_executable(ns_unit_tests
     unit/test_kv_memory.cpp
     unit/test_step_profile.cpp
     unit/test_engine_prefill_batch.cpp
-    unit/test_engine_chunked_prefill.cpp)
+    unit/test_engine_chunked_prefill.cpp
+    unit/test_engine_mixed_steps.cpp)
 target_include_directories(ns_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
 # Golden scheduler traces live in tests/data; NS_UPDATE_GOLDEN=1 rewrites their expected sections.
 target_compile_definitions(ns_unit_tests PRIVATE NS_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
