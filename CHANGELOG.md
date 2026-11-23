@@ -31,6 +31,11 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- CUDA Graphs for decode (`CudaLlmEngineConfig::cuda_graphs`, off until the Day 57 A/B): a
+  decode-only step of up to 16 sequences replays a graph captured per (batch bucket 1/2/4/8/16,
+  split count) on first use; padding rows write only to a reserved pad page. Replays equal eager
+  execution token for token for every bucket and split count, and Hugging Face.
+  `set_decode_path()`, `cuda_graphs_captured()`, `cuda_graph_replays()`.
 - Design: CUDA Graphs for decode (docs/cuda-graphs.md): the capture blockers in today's decode
   step (synchronous pageable copies, the legacy default stream, no cuBLAS workspace, the host-side
   split choice), graphs per (bucket, splits) for buckets 1/2/4/8/16, a reserved pad page for

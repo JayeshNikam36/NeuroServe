@@ -23,6 +23,10 @@ struct CudaLlmEngineConfig {
     // same prefix, and prefill starts at the first uncached token. Off by default until the
     // shared-prefix end-to-end test (Day 36) turns it on for the server.
     bool prefix_caching = false;
+    // CUDA Graphs for decode (docs/cuda-graphs.md): a decode-only step of up to 16 sequences replays
+    // a graph captured for its batch bucket (1, 2, 4, 8, 16) and split count. Off by default until
+    // the Day 57 A/B.
+    bool cuda_graphs = false;
 };
 
 // InferenceBackend implemented on top of cuda-llm-engine (paged KV cache, split-KV decode attention).
@@ -84,7 +88,17 @@ public:
     // sequences they prefilled. For tests and metrics.
     std::uint64_t batched_prefills() const noexcept;
     std::uint64_t batched_prefill_sequences() const noexcept;
-    std::uint64_t mixed_passes() const noexcept;  // mixed steps run as one forward pass (Day 53)
+    std::uint64_t mixed_passes() const noexcept;
+
+    // How a decode step runs (docs/cuda-graphs.md). kEager: the engine's batched decode. kGraph:
+    // a step of at most 16 sequences replays a captured graph (captured on its first use).
+    // kGraphEager: the graph's work without the graph (same padding, buffers and stream), to compare
+    // a replay with bit for bit. Switching is allowed at any time.
+    enum class DecodePath { kEager, kGraphEager, kGraph };
+    void set_decode_path(DecodePath path);
+    DecodePath decode_path() const noexcept;
+    int cuda_graphs_captured() const noexcept;        // (bucket, splits) graphs instantiated so far
+    std::uint64_t cuda_graph_replays() const noexcept;  // mixed steps run as one forward pass (Day 53)
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp
