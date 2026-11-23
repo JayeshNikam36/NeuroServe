@@ -42,6 +42,10 @@ class RequestResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     server: dict[str, Any] = field(default_factory=dict)  # the neuroserve block (server-side timings)
+    # client-side: the gap before each streamed text chunk after the first (Day 54). Not one per
+    # token: a token can stream no text of its own (the detokenizer holds a partial character), so a
+    # gap can span many tokens. The engine's per-token gaps are in the server's latency histogram.
+    token_gaps_ms: list[float] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -57,6 +61,7 @@ def _text_of(chunk: dict[str, Any]) -> str:
 
 async def _send(client: httpx.AsyncClient, planned: PlannedRequest, result: RequestResult, t0: float) -> None:
     start = time.monotonic()
+    last_text = start
     result.sent_at_s = round(start - t0, 6)
     try:
         async with client.stream("POST", planned.endpoint, json=planned.body) as resp:
@@ -76,8 +81,13 @@ async def _send(client: httpx.AsyncClient, planned: PlannedRequest, result: Requ
                 if "error" in chunk:
                     result.error = chunk["error"].get("code") or "stream_error"
                     return
-                if result.ttft_ms is None and _text_of(chunk):
-                    result.ttft_ms = (time.monotonic() - start) * 1000.0
+                if _text_of(chunk):
+                    now = time.monotonic()
+                    if result.ttft_ms is None:
+                        result.ttft_ms = (now - start) * 1000.0
+                    else:
+                        result.token_gaps_ms.append(round((now - last_text) * 1000.0, 3))
+                    last_text = now
                 if chunk.get("usage"):
                     result.prompt_tokens = chunk["usage"]["prompt_tokens"]
                     result.completion_tokens = chunk["usage"]["completion_tokens"]

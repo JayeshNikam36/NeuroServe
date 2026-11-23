@@ -57,6 +57,12 @@ PROFILES: dict[str, Profile] = {
         rate_rps=2.0, num_requests=120, kind="tokens",
         prompt_tokens=((32, 0.5), (128, 0.3), (480, 0.2)),
         output_tokens=((32, 0.4), (128, 0.4), (384, 0.2))),
+    # Chunked prefill (Day 54): short chats decoding while long prompts keep arriving.
+    "long_prompt": Profile(
+        name="long_prompt",
+        description="synthetic prompts, 7 in 10 of 32 tokens and 3 in 10 of 480, 128 output tokens each, 3 requests/s",
+        rate_rps=3.0, num_requests=64, kind="tokens",
+        prompt_tokens=((32, 0.7), (480, 0.3)), output_tokens=((128, 1.0),)),
     # Prefix caching (Day 43). Prefix lengths are whole 16-token pages, so a hit reuses all of them.
     "shared_prefix": Profile(
         name="shared_prefix",
