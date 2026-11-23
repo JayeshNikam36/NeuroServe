@@ -359,6 +359,44 @@ Measured with the step profile (RTX 4050 Laptop GPU, chunking off, step budget 5
 - **Follow-up:** a prompt prefilled alone with no decode running still takes the old path; sending
   a pack of one through `model_mixed_batch` too would give it the tiled kernel.
 
+## Chunked prefill, benchmarked (Day 54)
+
+`neuroserve.bench.chunked_ab` runs chunked prefill against unchunked (both with mixed steps): a
+fresh server per run, the same seeded schedule for both variants within a round, the order
+balanced across rounds, one warm-up round discarded, 4 measured. The time between tokens is the
+engine's, per token (its latency histogram) and per request (its longest gap). TTFT is split by
+prompt length. Two profiles: `long_prompt` (64 requests at 3/s, 7 in 10 with 32-token prompts and
+3 in 10 with 480, 128 output tokens each; at about the GPU's capacity: it offers 384 output
+tokens/s, the server delivers about 365) and `mixed` (32/128/480-token prompts, 2 requests/s). Chunked =
+128-token chunks and a 256-token step budget. Full report:
+[benchmarks/results/day54-chunked-ab.md](../benchmarks/results/day54-chunked-ab.md).
+
+| Paired change, chunked vs unchunked (rounds better, of 4) | `long_prompt` | `mixed` |
+| --- | --- | --- |
+| time between tokens P99 | 54.5 -> 31.1 ms, **-43% (4/4)** | 30.8 -> 30.1 ms, -2% (3/4) |
+| each request's longest gap, P99 | 65.9 -> 42.8 ms, **-39% (4/4)** | 69.9 -> 99.3 ms, **+44% (1/4)** |
+| TTFT of long prompts, P50 | 424 -> 494 ms, **+41% (0/4)** | 84 -> 143 ms, **+65% (0/4)** |
+| TTFT of short prompts, P50 | -1.4% (3/4) | +0.2% (2/4) |
+| output tokens/s | -0.4% | 0.0% |
+
+- **Where long prompts keep arriving among streaming chats** (`long_prompt`), chunking almost
+  halves the tail of the time between tokens in every round: a 480-token prefill no longer shares
+  one step with every running decode. Long prompts pay about 40% more time to first token (four
+  steps instead of one); short prompts and throughput are unchanged.
+- **In `mixed` it buys nothing and its worst gaps grow.** Mixed steps already keep its tail low
+  (an unchunked 480-token prefill plus the decodes is one ~60 ms pass), and the longest gap per
+  request rose from about 70 to 99 ms. Not from long steps: a step profile of the chunked `mixed`
+  run (3,747 steps) has none over 53 ms, and its slowest are lone chunks with no decode waiting,
+  which still take the single-sequence path (Day 53's follow-up). Open question; a lead is
+  decode-only steps with 18-20 ms of host time among the slowest.
+- **So chunking stays off by default.** It is the setting for streaming-heavy traffic with long
+  prompts near capacity, traded against long prompts' TTFT.
+- **The client cannot measure this:** a first version took the time between tokens from the gaps
+  between streamed text chunks, and found 2-7 s "stalls" in both variants. They were requests whose
+  random-token outputs streamed 128 or 384 tokens as 2-5 text chunks (the detokenizer holds back
+  partial characters), while the engine's longest gap for the same requests was 21-69 ms. The
+  report keeps the client's text gaps as a labelled reference column only.
+
 ## The model it serves
 
 Llama 3.2 1B, FP16:
@@ -553,6 +591,7 @@ Hugging Face, prefix hits, copy-on-write, resumption) unchanged, and the step pr
 | 51 | The engine prefills all admitted prompts in one batched pass using it | step profile and outputs |
 | 52 | Chunked prefill: long prompts split by the step budget, resumed from the cached offset each step, packed with other prefills and sharing steps with decodes | outputs equal for chunk sizes 64, 128, 256, 512 |
 | 53 | Mixed steps: the step's prefill chunks and decode tokens in one forward pass, attention dispatched per segment | every correctness suite passes with mixed steps on |
+| 54 | Benchmark chunked prefill: P99 ITL and TTFT with long prompts arriving, chunked against unchunked, order-balanced | `neuroserve.bench.chunked_ab` on `long_prompt` and `mixed` |
 
 ## Out of scope
 
