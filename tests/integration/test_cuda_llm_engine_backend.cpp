@@ -415,6 +415,71 @@ TEST_F(CudaLlmEngineBackendTest, MixedStepsMatchHuggingFace) {
     expect_no_leaked_pages();
 }
 
+TEST_F(CudaLlmEngineBackendTest, GraphReplayMatchesEagerForEveryBucket) {
+    // CUDA Graphs for decode (Day 56, docs/cuda-graphs.md). For 1 to 8 sequences (buckets 1, 2, 4,
+    // 8; 3, 5, 6, 7 padded), 130 decode steps replayed from graphs must equal the same work run
+    // eagerly (same padding, buffers and stream), token for token; the lengths reach 140 tokens, so
+    // every split count of every bucket is used. The first tokens must also equal Hugging Face.
+    using Path = CudaLlmEngineBackend::DecodePath;
+    constexpr std::size_t kSteps = 130;
+    int same_as_engine = 0;
+    for (int n = 1; n <= kNumPrompts; ++n) {
+        std::vector<std::vector<TokenId>> prompts;
+        for (int i = 0; i < n; ++i) {
+            prompts.push_back(refs_[static_cast<std::size_t>(i)].prompt);
+        }
+        backend_->set_decode_path(Path::kGraphEager);
+        const auto eager = batched_greedy(*backend_, prompts, 8, kSteps);
+        backend_->set_decode_path(Path::kGraph);
+        const std::uint64_t replays_before = backend_->cuda_graph_replays();
+        const auto graph = batched_greedy(*backend_, prompts, 8, kSteps);
+        EXPECT_GT(backend_->cuda_graph_replays(), replays_before) << n << " sequences: no step was replayed";
+        backend_->set_decode_path(Path::kEager);
+        const auto engine = batched_greedy(*backend_, prompts, 8, kSteps);
+        for (int i = 0; i < n; ++i) {
+            const auto& g = graph[static_cast<std::size_t>(i)];
+            EXPECT_EQ(g, eager[static_cast<std::size_t>(i)]) << n << " sequences, sequence " << i << ": replay != eager";
+            const auto& want = refs_[static_cast<std::size_t>(i)].greedy;
+            EXPECT_EQ(std::vector<TokenId>(g.begin(), g.begin() + static_cast<long>(want.size())), want)
+                << n << " sequences, sequence " << i << ": not Hugging Face's";
+            same_as_engine += g == engine[static_cast<std::size_t>(i)];
+        }
+    }
+    std::printf("cuda graphs: %d graphs, %llu replays; %d/36 sequences equal the engine's unpadded decode over %zu steps\n",
+                backend_->cuda_graphs_captured(), static_cast<unsigned long long>(backend_->cuda_graph_replays()),
+                same_as_engine, kSteps);
+    backend_->set_decode_path(Path::kEager);
+    expect_no_leaked_pages();
+}
+
+TEST_F(CudaLlmEngineBackendTest, GraphDecodeInterleavesWithMixedSteps) {
+    // Graph decode steps between mixed steps (Day 53) and prefills: the mixed-step test's schedule
+    // with graphs on must still equal Hugging Face, with caching off and on.
+    std::vector<std::vector<TokenId>> prompts;
+    std::vector<std::size_t> n_new;
+    for (const auto& r : refs_) {
+        prompts.push_back(r.prompt);
+        n_new.push_back(r.greedy.size());
+    }
+    backend_->set_decode_path(CudaLlmEngineBackend::DecodePath::kGraph);
+    const std::uint64_t replays_before = backend_->cuda_graph_replays();
+    for (const bool caching : {false, true}) {
+        backend_->set_prefix_caching(caching);
+        int mixed = 0;
+        const auto out = mixed_greedy(*backend_, prompts, 4, 4, n_new, mixed);
+        EXPECT_GT(mixed, 0);
+        for (int i = 0; i < kNumPrompts; ++i) {
+            EXPECT_EQ(out[static_cast<std::size_t>(i)], refs_[static_cast<std::size_t>(i)].greedy)
+                << "prompt " << i << (caching ? ", caching on" : ", caching off");
+        }
+        backend_->check_kv_invariants();
+    }
+    backend_->set_prefix_caching(false);
+    EXPECT_GT(backend_->cuda_graph_replays(), replays_before) << "no decode step was replayed";
+    backend_->set_decode_path(CudaLlmEngineBackend::DecodePath::kEager);
+    expect_no_leaked_pages();
+}
+
 TEST_F(CudaLlmEngineBackendTest, RejectsBadRequestsWithoutSideEffects) {
     const int free_before = backend_->kv_stats().free_pages;
     const std::vector<TokenId>& good = refs_[0].prompt;

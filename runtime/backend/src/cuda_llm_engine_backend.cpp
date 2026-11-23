@@ -19,6 +19,7 @@
 #include "neuroserve/core/kv_memory.hpp"
 #include "neuroserve/core/kv_prefix_hash.hpp"
 #include "neuroserve/cuda/device_info.hpp"
+#include "decode_graph.cuh"
 #include "prefill_from_offset.cuh"
 
 namespace neuroserve {
@@ -95,6 +96,10 @@ struct CudaLlmEngineBackend::Impl {
     backend_detail::PrefillBatchScratch prefill_scratch{};  // batched prefill (Day 51)
     bool prefill_scratch_allocated = false;
     std::uint64_t mixed_passes = 0;  // mixed steps run as one forward pass (Day 53)
+    // CUDA Graphs for decode (Day 56), made on first use. The KV pool has one page more than the
+    // manager knows of: the pad page padding rows write to.
+    std::optional<backend_detail::DecodeGraphs> graphs;
+    CudaLlmEngineBackend::DecodePath decode_path = CudaLlmEngineBackend::DecodePath::kEager;
     std::uint64_t batched_prefills = 0;
     std::uint64_t batched_prefill_sequences = 0;
 
@@ -107,6 +112,7 @@ struct CudaLlmEngineBackend::Impl {
                 ::free_sequence(*cache, entry.second);
             }
         }
+        graphs.reset();  // before the model and the cache it points into
         sequences.clear();
         tokens.clear();
         kv.reset();
@@ -428,6 +434,21 @@ struct CudaLlmEngineBackend::Impl {
         return std::vector<int>(next.begin() + static_cast<long>(pack.size()), next.end());
     }
 
+    // One greedy decode step of prefilled sequences whose pages cover the new token, by decode_path.
+    void run_decode(std::vector<::Sequence*>& seqs, std::span<const TokenId> toks, std::vector<int>& next) {
+        const std::vector<int> ids(toks.begin(), toks.end());
+        if (decode_path != CudaLlmEngineBackend::DecodePath::kEager) {
+            if (!graphs) {
+                graphs.emplace(model, *cache, config.max_batch, config.max_pages_per_sequence, config.num_pages);
+            }
+            if (static_cast<int>(seqs.size()) <= graphs->max_bucket()) {
+                graphs->step(seqs, ids, next, decode_path == CudaLlmEngineBackend::DecodePath::kGraph);
+                return;
+            }
+        }
+        model_decode_batch_greedy(model, *cache, batch, seqs, ids, next);
+    }
+
     // prefill()'s computation for one admitted sequence, in chunks of at most prefill_chunk tokens
     // (the scratch holds max_prompt_tokens): a client's prompt is one chunk; a resumed request's
     // prompt + generated tokens can be several (Day 38).
@@ -471,7 +492,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
 
     const Model shape{};  // engine defaults describe Llama-3.2-1B
     const std::size_t weights_bytes = fs::file_size(fs::path(config.model_dir) / "weights.bin");
-    const std::size_t kv_bytes = static_cast<std::size_t>(config.num_pages) *
+    const std::size_t kv_bytes = static_cast<std::size_t>(config.num_pages + 1) *  // + the pad page
                                  static_cast<std::size_t>(config.page_size_tokens) * kv_bytes_per_token(shape);
     const std::size_t needed = weights_bytes + kv_bytes + kVramHeadroomBytes;
     if (needed > init.info.free_mem_bytes) {
@@ -484,7 +505,8 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
 
     impl_->model = load_model(config.model_dir, config.max_prompt_tokens);
     impl_->model_loaded = true;
-    impl_->cache.emplace(alloc_paged_cache(impl_->model, config.num_pages, config.page_size_tokens));
+    // One page more than the manager's: the pad page of CUDA-Graph decode (page num_pages, never handed out).
+    impl_->cache.emplace(alloc_paged_cache(impl_->model, config.num_pages + 1, config.page_size_tokens));
     // KVCacheManager decides which block holds what. The engine's allocator is emptied, so a path
     // that still asked it for a block would stop the process loudly instead of handing out a block
     // the manager has already given to another sequence.
@@ -492,6 +514,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->kv.emplace(core::KvBlockConfig{config.num_pages, config.page_size_tokens, config.max_pages_per_sequence},
                       impl_->hasher->identity());  // the index is there; prefix_caching decides if it is used
     impl_->prefix_caching = config.prefix_caching;
+    impl_->decode_path = config.cuda_graphs ? DecodePath::kGraph : DecodePath::kEager;
     impl_->prefill_chunk = config.max_prompt_tokens;
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
@@ -642,8 +665,7 @@ void CudaLlmEngineBackend::mixed_step(std::span<PrefillItem> items, DecodeBatch&
     im.run_alone(alone);  // what does not fit the pass, before it
     std::vector<int> next;
     if (pack.empty()) {
-        const std::vector<int> toks(decode.tokens.begin(), decode.tokens.end());
-        model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
+        im.run_decode(seqs, decode.tokens, next);
     } else {
         std::vector<backend_detail::DecodeRow> rows_in;
         for (std::size_t i = 0; i < seqs.size(); ++i) {
@@ -664,6 +686,18 @@ std::uint64_t CudaLlmEngineBackend::batched_prefill_sequences() const noexcept {
 
 std::uint64_t CudaLlmEngineBackend::mixed_passes() const noexcept { return impl_->mixed_passes; }
 
+void CudaLlmEngineBackend::set_decode_path(DecodePath path) { impl_->decode_path = path; }
+
+CudaLlmEngineBackend::DecodePath CudaLlmEngineBackend::decode_path() const noexcept { return impl_->decode_path; }
+
+int CudaLlmEngineBackend::cuda_graphs_captured() const noexcept {
+    return impl_->graphs ? impl_->graphs->graphs() : 0;
+}
+
+std::uint64_t CudaLlmEngineBackend::cuda_graph_replays() const noexcept {
+    return impl_->graphs ? impl_->graphs->replays() : 0;
+}
+
 std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> ids,
                                                        std::span<const TokenId> tokens) {
     Impl& im = *impl_;
@@ -675,8 +709,7 @@ std::vector<TokenId> CudaLlmEngineBackend::decode_step(std::span<const SeqId> id
     }
     im.append_for_decode(ids, seqs);  // every check has passed
     std::vector<int> next;
-    const std::vector<int> toks(tokens.begin(), tokens.end());
-    model_decode_batch_greedy(im.model, *im.cache, im.batch, seqs, toks, next);
+    im.run_decode(seqs, tokens, next);
     im.finish_decode(ids, seqs, tokens);
     return std::vector<TokenId>(next.begin(), next.end());
 }

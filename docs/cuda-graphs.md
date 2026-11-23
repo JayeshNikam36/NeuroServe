@@ -1,6 +1,7 @@
-# CUDA Graphs for decode (design, Day 55)
+# CUDA Graphs for decode (design Day 55, capture and replay Day 56)
 
-Status: design. Capture and replay are Day 56, the A/B benchmark Day 57.
+Status: implemented behind `CudaLlmEngineConfig::cuda_graphs` (off), tested against eager
+execution and Hugging Face; the A/B benchmark that decides the default is Day 57.
 
 A decode step launches about 280 small kernels, one batch of new tokens through 16 layers. On
 the host, each launch costs a few microseconds. On the GPU, each dependent kernel waits for the
@@ -157,6 +158,43 @@ eager path remains for everything else and for comparison.
    bucket".
 4. **Interleaving.** Prefill, mixed and graph decode steps alternate (the engine loop on the
    GPU), with the KV invariants checked after every step.
+
+## Implementation (Day 56)
+
+`runtime/backend/src/decode_graph.cu`, `backend_detail::DecodeGraphs`, made on first use:
+
+- **Buckets** 1, 2, 4, 8, 16 up to the first that holds `max_batch`; a batch larger than the
+  largest bucket decodes eagerly. **Graphs per (bucket, splits)**, the split count chosen as the
+  eager path does (`choose_num_splits` on the real rows).
+- **Captured on first use, after an eager run of the same step.** The eager run is the step's
+  result and the capture's warm-up (every kernel loaded, cuBLAS's GEMMs chosen for these shapes);
+  the capture records without executing, and the pair is replayed from its next use on.
+- **The graph:** one memcpy node from the pinned input block (ids, positions, lengths, tables,
+  `max_bucket` rows each) to its device mirror; the embedding; 16 layers (a copy of the engine's
+  `layer_forward_batched` that passes the stream to every wrapper); the final norm and head;
+  argmax; one memcpy node of the next tokens back to pinned memory. A step: fill the staging,
+  `cudaGraphLaunch`, `cudaStreamSynchronize`, read the tokens.
+- **Its own cuBLAS handle,** with a 4 MiB workspace (`cublasSetWorkspace`) and the graph's stream,
+  so the eager and prefill paths keep the model's handle exactly as before. Capture mode
+  `cudaStreamCaptureModeThreadLocal`, on a blocking stream (ordered with the legacy default stream
+  the prefill path uses).
+- **The pad page** is page `num_pages` of the KV pool, which is allocated one page larger; the
+  manager never knows of it. Padding rows feed token 0 at position 0 with length 1 and a block
+  table of pad pages only.
+- **Switchable at any time:** `set_decode_path(kEager | kGraphEager | kGraph)`. `kGraphEager` runs
+  the graph's work without the graph (same padding, buffers, handle and stream): the reference a
+  replay must equal bit for bit. `cuda_graphs_captured()`, `cuda_graph_replays()` count.
+
+Tested on the GPU (`CudaLlmEngineBackendTest`): for 1 to 8 sequences (buckets 1, 2, 4, 8; 3, 5, 6,
+7 padded), 130 decode steps replayed equal the same steps run eagerly, token for token, and their
+first tokens equal Hugging Face; the lengths reach 140 tokens, so every split count of every
+bucket is replayed (the answer to "splits with no pages": graphs per (bucket, splits) never need
+one). The run captured **15 graphs** (8 + 4 + 2 + 1: every split count of buckets 1 to 8) and made
+**1,017 replays**; all **36/36** sequences also equal the engine's own unpadded decode over the
+130 steps, so on this GPU padding did not change cuBLAS's results either. 311/311 tests pass and
+the release check passed. And graph decode steps between mixed steps and prefills (the Day 53 schedule), caching off
+and on, equal Hugging Face. On the stand-in engine: every path decodes the same, a first use runs
+eagerly and is replayed after, the pad page is outside the manager's count.
 
 ## What to measure (Day 57)
 
