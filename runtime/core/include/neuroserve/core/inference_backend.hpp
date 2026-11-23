@@ -58,6 +58,8 @@ public:
 
 // One request of a batched prefill (InferenceBackend::prefill_batch): the backend sets `first`, or
 // `error` if this request could not be prefilled, in which case its sequence is unchanged.
+// `prompt` is the input up to the end of this prefill. With chunked prefill (Day 52) the sequence may
+// already hold a prefix of it (an earlier chunk): only the rest is computed, as prefill_more() does.
 struct PrefillItem {
     SeqId seq = 0;
     std::span<const TokenId> prompt;
@@ -93,13 +95,24 @@ public:
     virtual void prefill_batch(std::span<PrefillItem> items) {
         for (PrefillItem& item : items) {
             try {
-                item.first = prefill(item.seq, item.prompt);
+                item.first = sequence_length(item.seq) == 0 ? prefill(item.seq, item.prompt)
+                                                              : prefill_more(item.seq, item.prompt);
                 item.error = nullptr;
             } catch (...) {
                 item.error = std::current_exception();
             }
         }
     }
+
+    // Chunked prefill (Day 52): the sequence holds input[0 .. len) from an earlier prefill; computes
+    // the rest of `input`, attending to everything before it, and returns the next token. Throws
+    // like prefill(), plus std::logic_error if `input` does not extend what the sequence holds.
+    // Only backends whose supports_chunked_prefill() is true implement it.
+    virtual TokenId prefill_more(SeqId seq, std::span<const TokenId> input) {
+        (void)seq, (void)input;
+        throw std::logic_error("this backend cannot prefill in chunks");
+    }
+    virtual bool supports_chunked_prefill() const { return false; }
 
     // One decode step for several sequences: tokens[i] is appended to seqs[i].
     // Returns the next token for each sequence, in the same order.

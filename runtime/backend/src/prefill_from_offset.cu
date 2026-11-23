@@ -260,7 +260,9 @@ std::vector<int> model_prefill_batch(Model& m, PagedKVCache& c, const std::vecto
         const PrefillPart& p = parts[static_cast<size_t>(b)];
         const int total = static_cast<int>(p.ids->size());
         const int T = total - p.start;
-        if (p.seq->len != 0 || p.start < 0 || T <= 0 || static_cast<int>(p.seq->pages.size()) * c.page_size < total ||
+        // A new prefill (length 0, a cached prefix or none) or the next chunk of one (length = start).
+        if ((p.seq->len != 0 && p.seq->len != p.start) || p.start < 0 || T <= 0 ||
+            static_cast<int>(p.seq->pages.size()) * c.page_size < total ||
             static_cast<int>(p.seq->pages.size()) > s.max_pages) {
             throw std::logic_error("model_prefill_batch: sequence " + std::to_string(b) + " does not fit (" +
                                    std::to_string(total) + " tokens from " + std::to_string(p.start) + ", " +

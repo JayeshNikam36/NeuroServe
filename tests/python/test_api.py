@@ -41,6 +41,13 @@ def test_prompt_limit_must_fit_the_token_budget():
         make_config(max_prompt_tokens=600, max_batch_tokens=512)
 
 
+def test_with_chunked_prefill_a_prompt_may_be_longer_than_a_step():
+    config = make_config(max_prompt_tokens=600, max_batch_tokens=512, prefill_chunk_tokens=256)
+    assert config.engine.prefill_chunk_tokens == 256
+    with pytest.raises(ValueError):
+        make_config(prefill_chunk_tokens=-1)
+
+
 class FakeStream:
     """Like neuroserve.TokenStream: hands out the tokens one per read(), then the result.
 

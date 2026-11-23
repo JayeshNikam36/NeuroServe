@@ -211,6 +211,49 @@ struct CudaLlmEngineBackend::Impl {
         return cached;
     }
 
+    // prefill_more()'s checks: a partly prefilled sequence and an input that extends what it holds.
+    ::Sequence& checked_for_more(SeqId id, std::span<const TokenId> input) {
+        ::Sequence& seq = get(id);
+        const int n = static_cast<int>(input.size());
+        if (seq.len == 0 || n <= seq.len) {
+            throw std::logic_error("prefill_more: sequence " + std::to_string(id) + " holds " + std::to_string(seq.len) +
+                                   " tokens; the input must extend them (" + std::to_string(n) + " given)");
+        }
+        const int capacity = config.max_pages_per_sequence * config.page_size_tokens;
+        if (n > capacity) {
+            throw std::length_error("prefill_more: " + std::to_string(n) + " tokens, a sequence holds at most " +
+                                    std::to_string(capacity));
+        }
+        if (prefix_caching) {  // the tokens it holds are known: the input must start with them
+            const std::vector<TokenId>& held = tokens[id];
+            if (held.size() != static_cast<std::size_t>(seq.len) || !std::equal(held.begin(), held.end(), input.begin())) {
+                throw std::logic_error("prefill_more: the input does not extend sequence " + std::to_string(id) +
+                                       "'s tokens");
+            }
+        }
+        for (std::size_t i = static_cast<std::size_t>(seq.len); i < input.size(); ++i) {
+            check_token(input[i]);
+        }
+        return seq;
+    }
+
+    // The blocks for the new tokens of a partly prefilled sequence. Returns the tokens it already
+    // holds (the new part's start). Throws, changing nothing, if blocks run out.
+    int admit_more(SeqId id, ::Sequence& seq, std::span<const TokenId> input) {
+        const int extra = static_cast<int>(input.size()) - seq.len;
+        const int pages = kv->blocks_needed(id, extra);
+        if (pages > kv->free_blocks()) {
+            throw KvCacheExhausted("prefill_more: needs " + std::to_string(pages) + " KV pages, " +
+                                   std::to_string(kv->free_blocks()) + " free");
+        }
+        if (static_cast<int>(seq.pages.size()) + pages > config.max_pages_per_sequence) {
+            throw std::length_error("prefill_more: sequence " + std::to_string(id) + " would exceed its maximum length");
+        }
+        kv->append(id, extra);
+        sync_pages(id, seq);
+        return seq.len;
+    }
+
     // After the K/V are written: the engine and the manager agree, and the prompt's full pages are
     // indexed for later hits.
     void finish_prefill(SeqId id, const ::Sequence& seq, std::span<const TokenId> prompt) {
@@ -382,6 +425,13 @@ TokenId CudaLlmEngineBackend::prefill(SeqId id, std::span<const TokenId> prompt)
     return im.run_chunked(id, seq, prompt, cached);
 }
 
+TokenId CudaLlmEngineBackend::prefill_more(SeqId id, std::span<const TokenId> input) {
+    Impl& im = *impl_;
+    ::Sequence& seq = im.checked_for_more(id, input);
+    const int start = im.admit_more(id, seq, input);
+    return im.run_chunked(id, seq, input, start);
+}
+
 void CudaLlmEngineBackend::prefill_batch(std::span<PrefillItem> items) {
     Impl& im = *impl_;
     struct Admitted {
@@ -394,8 +444,13 @@ void CudaLlmEngineBackend::prefill_batch(std::span<PrefillItem> items) {
     for (PrefillItem& item : items) {
         item.error = nullptr;
         try {
-            ::Sequence& seq = im.checked_for_prefill(item.seq, item.prompt);
-            admitted.push_back({&item, &seq, im.admit(item.seq, seq, item.prompt)});
+            if (im.get(item.seq).len == 0) {  // a new prefill
+                ::Sequence& seq = im.checked_for_prefill(item.seq, item.prompt);
+                admitted.push_back({&item, &seq, im.admit(item.seq, seq, item.prompt)});
+            } else {  // the next chunk of one (chunked prefill)
+                ::Sequence& seq = im.checked_for_more(item.seq, item.prompt);
+                admitted.push_back({&item, &seq, im.admit_more(item.seq, seq, item.prompt)});
+            }
         } catch (...) {
             item.error = std::current_exception();
         }

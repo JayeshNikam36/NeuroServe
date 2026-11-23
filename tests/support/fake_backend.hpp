@@ -68,6 +68,38 @@ public:
         InferenceBackend::prefill_batch(items);
     }
 
+    bool supports_chunked_prefill() const override { return chunked_prefill; }
+
+    TokenId prefill_more(SeqId id, std::span<const TokenId> input) override {
+        if (on_prefill) {
+            on_prefill();
+        }
+        int& len = length(id);
+        const int n = static_cast<int>(input.size());
+        if (len == 0 || n <= len) {
+            throw std::logic_error("prefill_more: needs a partly prefilled sequence and more tokens");
+        }
+        const std::vector<TokenId>& held = tokens_[id];
+        if (!std::equal(held.begin(), held.end(), input.begin())) {
+            throw std::logic_error("prefill_more: the input does not extend the sequence's tokens");
+        }
+        const int extra = n - len;
+        const int pages = kv_.blocks_needed(id, extra);
+        if (pages > kv_.free_blocks()) {
+            throw KvCacheExhausted("prefill_more: needs " + std::to_string(pages) + " KV pages");
+        }
+        kv_.append(id, extra);
+        ++prefill_calls_;
+        prefilled_tokens_ += extra;
+        tokens_[id].assign(input.begin(), input.end());
+        if (prefix_caching) {
+            kv_.commit(id, tokens_[id]);
+        }
+        len = n;
+        prefill_sizes_.push_back(extra);
+        return next(input.back());
+    }
+
     TokenId prefill(SeqId id, std::span<const TokenId> prompt) override {
         if (on_prefill) {
             on_prefill();
@@ -217,6 +249,7 @@ public:
     // The size of every prefill_batch call, in order (written by the engine thread; read it once
     // the requests have finished).
     std::vector<std::size_t> prefill_batch_sizes;
+    bool chunked_prefill = true;  // supports_chunked_prefill(): turn off to test the fallback
 
     // When true, every successful decode_step's sequence ids are appended to decode_batches, and
     // the first token of every prefilled prompt to prefill_first_tokens (the admission order).

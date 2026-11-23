@@ -30,6 +30,9 @@ class EngineSection(_Strict):
     num_pages: int = Field(default=2048, ge=1)
     max_batch: int = Field(default=8, ge=1)
     max_batch_tokens: int = Field(default=512, ge=1)  # tokens one engine step may process (prefill + decode)
+    # Chunked prefill: a prompt is prefilled at most this many tokens per step, so long prompts
+    # share steps with decodes (0 = off: each prompt is prefilled in one step). See docs/prefill-attention.md.
+    prefill_chunk_tokens: int = Field(default=0, ge=0)
     max_pages_per_sequence: int = Field(default=64, ge=1)
     device_index: int = Field(default=0, ge=0)
     # which requests are admitted and preempted each step; see docs/scheduling.md
@@ -81,7 +84,8 @@ class ServerConfig(_Strict):
                 f"max_prompt_tokens ({self.engine.max_prompt_tokens}) + max_tokens_limit "
                 f"({self.limits.max_tokens_limit}) exceeds the per-sequence capacity of {per_sequence} tokens"
             )
-        if self.engine.max_prompt_tokens > self.engine.max_batch_tokens:
+        # With chunked prefill a prompt may be longer than a step: it is prefilled over several.
+        if self.engine.prefill_chunk_tokens == 0 and self.engine.max_prompt_tokens > self.engine.max_batch_tokens:
             raise ValueError(
                 f"max_prompt_tokens ({self.engine.max_prompt_tokens}) exceeds max_batch_tokens "
                 f"({self.engine.max_batch_tokens}): the longest prompt's prefill could never fit in a step"

@@ -41,6 +41,11 @@ SCENARIOS: dict[str, tuple[Profile, str]] = {
                         num_requests=32, kind="tokens", prompt_tokens=((480, 1.0),), output_tokens=((8, 1.0),)),
                 "mostly prefill: its cost per token"),
     "mixed": (PROFILES["mixed"], "the mixed profile at its own rate: a realistic step mix"),
+    # Day 52: short chats decoding while long prompts arrive; chunked prefill keeps their steps short.
+    "interference": (Profile("interference", "48 requests at 3/s, 3 in 4 with 32-token prompts and 1 in 4 with "
+                             "480, 128 output tokens each", rate_rps=3.0, num_requests=48, kind="tokens",
+                             prompt_tokens=((32, 0.75), (480, 0.25)), output_tokens=((128, 1.0),)),
+                     "decodes sharing steps with long prefills: the step-time tail and the time between tokens"),
 }
 WARMUP = prefix_ab.WARMUP
 PHASES = ("housekeeping_ms", "schedule_ms", "preempt_ms", "prefill_ms", "decode_ms", "host_ms", "invariants_ms")
@@ -128,13 +133,18 @@ def _on_off(v: bool | None) -> str:
     return "unknown (a running server)" if v is None else "on" if v else "off"
 
 
+def _chunk(v: int | None) -> str:
+    return "unknown" if v is None else "off" if v == 0 else f"{v} tokens per prompt per step"
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
     meta = summary["meta"]
     lines = ["# Engine step profile", "",
              f"- **When:** {meta['started_at']} ({meta['git_commit']})",
              f"- **GPU:** {meta['gpu']} · **model:** {meta['model']} · **config:** `{meta['config']}`; prefix "
              f"caching {_on_off(meta['prefix_caching'])}; invariant checks "
-             f"{_on_off(meta['check_invariants'])}",
+             f"{_on_off(meta['check_invariants'])}; step budget {_fmt(meta.get('max_batch_tokens'))} tokens, "
+             f"chunked prefill {_chunk(meta.get('prefill_chunk_tokens'))}",
              "- **Method:** the engine times every step's phases on its own thread (host clock). The backend's "
              "prefill and decode calls return tokens to the host, so their time includes the GPU work they "
              "launch and wait for; everything else in the step is host work. Idle = the engine thread waiting "
@@ -150,7 +160,17 @@ def render_markdown(summary: dict[str, Any]) -> str:
                      f"{sh['invariants_ms']:.1%} | {a['busy_steps']} | {_fmt(a['step_ms_p50'])} | "
                      f"{_fmt(a['step_ms_p99'])} |")
     lines += ["", "Shares are of the busy time (the sum of every step). Host (loop) = housekeeping, scheduling, "
-                  "preemption and the rest of the step outside the backend calls and the invariant checks.", ""]
+                  "preemption and the rest of the step outside the backend calls and the invariant checks.", "",
+              "## Latency", "",
+              "| Scenario | TTFT P50 (ms) | TTFT P99 (ms) | time between tokens P50 (ms) | P99 (ms) |",
+              "|" + " --- |" * 5]
+    for name, s in summary["scenarios"].items():
+        lat = s.get("latency") or {}
+        ttft, itl = lat.get("client_ttft_ms") or {}, lat.get("server_itl_ms") or {}
+        lines.append(f"| `{name}` | {_fmt(ttft.get('p50'))} | {_fmt(ttft.get('p99'))} | {_fmt(itl.get('p50'))} | "
+                     f"{_fmt(itl.get('p99'))} |")
+    lines += ["", "TTFT is client-side; the time between tokens is each request's mean, from the server, its P50 "
+                  "and P99 over requests.", ""]
     for name, s in summary["scenarios"].items():
         a, (profile, what) = s["analysis"], SCENARIOS[name]
         lines += [f"## `{name}`: {profile.description}", "", f"{what[0].upper() + what[1:]}.", ""]
@@ -200,9 +220,10 @@ def run_scenario(url: str, name: str, model: str, args: argparse.Namespace, out_
     (out_dir / f"trace-{name}.json").write_text(json.dumps(chrome_trace(prof.get("records", []), name)),
                                                 encoding="utf-8")
     gpu = sampler.result()
+    latency = loadgen.summarize(results, duration)
     return {"requests": len(results), "succeeded": sum(r.ok for r in results), "duration_s": round(duration, 3),
             "analysis": analyse(prof), "gpu": {k: v for k, v in gpu.items() if k != "samples"},
-            "totals": prof["totals"]}
+            "latency": {k: latency[k] for k in ("client_ttft_ms", "server_itl_ms")}, "totals": prof["totals"]}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--scenarios", default=",".join(SCENARIOS), help="comma-separated: " + ", ".join(SCENARIOS))
     parser.add_argument("--prefix-caching", action="store_true", help="start the server with prefix caching on")
+    parser.add_argument("--prefill-chunk-tokens", type=int, default=None,
+                        help="start the server with chunked prefill, at most this many tokens per prompt per step")
+    parser.add_argument("--max-batch-tokens", type=int, default=None, help="start the server with this step budget")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--startup-timeout-s", type=float, default=300.0)
@@ -227,15 +251,23 @@ def main(argv: list[str] | None = None) -> int:
     model = base_cfg.model.name
     args.out_dir.mkdir(parents=True, exist_ok=True)
     server = None
+    chunk_tokens: int | None = None  # the started server's settings (unknown for a running server)
+    step_budget: int | None = None
     url = args.url
     if url is None:
         cfg = prefix_ab.run_config(base, prefix_caching=args.prefix_caching, pool_fraction=1.0, burst=True,
                                    requests=max(p.num_requests for p, _ in SCENARIOS.values()), port=args.port)
+        for key in ("prefill_chunk_tokens", "max_batch_tokens"):
+            if getattr(args, key) is not None:
+                cfg["engine"][key] = getattr(args, key)
+        engine_cfg = ServerConfig.model_validate(cfg).engine  # raises if the combination is invalid
+        chunk_tokens, step_budget = engine_cfg.prefill_chunk_tokens, engine_cfg.max_batch_tokens
         server = prefix_ab.ServerProcess(cfg, args.out_dir, "profile")
     meta: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "git_commit": compare._git_commit(),
         "config": str(args.config), "model": model, "url": url, "seed": args.seed, "scenarios": scenarios,
         "prefix_caching": args.prefix_caching if server else None, "gpu": None,
+        "prefill_chunk_tokens": chunk_tokens, "max_batch_tokens": step_budget,
     }
     from .stress import invariant_checks
     meta["check_invariants"] = invariant_checks()
