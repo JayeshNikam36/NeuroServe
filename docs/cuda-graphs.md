@@ -1,7 +1,8 @@
 # CUDA Graphs for decode (design Day 55, capture and replay Day 56)
 
-Status: implemented behind `CudaLlmEngineConfig::cuda_graphs` (off), tested against eager
-execution and Hugging Face; the A/B benchmark that decides the default is Day 57.
+Status: implemented (Day 56), measured (Day 57), and on by default in the server and the
+Python `Engine` (`engine.cuda_graphs`, `Engine(cuda_graphs=...)`); `CudaLlmEngineConfig::cuda_graphs`
+stays off for C++ users of the backend, who choose.
 
 A decode step launches about 280 small kernels, one batch of new tokens through 16 layers. On
 the host, each launch costs a few microseconds. On the GPU, each dependent kernel waits for the
@@ -196,18 +197,41 @@ the release check passed. And graph decode steps between mixed steps and prefill
 and on, equal Hugging Face. On the stand-in engine: every path decodes the same, a first use runs
 eagerly and is replayed after, the pad page is outside the manager's count.
 
-## What to measure (Day 57)
+## Measured (Day 57)
 
-- **Decode step time, by batch size,** with and without graphs (the step profile's
-  `decode_by_batch`).
-- **Per-step host time,** with and without graphs.
-- **The cost of padding.** Each `n` against its bucket.
-- **The design:** an interleaved A/B, 5 rounds, round 1 discarded.
+`ns_decode_graph_bench` (benchmarks/decode_graph) times one `decode_step()` call through the three
+paths, for every batch size 1-8, each batch prefilled to 512 tokens: 8 warm-up steps (a graph's
+capture falls there), then 64 timed steps, P50; 5 interleaved rounds, the path order rotating, round
+1 discarded; RTX 4050 Laptop GPU at 2,640 MHz, never power- or thermally capped. Full report:
+[benchmarks/results/day57-cuda-graphs.md](../benchmarks/results/day57-cuda-graphs.md).
 
-Expected gain: up to the launch gaps the profile shows between kernels. About 280 launches at a
-few microseconds each is an estimate of 1 ms or less against a 16 ms batch-1 step, so single-digit
-percent. This is to be measured, not promised. On WSL2, Nsight Systems records no kernel data
-(Day 46), so the A/B is the measurement.
+| batch | eager (ms) | graph (ms) | graph vs eager | host time to issue the step: eager-issued / graph |
+| --- | --- | --- | --- | --- |
+| 1 | 15.12 | 14.77 | **-2.3% (4/4 rounds)** | 2.00 / 0.17 ms |
+| 2 | 15.62 | 14.88 | **-4.5% (4/4)** | 2.20 / 0.15 ms |
+| 4 | 15.95 | 15.21 | **-4.3% (4/4)** | 2.30 / 0.15 ms |
+| 8 | 16.40 | 15.73 | **-3.9% (4/4)** | 2.24 / 0.17 ms |
+| 3, 5, 6, 7 (padded) | 15.76-16.28 | 15.12-15.66 | -3.4% to -3.8% (4/4 each) | 2.19-2.33 / 0.17-0.19 ms |
+
+- **The graph is faster at every batch size, in every round** (32 of 32 paired comparisons): 0.35
+  to 0.74 ms per step, 2.3-4.5%. That is inside the design's estimate ("1 ms or less, single-digit
+  percent"): decode is bound by reading the weights, and what a graph removes is the gaps between
+  dependent kernels while their launches arrive.
+- **Issuing a step costs the host about 2.0-2.3 ms kernel by kernel, and 0.15-0.19 ms as one
+  `cudaGraphLaunch`**, about 13x less. Most of those 2 ms overlap the GPU's own work, which is why
+  the step gets 0.5 ms faster rather than 2: the host is freed for the engine loop's work, not the
+  GPU sped up by the full amount.
+- **The graph's work issued kernel by kernel is already 0.3-1.6% faster than the engine's eager
+  step:** one pinned copy in and one out instead of four synchronous copies in, an event wait and
+  a synchronous copy out. The graph adds 1.2-3.5% on top of that.
+- **Padding costs nothing measurable.** A padded batch is faster than its full bucket (3 rows at
+  15.12 ms against 4 at 15.21; 5 at 15.40 against 8 at 15.73: the padding rows attend to one key,
+  the real ones to 512) and faster than the engine's unpadded eager step at the same size. The
+  padding rows' GEMM rows are free in a weight-bound step.
+- **4 graphs** were captured (one per bucket: at 512 tokens every bucket has one split count) and
+  replayed 2,876 times.
+- **So graphs are on by default** in the server and the Python `Engine`, and the eager path stays for
+  prefill and mixed steps, batches over 16, and comparison (`set_decode_path`).
 
 Graphs will not touch the decode-only steps with 18-20 ms of host time that Day 54's step profile
 found. That time is outside the backend call, in the loop's own work. It stays a separate open

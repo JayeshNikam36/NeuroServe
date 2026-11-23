@@ -40,6 +40,16 @@ public:
     int graphs() const { return static_cast<int>(execs_.size()); }  // captured (bucket, splits) pairs
     std::uint64_t replays() const { return replays_; }
 
+    // Host time of the steps so far (Day 57), in milliseconds: writing the pinned inputs (stage),
+    // issuing the GPU work (issue: the ~280 launches eagerly, one cudaGraphLaunch from a graph),
+    // and waiting for it (wait). A first use's capture is not counted.
+    struct HostTimes {
+        double stage_ms = 0, issue_ms = 0, wait_ms = 0;
+        std::uint64_t steps = 0;
+    };
+    const HostTimes& host_times() const { return times_; }
+    void reset_host_times() { times_ = {}; }
+
 private:
     void enqueue(int bucket, int splits);   // the step's work on stream_, for `bucket` rows
     cudaGraphExec_t graph_for(int bucket, int splits);
@@ -63,6 +73,7 @@ private:
     __half* d_logits_ = nullptr;   // [max_bucket, vocab]
     std::map<int, cudaGraphExec_t> execs_;  // key: bucket * 64 + splits
     std::uint64_t replays_ = 0;
+    HostTimes times_;
 };
 
 }  // namespace neuroserve::backend_detail

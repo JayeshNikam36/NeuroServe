@@ -31,6 +31,13 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- `ns_decode_graph_bench` (benchmarks/decode_graph): decode step time through the eager,
+  graph-eager and graph paths for every batch size, interleaved over rounds, with host time per
+  step and the cost of padding. `cuda_graphs` in the server config and `Engine(cuda_graphs=...)`;
+  `stats()["cuda_graph_replays"]`; `neuroserve.bench.step_profile --no-cuda-graphs`. Measured:
+  the graph is 2.3-4.5% faster per decode step at every batch size 1-8 (4/4 rounds each), and
+  issuing a step costs the host 0.15-0.19 ms instead of 2.0-2.3 ms; padding costs nothing
+  measurable. **CUDA Graphs are on by default** in the server and the Python `Engine`.
 - CUDA Graphs for decode (`CudaLlmEngineConfig::cuda_graphs`, off until the Day 57 A/B): a
   decode-only step of up to 16 sequences replays a graph captured per (batch bucket 1/2/4/8/16,
   split count) on first use; padding rows write only to a reserved pad page. Replays equal eager
