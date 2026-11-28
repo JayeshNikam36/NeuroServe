@@ -49,6 +49,8 @@ class GenerationEngine(Protocol):
 
     def kv_stats(self) -> dict[str, Any]: ...
 
+    def memory(self) -> dict[str, Any]: ...
+
     def stats(self) -> dict[str, Any]: ...
 
     def latency(self) -> dict[str, Any]: ...
@@ -224,6 +226,30 @@ class EngineService:
             "admission": self._config.engine.kv_admission,
             "preemptions": stats["preemptions"],
             "policy": stats["policy"],
+            "gpu_memory": self.memory_summary(),
+        }
+
+    def memory_summary(self) -> dict[str, Any]:
+        """GPU memory by owner, in MiB (docs/gpu-memory.md, Day 58): each owner's bytes through the
+        pool and recorded from the engine, the pool, and the device's used memory beside them."""
+        m = self._engine.memory()
+
+        def mib(n: int) -> float:
+            return round(n / 1048576, 1)
+
+        return {
+            "owners": {name: {"mib": mib(u["bytes"]), "pool_mib": mib(u["pool_bytes"]),
+                              "external_mib": mib(u["external_bytes"]), "peak_mib": mib(u["peak_bytes"]),
+                              "allocations": u["allocations"]}
+                       for name, u in m["owners"].items()},
+            "items": [{"owner": i["owner"], "source": i["source"], "label": i["label"], "mib": mib(i["bytes"]),
+                       "allocations": i["allocations"]} for i in m["items"]],
+            "attributed_mib": mib(m["bytes"]),
+            "pool": {"supported": m["pool"]["supported"],
+                     "release_threshold_mib": mib(m["pool"]["release_threshold_bytes"]),
+                     "reserved_mib": mib(m["pool"]["reserved_bytes"]), "used_mib": mib(m["pool"]["used_bytes"])},
+            "device": {"total_mib": mib(m["device"]["total_bytes"]), "used_mib": mib(m["device"]["used_bytes"]),
+                       "unattributed_mib": mib(m["device"]["unattributed_bytes"])},
         }
 
     def decisions(self, since: int, limit: int) -> dict[str, Any]:

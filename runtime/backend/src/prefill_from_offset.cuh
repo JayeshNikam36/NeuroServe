@@ -7,6 +7,7 @@
 
 #include <vector>
 
+#include "neuroserve/backend/gpu_memory.hpp"
 #include "paged.h"
 
 namespace neuroserve::backend_detail {
@@ -60,8 +61,10 @@ struct PrefillBatchScratch {
     __half* d_logits = nullptr;  // [max_seqs, vocab]
 };
 
-PrefillBatchScratch alloc_prefill_batch_scratch(const Model& m, int max_seqs, int max_pages);
-void free_prefill_batch_scratch(PrefillBatchScratch& s);
+// Through the GPU memory manager (Day 58), as workspace.
+PrefillBatchScratch alloc_prefill_batch_scratch(const Model& m, int max_seqs, int max_pages,
+                                                neuroserve::GpuMemoryManager& memory);
+void free_prefill_batch_scratch(PrefillBatchScratch& s, neuroserve::GpuMemoryManager& memory);
 
 // Prefills several sequences in one forward pass: their new tokens are packed (at most m.max_T in
 // all), every projection and the MLP run once on the pack, each sequence's K/V go into its own

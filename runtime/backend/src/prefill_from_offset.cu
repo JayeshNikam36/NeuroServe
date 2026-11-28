@@ -260,27 +260,31 @@ void model_prefill_from(Model& m, PagedKVCache& c, Sequence& seq, const std::vec
     seq.len = total;
 }
 
-PrefillBatchScratch alloc_prefill_batch_scratch(const Model& m, int max_seqs, int max_pages) {
+PrefillBatchScratch alloc_prefill_batch_scratch(const Model& m, int max_seqs, int max_pages,
+                                                neuroserve::GpuMemoryManager& memory) {
     PrefillBatchScratch s;
     s.max_seqs = max_seqs;
     s.max_pages = max_pages;
     s.max_tiles = m.max_T / 64 + max_seqs;  // ceil(T_b / 64) summed over at most max_seqs sequences
-    CUDA_CHECK(cudaMalloc(&s.d_tables, sizeof(int) * static_cast<size_t>(max_seqs) * static_cast<size_t>(max_pages)));
-    CUDA_CHECK(cudaMalloc(&s.d_cu, sizeof(int) * static_cast<size_t>(max_seqs + 1)));
-    CUDA_CHECK(cudaMalloc(&s.d_start, sizeof(int) * static_cast<size_t>(max_seqs)));
-    CUDA_CHECK(cudaMalloc(&s.d_tile_map, sizeof(int) * 2 * static_cast<size_t>(s.max_tiles)));
+    const auto get = [&memory](size_t bytes) {
+        return memory.allocate(neuroserve::core::MemoryOwner::kWorkspace, bytes, "batched prefill scratch");
+    };
+    s.d_tables = static_cast<int*>(get(sizeof(int) * static_cast<size_t>(max_seqs) * static_cast<size_t>(max_pages)));
+    s.d_cu = static_cast<int*>(get(sizeof(int) * static_cast<size_t>(max_seqs + 1)));
+    s.d_start = static_cast<int*>(get(sizeof(int) * static_cast<size_t>(max_seqs)));
+    s.d_tile_map = static_cast<int*>(get(sizeof(int) * 2 * static_cast<size_t>(s.max_tiles)));
     const size_t rows = static_cast<size_t>(max_seqs) * static_cast<size_t>(m.cfg.hidden);
-    CUDA_CHECK(cudaMalloc(&s.d_last, sizeof(__half) * rows));
-    CUDA_CHECK(cudaMalloc(&s.d_last_norm, sizeof(__half) * rows));
-    CUDA_CHECK(cudaMalloc(&s.d_logits, sizeof(__half) * static_cast<size_t>(max_seqs) * static_cast<size_t>(m.vocab)));
+    s.d_last = static_cast<__half*>(get(sizeof(__half) * rows));
+    s.d_last_norm = static_cast<__half*>(get(sizeof(__half) * rows));
+    s.d_logits = static_cast<__half*>(get(sizeof(__half) * static_cast<size_t>(max_seqs) * static_cast<size_t>(m.vocab)));
     return s;
 }
 
-void free_prefill_batch_scratch(PrefillBatchScratch& s) {
+void free_prefill_batch_scratch(PrefillBatchScratch& s, neuroserve::GpuMemoryManager& memory) {
     for (void* p : {static_cast<void*>(s.d_tables), static_cast<void*>(s.d_cu), static_cast<void*>(s.d_start),
                     static_cast<void*>(s.d_tile_map), static_cast<void*>(s.d_last), static_cast<void*>(s.d_last_norm),
                     static_cast<void*>(s.d_logits)}) {
-        cudaFree(p);
+        memory.free(p);
     }
     s = PrefillBatchScratch{};
 }

@@ -70,8 +70,9 @@ int DecodeGraphs::bucket_for(const std::vector<int>& buckets, int n) {
     return 0;
 }
 
-DecodeGraphs::DecodeGraphs(Model& m, PagedKVCache& c, int max_batch, int max_pages, int pad_page)
-    : m_(m), c_(c), max_pages_(max_pages), pad_page_(pad_page) {
+DecodeGraphs::DecodeGraphs(Model& m, PagedKVCache& c, int max_batch, int max_pages, int pad_page,
+                           GpuMemoryManager& memory)
+    : m_(m), c_(c), memory_(memory), max_pages_(max_pages), pad_page_(pad_page) {
     for (const int b : kBuckets) {
         buckets_.push_back(b);
         if (b >= max_batch) {
@@ -88,19 +89,25 @@ DecodeGraphs::DecodeGraphs(Model& m, PagedKVCache& c, int max_batch, int max_pag
     if (cublasCreate(&handle_) != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error("DecodeGraphs: cublasCreate failed");
     }
-    CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWorkspaceBytes));
+    using core::MemoryOwner;
+    cublas_ws_ = memory_.allocate(MemoryOwner::kWorkspace, kCublasWorkspaceBytes, "cuBLAS workspace (CUDA Graph decode)");
     if (cublasSetWorkspace(handle_, cublas_ws_, kCublasWorkspaceBytes) != CUBLAS_STATUS_SUCCESS ||
         cublasSetStream(handle_, stream_) != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error("DecodeGraphs: cublasSetWorkspace / cublasSetStream failed");
     }
     const size_t in_ints = static_cast<size_t>(B) * static_cast<size_t>(3 + max_pages);
     CUDA_CHECK(cudaMallocHost(&h_in_, in_ints * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_in_, in_ints * sizeof(int)));
+    const auto get = [this](size_t bytes) {
+        return memory_.allocate(MemoryOwner::kWorkspace, bytes, "CUDA Graph decode buffers");
+    };
+    d_in_ = static_cast<int*>(get(in_ints * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&h_next_, static_cast<size_t>(B) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_next_, static_cast<size_t>(B) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_ws_, attention_decode_fast_workspace_floats(B, m.cfg.n_heads, kMaxSplits) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_normed_, static_cast<size_t>(B) * m.cfg.hidden * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_logits_, static_cast<size_t>(B) * m.vocab * sizeof(__half)));
+    d_next_ = static_cast<int*>(get(static_cast<size_t>(B) * sizeof(int)));
+    d_ws_ = static_cast<float*>(get(attention_decode_fast_workspace_floats(B, m.cfg.n_heads, kMaxSplits) * sizeof(float)));
+    d_normed_ = static_cast<__half*>(get(static_cast<size_t>(B) * m.cfg.hidden * sizeof(__half)));
+    d_logits_ = static_cast<__half*>(get(static_cast<size_t>(B) * m.vocab * sizeof(__half)));
+    // Allocated in the legacy stream's order: done before the graph's own stream first uses them.
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
 DecodeGraphs::~DecodeGraphs() {
@@ -108,16 +115,20 @@ DecodeGraphs::~DecodeGraphs() {
         cudaGraphExecDestroy(exec);
     }
     cudaFreeHost(h_in_);
-    cudaFree(d_in_);
     cudaFreeHost(h_next_);
-    cudaFree(d_next_);
-    cudaFree(d_ws_);
-    cudaFree(d_normed_);
-    cudaFree(d_logits_);
+    if (stream_ != nullptr) {
+        cudaStreamSynchronize(stream_);  // nothing of ours still running before its memory goes back
+    }
     if (handle_ != nullptr) {
         cublasDestroy(handle_);
     }
-    cudaFree(cublas_ws_);
+    for (void* p : {static_cast<void*>(d_in_), static_cast<void*>(d_next_), static_cast<void*>(d_ws_),
+                    static_cast<void*>(d_normed_), static_cast<void*>(d_logits_), cublas_ws_}) {
+        try {
+            memory_.free(p);  // nullptr is ignored
+        } catch (...) {       // a destructor: the manager returns anything left when it goes
+        }
+    }
     if (stream_ != nullptr) {
         cudaStreamDestroy(stream_);
     }

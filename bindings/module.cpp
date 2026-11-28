@@ -134,6 +134,52 @@ public:
         return out;
     }
 
+    // GPU memory by owner (Day 58, docs/gpu-memory.md). Bytes throughout.
+    py::dict memory() const {
+        const ns::GpuMemoryManager::Report r = backend_->memory_report();
+        py::dict owners;
+        for (std::size_t i = 0; i < core::kMemoryOwners; ++i) {
+            const auto& u = r.ledger.owners[i];
+            py::dict d;
+            d["bytes"] = u.bytes;
+            d["pool_bytes"] = u.pool_bytes;
+            d["external_bytes"] = u.external_bytes;
+            d["peak_bytes"] = u.peak_bytes;
+            d["allocations"] = u.allocations;
+            owners[py::str(std::string(core::to_string(static_cast<core::MemoryOwner>(i))))] = d;
+        }
+        py::list items;
+        for (const auto& item : r.ledger.items) {
+            py::dict d;
+            d["owner"] = std::string(core::to_string(item.owner));
+            d["source"] = item.source == core::MemorySource::kPool ? "pool" : "external";
+            d["label"] = item.label;
+            d["bytes"] = item.bytes;
+            d["allocations"] = item.allocations;
+            items.append(d);
+        }
+        py::dict pool;
+        pool["supported"] = r.pool.supported;
+        pool["release_threshold_bytes"] = r.pool.release_threshold_bytes;
+        pool["reserved_bytes"] = r.pool.reserved_bytes;
+        pool["used_bytes"] = r.pool.used_bytes;
+        pool["reserved_peak_bytes"] = r.pool.reserved_peak_bytes;
+        py::dict device;
+        device["total_bytes"] = r.device_total_bytes;
+        device["used_bytes"] = r.device_used_bytes;
+        device["unattributed_bytes"] = r.unattributed_bytes;
+        py::dict out;
+        out["owners"] = owners;
+        out["items"] = items;
+        out["bytes"] = r.ledger.bytes;
+        out["pool_bytes"] = r.ledger.pool_bytes;
+        out["external_bytes"] = r.ledger.external_bytes;
+        out["peak_bytes"] = r.ledger.peak_bytes;
+        out["pool"] = pool;
+        out["device"] = device;
+        return out;
+    }
+
     py::dict kv_stats() const {
         const ns::KvCacheStats s = loop_->kv_stats();  // the loop's snapshot: never touches the backend
         py::dict out;
@@ -400,6 +446,9 @@ PYBIND11_MODULE(_core, m) {
              "pages are freed, and its caller gets RequestCancelled. False if no unfinished request has this id.")
         .def("model_info", &Engine::model_info)
         .def("kv_stats", &Engine::kv_stats)
+        .def("memory", &Engine::memory,
+             "GPU memory by owner (weights, workspace, kv, other): bytes through the pool and recorded "
+             "from the engine, what each is made of, the pool and the device (docs/gpu-memory.md).")
         .def("stats", &Engine::stats, "Engine loop counters: queue, batch and request outcomes.")
         .def("decisions", &Engine::decisions, py::arg("since") = 0, py::arg("limit") = 100,
              "Why requests were admitted, deferred, rejected or preempted, with the numbers each decision was "
