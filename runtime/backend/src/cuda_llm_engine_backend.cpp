@@ -14,6 +14,7 @@
 #include <vector>
 
 // cuda-llm-engine (global namespace). Kept out of every public NeuroServe header.
+#include "attention_decode_fast.cuh"
 #include "batched.h"
 
 #include "neuroserve/core/kv_cache_manager.hpp"
@@ -56,6 +57,33 @@ std::size_t kv_bytes_per_token(const Model& m) {
            static_cast<std::size_t>(m.cfg.head_dim) * sizeof(__half);
 }
 
+// The weights load_model() puts on the GPU (engine/model.cu, load_layer_weights): FP16, the output
+// head tied to the embedding.
+std::size_t model_weight_bytes(const Model& m) {
+    const std::size_t H = static_cast<std::size_t>(m.cfg.hidden), I = static_cast<std::size_t>(m.cfg.inter);
+    const std::size_t q = static_cast<std::size_t>(m.cfg.n_heads) * static_cast<std::size_t>(m.cfg.head_dim);
+    const std::size_t kv = static_cast<std::size_t>(m.cfg.n_kv_heads) * static_cast<std::size_t>(m.cfg.head_dim);
+    const std::size_t per_layer = 2 * H + H * q + 2 * H * kv + q * H + 3 * H * I;  // norms, Q K V O, MLP
+    const std::size_t elements = static_cast<std::size_t>(m.vocab) * H + H + static_cast<std::size_t>(m.n_layers) * per_layer;
+    return elements * sizeof(__half);
+}
+
+// What alloc_batch_state() allocates (engine/batched.cu).
+std::size_t batch_state_bytes(const Model& m, int max_batch, int max_pages) {
+    const std::size_t b = static_cast<std::size_t>(max_batch);
+    return b * static_cast<std::size_t>(max_pages) * sizeof(int) + 2 * b * sizeof(int) +
+           attention_decode_fast_workspace_floats(max_batch, m.cfg.n_heads, 32) * sizeof(float) +
+           b * static_cast<std::size_t>(m.cfg.hidden) * sizeof(__half) + b * static_cast<std::size_t>(m.vocab) * sizeof(__half);
+}
+
+std::size_t device_free_bytes() {
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        return 0;
+    }
+    return free_bytes;
+}
+
 // The K/V identity: everything besides the tokens that decides the K/V values (docs/kv-cache.md).
 // cuda-llm-engine computes K/V in FP16 and hard-codes Llama 3's RoPE in load_model
 // (engine/model.cu: compute_rope_inv_freq(head_dim, 500000.0, 32.0, 1.0, 4.0, 8192.0)); the values
@@ -80,6 +108,9 @@ TokenId argmax_first(const std::vector<float>& logits) {
 }  // namespace
 
 struct CudaLlmEngineBackend::Impl {
+    // GPU memory manager (Day 58): made first, released last; everything below that allocates on
+    // the GPU through it, or is recorded in it.
+    std::optional<GpuMemoryManager> memory;
     CudaLlmEngineConfig config;
     ModelInfo info;
     Model model{};
@@ -99,7 +130,7 @@ struct CudaLlmEngineBackend::Impl {
     std::uint64_t mixed_passes = 0;  // mixed steps run as one forward pass (Day 53)
     // CUDA Graphs for decode (Day 56), made on first use. The KV pool has one page more than the
     // manager knows of: the pad page padding rows write to.
-    std::optional<backend_detail::DecodeGraphs> graphs;
+    std::optional<backend_detail::DecodeGraphs> graphs;  // its buffers come from `memory`
     std::atomic<int> graphs_captured{0};  // copies of graphs' counters, for readers on other threads
     std::atomic<std::uint64_t> graph_replays{0};
     CudaLlmEngineBackend::DecodePath decode_path = CudaLlmEngineBackend::DecodePath::kEager;
@@ -109,11 +140,8 @@ struct CudaLlmEngineBackend::Impl {
     ~Impl() { release(); }
 
     void release() noexcept {
-        if (cache) {
-            for (auto& entry : sequences) {
-                entry.second.pages.clear();  // the manager's blocks: never returned to the engine's allocator
-                ::free_sequence(*cache, entry.second);
-            }
+        for (auto& entry : sequences) {
+            free_block_table(entry.second);
         }
         graphs.reset();  // before the model and the cache it points into
         sequences.clear();
@@ -124,7 +152,7 @@ struct CudaLlmEngineBackend::Impl {
             batch_allocated = false;
         }
         if (prefill_scratch_allocated) {
-            backend_detail::free_prefill_batch_scratch(prefill_scratch);
+            backend_detail::free_prefill_batch_scratch(prefill_scratch, *memory);
             prefill_scratch_allocated = false;
         }
         if (cache) {
@@ -135,6 +163,28 @@ struct CudaLlmEngineBackend::Impl {
             free_model(model);
             model_loaded = false;
         }
+        memory.reset();
+    }
+
+    // A sequence as the engine's new_sequence() makes it (engine/paged.cu), its block table from the
+    // pool instead of a cudaMalloc per request; and freed likewise, instead of free_sequence()'s
+    // cudaFree (its pages are the KV manager's, never the engine allocator's).
+    ::Sequence make_sequence() {
+        ::Sequence s;
+        s.max_pages = config.max_pages_per_sequence;
+        s.d_table = static_cast<int*>(memory->allocate(core::MemoryOwner::kKv,
+                                                       static_cast<std::size_t>(s.max_pages) * sizeof(int),
+                                                       "block tables"));
+        return s;
+    }
+    void free_block_table(::Sequence& s) noexcept {
+        s.pages.clear();
+        s.len = 0;
+        try {
+            memory->free(s.d_table);
+        } catch (...) {  // only for a pointer the pool did not give: nothing to return
+        }
+        s.d_table = nullptr;
     }
 
     ::Sequence& get(SeqId id) {
@@ -442,7 +492,8 @@ struct CudaLlmEngineBackend::Impl {
         const std::vector<int> ids(toks.begin(), toks.end());
         if (decode_path != CudaLlmEngineBackend::DecodePath::kEager) {
             if (!graphs) {
-                graphs.emplace(model, *cache, config.max_batch, config.max_pages_per_sequence, config.num_pages);
+                graphs.emplace(model, *cache, config.max_batch, config.max_pages_per_sequence, config.num_pages,
+                               *memory);
             }
             if (static_cast<int>(seqs.size()) <= graphs->max_bucket()) {
                 graphs->step(seqs, ids, next, decode_path == CudaLlmEngineBackend::DecodePath::kGraph);
@@ -494,6 +545,7 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->hasher.emplace(kv_identity_for(config));  // reads about 4 MiB of the weights; may throw
 
     const cuda::InitResult init = cuda::initialize_device(config.device_index);
+    impl_->memory.emplace(config.device_index, config.memory_release_threshold_bytes);
 
     const Model shape{};  // engine defaults describe Llama-3.2-1B
     const std::size_t weights_bytes = fs::file_size(fs::path(config.model_dir) / "weights.bin");
@@ -508,10 +560,26 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
             std::to_string(init.info.free_mem_bytes / kMiB) + " MiB; lower num_pages");
     }
 
+    // The engine allocates inside these calls; what each takes is recorded with its owner
+    // (docs/gpu-memory.md). load_model: the weights (exact, from the shapes) and, measured, its
+    // activations, scratch and cuBLAS handle.
+    const std::size_t free_before_model = device_free_bytes();
     impl_->model = load_model(config.model_dir, config.max_prompt_tokens);
     impl_->model_loaded = true;
+    {
+        const std::size_t taken = free_before_model - std::min(free_before_model, device_free_bytes());
+        const std::size_t weights = model_weight_bytes(impl_->model);
+        using core::MemoryOwner;
+        impl_->memory->record_external(MemoryOwner::kWeights, weights, "model weights (cuda-llm-engine)");
+        impl_->memory->record_external(MemoryOwner::kWorkspace, taken > weights ? taken - weights : 0,
+                                       "model activations, scratch and cuBLAS (cuda-llm-engine, measured)");
+    }
     // One page more than the manager's: the pad page of CUDA-Graph decode (page num_pages, never handed out).
     impl_->cache.emplace(alloc_paged_cache(impl_->model, config.num_pages + 1, config.page_size_tokens));
+    impl_->memory->record_external(core::MemoryOwner::kKv,
+                                   static_cast<std::size_t>(config.num_pages + 1) *
+                                       static_cast<std::size_t>(config.page_size_tokens) * kv_bytes_per_token(impl_->model),
+                                   "KV pool, K and V of every layer (cuda-llm-engine)");
     // KVCacheManager decides which block holds what. The engine's allocator is emptied, so a path
     // that still asked it for a block would stop the process loudly instead of handing out a block
     // the manager has already given to another sequence.
@@ -523,8 +591,11 @@ CudaLlmEngineBackend::CudaLlmEngineBackend(const CudaLlmEngineConfig& config)
     impl_->prefill_chunk = config.max_prompt_tokens;
     impl_->batch = alloc_batch_state(impl_->model, config.max_batch, config.max_pages_per_sequence);
     impl_->batch_allocated = true;
-    impl_->prefill_scratch =
-        backend_detail::alloc_prefill_batch_scratch(impl_->model, config.max_batch, config.max_pages_per_sequence);
+    impl_->memory->record_external(core::MemoryOwner::kWorkspace,
+                                   batch_state_bytes(impl_->model, config.max_batch, config.max_pages_per_sequence),
+                                   "decode batch state (cuda-llm-engine)");
+    impl_->prefill_scratch = backend_detail::alloc_prefill_batch_scratch(impl_->model, config.max_batch,
+                                                                         config.max_pages_per_sequence, *impl_->memory);
     impl_->prefill_scratch_allocated = true;
 
     ModelInfo& info = impl_->info;
@@ -605,7 +676,7 @@ KvCacheStats CudaLlmEngineBackend::kv_stats() const {
 SeqId CudaLlmEngineBackend::create_sequence() {
     const SeqId id = impl_->next_id++;
     impl_->kv->create(id);
-    impl_->sequences.emplace(id, ::new_sequence(impl_->config.max_pages_per_sequence));
+    impl_->sequences.emplace(id, impl_->make_sequence());
     return id;
 }
 
@@ -711,6 +782,8 @@ CudaLlmEngineBackend::DecodeHostTimes CudaLlmEngineBackend::decode_host_times() 
     return {t.stage_ms, t.issue_ms, t.wait_ms, t.steps};
 }
 
+GpuMemoryManager::Report CudaLlmEngineBackend::memory_report() const { return impl_->memory->report(); }
+
 void CudaLlmEngineBackend::reset_decode_host_times() {
     if (impl_->graphs) {
         impl_->graphs->reset_host_times();
@@ -738,8 +811,7 @@ void CudaLlmEngineBackend::free_sequence(SeqId id) {
     if (it == impl_->sequences.end()) {
         throw std::invalid_argument("unknown sequence id " + std::to_string(id));
     }
-    it->second.pages.clear();  // the blocks go back to the manager, not to the engine's allocator
-    ::free_sequence(*impl_->cache, it->second);
+    impl_->free_block_table(it->second);  // its blocks go back to the KV manager below, not to the engine
     impl_->kv->release(id);
     impl_->tokens.erase(id);
     impl_->sequences.erase(it);

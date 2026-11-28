@@ -21,6 +21,7 @@ namespace fs = std::filesystem;
 namespace core = neuroserve::core;
 using neuroserve::CudaLlmEngineBackend;
 using neuroserve::CudaLlmEngineConfig;
+using neuroserve::GpuMemoryManager;
 using neuroserve::KvCacheExhausted;
 using neuroserve::SeqId;
 using neuroserve::TokenId;
@@ -478,6 +479,82 @@ TEST_F(CudaLlmEngineBackendTest, GraphDecodeInterleavesWithMixedSteps) {
     EXPECT_GT(backend_->cuda_graph_replays(), replays_before) << "no decode step was replayed";
     backend_->set_decode_path(CudaLlmEngineBackend::DecodePath::kEager);
     expect_no_leaked_pages();
+}
+
+TEST_F(CudaLlmEngineBackendTest, GpuMemoryIsReportedByOwner) {
+    // GPU memory by owner (Day 58, docs/gpu-memory.md): the engine's weights and KV pool recorded,
+    // NeuroServe's own buffers from the pool, a block table per sequence from the pool and back.
+    using core::MemoryOwner;
+    const auto owner = [](const GpuMemoryManager::Report& r, MemoryOwner o) {
+        return r.ledger.owners[static_cast<std::size_t>(o)];
+    };
+    const GpuMemoryManager::Report r0 = backend_->memory_report();
+    const auto weights_file = fs::file_size(fs::path(model_dir_) / "weights.bin");
+    const auto weights = owner(r0, MemoryOwner::kWeights).external_bytes;
+    EXPECT_NEAR(static_cast<double>(weights), static_cast<double>(weights_file), 0.01 * static_cast<double>(weights_file))
+        << "the weights recorded are not the size of weights.bin";
+    EXPECT_EQ(owner(r0, MemoryOwner::kKv).external_bytes, std::size_t{513} * 16 * 32 * 1024);  // 512 pages + the pad page
+    EXPECT_GT(owner(r0, MemoryOwner::kWorkspace).external_bytes, 0u);  // the engine's activations, batch state
+    EXPECT_GT(owner(r0, MemoryOwner::kWorkspace).pool_bytes, 0u);      // the batched prefill scratch, ours
+    EXPECT_TRUE(r0.pool.supported);
+    EXPECT_GE(r0.pool.used_bytes, r0.ledger.pool_bytes);
+    EXPECT_GE(r0.device_used_bytes, r0.ledger.external_bytes + r0.pool.used_bytes);
+
+    std::vector<SeqId> ids;
+    for (int i = 0; i < 8; ++i) {
+        ids.push_back(backend_->create_sequence());
+    }
+    const GpuMemoryManager::Report r1 = backend_->memory_report();
+    EXPECT_EQ(owner(r1, MemoryOwner::kKv).pool_bytes - owner(r0, MemoryOwner::kKv).pool_bytes, 8u * 64u * sizeof(int));
+    for (const SeqId id : ids) {
+        backend_->free_sequence(id);
+    }
+    const GpuMemoryManager::Report r2 = backend_->memory_report();
+    EXPECT_EQ(owner(r2, MemoryOwner::kKv).pool_bytes, owner(r0, MemoryOwner::kKv).pool_bytes);
+    std::printf("gpu memory: weights %.0f MiB, kv %.0f MiB, workspace %.1f MiB (pool %.1f), other %.1f MiB; "
+                "pool reserved %.1f MiB (threshold %.0f MiB); device used %.0f of %.0f MiB, unattributed %.0f MiB\n",
+                static_cast<double>(owner(r2, MemoryOwner::kWeights).bytes) / 1048576.0,
+                static_cast<double>(owner(r2, MemoryOwner::kKv).bytes) / 1048576.0,
+                static_cast<double>(owner(r2, MemoryOwner::kWorkspace).bytes) / 1048576.0,
+                static_cast<double>(owner(r2, MemoryOwner::kWorkspace).pool_bytes) / 1048576.0,
+                static_cast<double>(owner(r2, MemoryOwner::kOther).bytes) / 1048576.0,
+                static_cast<double>(r2.pool.reserved_bytes) / 1048576.0,
+                static_cast<double>(r2.pool.release_threshold_bytes) / 1048576.0,
+                static_cast<double>(r2.device_used_bytes) / 1048576.0, static_cast<double>(r2.device_total_bytes) / 1048576.0,
+                static_cast<double>(r2.unattributed_bytes) / 1048576.0);
+    expect_no_leaked_pages();
+}
+
+TEST_F(CudaLlmEngineBackendTest, AMemoryManagerCountsItsPoolAllocations) {
+    // The manager on its own (the device is the backend's): allocations from a pool of its own,
+    // tagged by owner, freed back; records of memory allocated elsewhere; the release threshold.
+    using core::MemoryOwner;
+    GpuMemoryManager memory(0, std::size_t{32} << 20);
+    const auto r0 = memory.report();
+    ASSERT_TRUE(r0.pool.supported);
+    EXPECT_EQ(r0.pool.release_threshold_bytes, std::size_t{32} << 20);
+    std::vector<void*> blocks;
+    for (int i = 0; i < 16; ++i) {
+        blocks.push_back(memory.allocate(i % 2 ? MemoryOwner::kOther : MemoryOwner::kWorkspace, std::size_t{1} << 20,
+                                         "test blocks"));
+    }
+    const auto r1 = memory.report();
+    EXPECT_EQ(r1.ledger.pool_bytes, std::size_t{16} << 20);
+    EXPECT_EQ(r1.ledger.owners[static_cast<std::size_t>(MemoryOwner::kOther)].allocations, 8u);
+    EXPECT_GE(r1.pool.used_bytes, std::size_t{16} << 20);
+    ASSERT_EQ(r1.ledger.items.size(), 2u);  // one item per owner: "test blocks" under workspace and other
+    const auto ext = memory.record_external(MemoryOwner::kWeights, 1000, "elsewhere");
+    EXPECT_EQ(memory.report().ledger.external_bytes, 1000u);
+    memory.release_external(ext);
+    for (void* block : blocks) {
+        memory.free(block);
+    }
+    const auto r2 = memory.report();
+    EXPECT_EQ(r2.ledger.bytes, 0u);
+    EXPECT_EQ(r2.ledger.owners[static_cast<std::size_t>(MemoryOwner::kOther)].peak_bytes, std::size_t{8} << 20);
+    EXPECT_LE(r2.pool.reserved_bytes, r1.pool.reserved_bytes);
+    int not_ours = 0;
+    EXPECT_THROW(memory.free(&not_ours), std::invalid_argument);
 }
 
 TEST_F(CudaLlmEngineBackendTest, RejectsBadRequestsWithoutSideEffects) {

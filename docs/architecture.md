@@ -60,7 +60,8 @@ first uncached token. The design, its invariants and the measurements are in
 
 Phase 4 makes the GPU path NeuroServe's own too: prefill attention and batched, chunked and mixed
 prefill/decode steps ([prefill-attention.md](prefill-attention.md)), the step profile
-([profiling.md](profiling.md)), and CUDA Graphs for decode ([cuda-graphs.md](cuda-graphs.md)).
+([profiling.md](profiling.md)), CUDA Graphs for decode ([cuda-graphs.md](cuda-graphs.md)), and GPU memory by owner
+([gpu-memory.md](gpu-memory.md)).
 
 Outside the request path, `neuroserve.bench` (load generator, policy comparison, prefix-caching
 comparison, stress run, NVML GPU sampler) drives servers for measurements; see

@@ -167,6 +167,21 @@ class FakeEngine:
         self.cancelled.append(request_id)
         return True
 
+    def memory(self):
+        owner = {"bytes": 0, "pool_bytes": 0, "external_bytes": 0, "peak_bytes": 0, "allocations": 0}
+        return {"owners": {"weights": {**owner, "bytes": 2 << 30, "external_bytes": 2 << 30, "peak_bytes": 2 << 30,
+                                       "allocations": 1},
+                           "workspace": dict(owner), "kv": {**owner, "bytes": 1 << 20, "pool_bytes": 1 << 20,
+                                                             "peak_bytes": 1 << 20, "allocations": 4},
+                           "other": dict(owner)},
+                "items": [{"owner": "weights", "source": "external", "label": "model weights", "bytes": 2 << 30,
+                           "allocations": 1}],
+                "bytes": (2 << 30) + (1 << 20), "pool_bytes": 1 << 20, "external_bytes": 2 << 30,
+                "peak_bytes": (2 << 30) + (1 << 20),
+                "pool": {"supported": True, "release_threshold_bytes": 64 << 20, "reserved_bytes": 2 << 20,
+                         "used_bytes": 1 << 20, "reserved_peak_bytes": 2 << 20},
+                "device": {"total_bytes": 6 << 30, "used_bytes": 3 << 30, "unattributed_bytes": (1 << 30) - (2 << 20)}}
+
     def kv_stats(self):
         return {"page_size_tokens": 16, "total_pages": 64, "free_pages": 64, "max_pages_per_sequence": 64,
                 "shared_pages": 0, "indexed_pages": 0, "prefix_lookups": 0, "prefix_lookup_pages": 0,
@@ -775,6 +790,20 @@ def test_runtime_state_of_an_idle_engine(tok):
         state = client.get("/v1/runtime/state").json()
     assert state["kv_cache"]["occupancy"] == 0.0 and state["kv_cache"]["free_pages"] == 64
     assert state["prefix_cache"]["hit_rate"] == 0.0 and state["prefix_cache"]["miss_pages"] == 0
+
+
+def test_runtime_state_reports_gpu_memory_by_owner(tok):
+    app, _, _ = make_app(tok)
+    with TestClient(app) as client:
+        memory = client.get("/v1/runtime/state").json()["gpu_memory"]
+    assert set(memory["owners"]) == {"weights", "workspace", "kv", "other"}
+    assert memory["owners"]["weights"] == {"mib": 2048.0, "pool_mib": 0.0, "external_mib": 2048.0,
+                                           "peak_mib": 2048.0, "allocations": 1}
+    assert memory["owners"]["kv"]["pool_mib"] == 1.0 and memory["attributed_mib"] == 2049.0
+    assert memory["items"] == [{"owner": "weights", "source": "external", "label": "model weights", "mib": 2048.0,
+                                "allocations": 1}]
+    assert memory["pool"] == {"supported": True, "release_threshold_mib": 64.0, "reserved_mib": 2.0, "used_mib": 1.0}
+    assert memory["device"] == {"total_mib": 6144.0, "used_mib": 3072.0, "unattributed_mib": 1022.0}
 
 
 def test_the_step_profile_is_read_and_reset_over_http(tok):

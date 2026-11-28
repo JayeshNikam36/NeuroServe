@@ -31,6 +31,12 @@ before 1.0, minor versions may change the API.
   packed three ways, match Hugging Face 24/24. Prefill throughput for a burst of 64-token prompts
   1.86x (3,314 -> 6,165 tokens/s).
   `CudaLlmEngineBackend::batched_prefills()` / `batched_prefill_sequences()` count it.
+- GPU memory manager with pools and owner tags (docs/gpu-memory.md): NeuroServe's own GPU
+  allocations (batched-prefill scratch, CUDA Graph buffers, every sequence's block table) come from
+  a stream-ordered pool with a release threshold; cuda-llm-engine's (weights, KV pool, activations,
+  batch state) are recorded with their owners. Block tables no longer cost a cudaMalloc and a
+  cudaFree per request. `CudaLlmEngineBackend::memory_report()`, `Engine.memory()`, and
+  `gpu_memory` in `GET /v1/runtime/state`.
 - `ns_decode_graph_bench` (benchmarks/decode_graph): decode step time through the eager,
   graph-eager and graph paths for every batch size, interleaved over rounds, with host time per
   step and the cost of padding. `cuda_graphs` in the server config and `Engine(cuda_graphs=...)`;

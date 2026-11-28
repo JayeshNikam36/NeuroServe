@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "neuroserve/backend/gpu_memory.hpp"
 #include "paged.h"
 
 namespace neuroserve::backend_detail {
@@ -24,7 +25,8 @@ class DecodeGraphs {
 public:
     // Buckets of 1, 2, 4, 8 and 16 sequences, up to the first that holds max_batch (at most 16).
     // pad_page is a KV page no sequence holds: padding rows write their K/V there and nowhere else.
-    DecodeGraphs(Model& m, PagedKVCache& c, int max_batch, int max_pages, int pad_page);
+    // Its device buffers come from `memory` (Day 58), as workspace.
+    DecodeGraphs(Model& m, PagedKVCache& c, int max_batch, int max_pages, int pad_page, GpuMemoryManager& memory);
     ~DecodeGraphs();
     DecodeGraphs(const DecodeGraphs&) = delete;
     DecodeGraphs& operator=(const DecodeGraphs&) = delete;
@@ -56,6 +58,7 @@ private:
 
     Model& m_;
     PagedKVCache& c_;
+    GpuMemoryManager& memory_;
     int max_pages_ = 0;
     int pad_page_ = 0;
     std::vector<int> buckets_;

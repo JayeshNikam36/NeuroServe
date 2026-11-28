@@ -24,6 +24,7 @@ add_executable(ns_unit_tests
     unit/test_kv_prefix_cache.cpp
     unit/test_preemption_recompute.cpp
     unit/test_kv_memory.cpp
+    unit/test_memory_ledger.cpp
     unit/test_step_profile.cpp
     unit/test_engine_prefill_batch.cpp
     unit/test_engine_chunked_prefill.cpp

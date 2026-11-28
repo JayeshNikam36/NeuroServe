@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 
+#include "neuroserve/backend/gpu_memory.hpp"
 #include "neuroserve/core/inference_backend.hpp"
 #include "neuroserve/core/kv_prefix_hash.hpp"
 
@@ -27,6 +29,9 @@ struct CudaLlmEngineConfig {
     // a graph captured for its batch bucket (1, 2, 4, 8, 16) and split count. Off by default until
     // the Day 57 A/B.
     bool cuda_graphs = false;
+    // GPU memory manager (Day 58, docs/gpu-memory.md): freed pool memory above this is returned to
+    // the driver at the next synchronization.
+    std::size_t memory_release_threshold_bytes = std::size_t{64} << 20;
 };
 
 // InferenceBackend implemented on top of cuda-llm-engine (paged KV cache, split-KV decode attention).
@@ -108,7 +113,12 @@ public:
         std::uint64_t steps = 0;
     };
     DecodeHostTimes decode_host_times() const;
-    void reset_decode_host_times();  // mixed steps run as one forward pass (Day 53)
+    void reset_decode_host_times();
+
+    // GPU memory by owner (Day 58, docs/gpu-memory.md): NeuroServe's own allocations through the
+    // pool, cuda-llm-engine's recorded with their owners, the device's used memory beside them.
+    // Safe from any thread.
+    GpuMemoryManager::Report memory_report() const;  // mixed steps run as one forward pass (Day 53)
 
 private:
     struct Impl;                  // holds all engine types; defined only in the .cpp

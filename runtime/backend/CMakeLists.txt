@@ -1,5 +1,6 @@
 add_library(neuroserve_backend
     src/cuda_llm_engine_backend.cpp
+    src/gpu_memory.cpp
     src/prefill_from_offset.cu
     src/decode_graph.cu)
 add_library(neuroserve::backend ALIAS neuroserve_backend)
